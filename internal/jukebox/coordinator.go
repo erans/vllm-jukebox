@@ -338,7 +338,14 @@ func (c *Coordinator) handleSwapDone(ev swapDone) {
 		metrics.SetState(string(c.state))
 		if ev.from != "" || ev.model != "" {
 			metrics.SwapsTotal.WithLabelValues(ev.from, ev.model).Inc()
-			metrics.SwapDurationSeconds.WithLabelValues(ev.from, ev.model).Observe(ev.duration.Seconds())
+			metrics.SwapDurationSeconds.Observe(ev.duration.Seconds())
+		}
+		metrics.ConsecutiveFailures.Set(0)
+		if ev.from != "" && ev.from != ev.model {
+			metrics.CurrentModel.WithLabelValues(ev.from).Set(0)
+		}
+		if ev.model != "" {
+			metrics.CurrentModel.WithLabelValues(ev.model).Set(1)
 		}
 		slog.Info(
 			"model_swap_completed",
@@ -354,6 +361,7 @@ func (c *Coordinator) handleSwapDone(ev swapDone) {
 	c.failureCount++
 	c.lastFailure = c.now()
 	metrics.SetState(string(c.state))
+	metrics.ConsecutiveFailures.Set(float64(c.failureCount))
 
 	slog.Error(
 		"model_swap_failed",

@@ -34,11 +34,10 @@ func healthHandler(coord StatusProvider) fiber.Handler {
 			"status":             statusText,
 			"accepting_requests": accepting,
 			"vllm": fiber.Map{
-				"state":              st.State,
-				"model":              st.CurrentModel,
-				"pid":                st.PID,
-				"uptime_seconds":     st.UptimeSeconds,
-				"in_flight_requests": st.InFlight,
+				"state":          st.State,
+				"model":          st.CurrentModel,
+				"pid":            st.PID,
+				"uptime_seconds": st.UptimeSeconds,
 			},
 		})
 	}

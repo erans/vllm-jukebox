@@ -1,37 +1,32 @@
 package metrics
 
 import (
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
+	// Counter: requests by model and status
 	RequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jukebox_requests_total",
 			Help: "Total HTTP requests handled by Jukebox.",
 		},
-		[]string{"path", "status", "model"},
+		[]string{"model", "status"},
 	)
 
-	RequestDurationSeconds = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "jukebox_request_duration_seconds",
-			Help:    "HTTP request duration in seconds.",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"path", "model"},
-	)
-
+	// Counter: model swaps
 	SwapsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jukebox_swaps_total",
-			Help: "Total model swaps completed successfully.",
+			Help: "Total model swaps.",
 		},
 		[]string{"from", "to"},
 	)
 
+	// Counter: swap rejections by reason
 	SwapRejectionsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jukebox_swap_rejections_total",
@@ -40,53 +35,83 @@ var (
 		[]string{"reason"},
 	)
 
-	SwapDurationSeconds = prometheus.NewHistogramVec(
+	// Histogram: swap duration
+	SwapDurationSeconds = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "jukebox_swap_duration_seconds",
 			Help:    "Duration of model swaps in seconds.",
 			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"from", "to"},
 	)
 
+	// Histogram: request duration
+	RequestDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jukebox_request_duration_seconds",
+			Help:    "HTTP request duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"model"},
+	)
+
+	// Gauge: current state (1 = active)
 	State = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "jukebox_state",
-			Help: "Current Jukebox vLLM state (1 = active).",
+			Help: "Current vLLM state (1 = active).",
 		},
 		[]string{"state"},
+	)
+
+	// Gauge: in-flight requests
+	InFlightRequests = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "jukebox_in_flight_requests",
+			Help: "Number of in-flight proxied requests.",
+		},
+	)
+
+	// Gauge: current model (1 = loaded)
+	CurrentModel = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_current_model",
+			Help: "Currently loaded model (1 = loaded).",
+		},
+		[]string{"model"},
+	)
+
+	// Gauge: consecutive failures
+	ConsecutiveFailures = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "jukebox_consecutive_failures",
+			Help: "Consecutive vLLM start/swap failures.",
+		},
 	)
 )
 
 func init() {
 	prometheus.MustRegister(
 		RequestsTotal,
-		RequestDurationSeconds,
 		SwapsTotal,
 		SwapRejectionsTotal,
 		SwapDurationSeconds,
+		RequestDurationSeconds,
 		State,
+		InFlightRequests,
+		CurrentModel,
+		ConsecutiveFailures,
 	)
 }
 
-func ObserveRequest(path string, statusCode int, model string, dur time.Duration) {
-	RequestsTotal.WithLabelValues(path, itoa(statusCode), model).Inc()
-	RequestDurationSeconds.WithLabelValues(path, model).Observe(dur.Seconds())
-}
-
-func ObserveSwap(from, to string, dur time.Duration, err error, rejectReason string) {
-	if rejectReason != "" {
-		SwapRejectionsTotal.WithLabelValues(rejectReason).Inc()
-		return
+func ObserveRequest(statusCode int, model string, dur time.Duration) {
+	if model == "" {
+		model = "unknown"
 	}
-	if err == nil {
-		SwapsTotal.WithLabelValues(from, to).Inc()
-		SwapDurationSeconds.WithLabelValues(from, to).Observe(dur.Seconds())
-	}
+	RequestsTotal.WithLabelValues(model, strconv.Itoa(statusCode)).Inc()
+	RequestDurationSeconds.WithLabelValues(model).Observe(dur.Seconds())
 }
 
 func SetState(state string) {
-	// Set selected state to 1, others to 0.
 	for _, s := range []string{"idle", "starting", "ready", "stopping", "error"} {
 		v := 0.0
 		if s == state {
@@ -94,26 +119,4 @@ func SetState(state string) {
 		}
 		State.WithLabelValues(s).Set(v)
 	}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [32]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }

@@ -63,6 +63,79 @@ func TestHealth_ReadyReturns200AndAcceptingRequests(t *testing.T) {
 	}
 }
 
+func TestHealth_SchemaMatchesSpec(t *testing.T) {
+	app := httpserver.NewApp(httpserver.Options{
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", PID: 123, UptimeSeconds: 7}},
+	})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	type healthResp struct {
+		Status            string `json:"status"`
+		AcceptingRequests bool   `json:"accepting_requests"`
+		VLLM              struct {
+			State         string `json:"state"`
+			Model         string `json:"model"`
+			PID           int    `json:"pid"`
+			UptimeSeconds int64  `json:"uptime_seconds"`
+		} `json:"vllm"`
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	var decoded healthResp
+	if err := dec.Decode(&decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+func TestStatus_SchemaMatchesSpec(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", InFlight: 2, UptimeSeconds: 3}},
+	})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/status", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	type statusResp struct {
+		State                        string   `json:"state"`
+		AcceptingRequests            bool     `json:"accepting_requests"`
+		CurrentModel                 string   `json:"current_model"`
+		InFlightRequests             int64    `json:"in_flight_requests"`
+		UptimeSeconds                int64    `json:"uptime_seconds"`
+		SwapCooldownRemainingSeconds int64    `json:"swap_cooldown_remaining_seconds"`
+		LastSwap                     any      `json:"last_swap"`
+		FailureCount                 int      `json:"failure_count"`
+		AvailableModels              []string `json:"available_models"`
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	var decoded statusResp
+	if err := dec.Decode(&decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
 func TestHealth_StartingReturns503(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
 		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateStarting}},
@@ -278,6 +351,115 @@ models:
 	}
 }
 
+func TestSwitchingProxy_UnknownModelReturns400WithSpecErrorShape(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nope"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+
+	var decoded struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Error.Code != "model_not_found" || decoded.Error.Type != "invalid_request_error" {
+		t.Fatalf("unexpected error: %+v", decoded.Error)
+	}
+}
+
+func TestSwitchingProxy_InvalidJSONReturns400(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{not json`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestSwitchingProxy_MissingModelReturns400(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
 func TestSwitchingProxy_RewritesModelNameInSSE(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
@@ -374,5 +556,49 @@ models:
 	}
 	if coord.ensureCalls != 0 {
 		t.Fatalf("expected EnsureModel not called, got %d", coord.ensureCalls)
+	}
+}
+
+func TestUnknownV1Endpoint_Returns501WithOpenAIErrorShape(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+	})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/v1/unknown", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d", resp.StatusCode)
+	}
+
+	var decoded struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Error.Code != "not_implemented" {
+		t.Fatalf("unexpected code: %q", decoded.Error.Code)
 	}
 }

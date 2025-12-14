@@ -19,6 +19,7 @@ import (
 	"vllm-jukebox/internal/httpserver"
 	"vllm-jukebox/internal/inflight"
 	"vllm-jukebox/internal/jukebox"
+	"vllm-jukebox/internal/metrics"
 	"vllm-jukebox/internal/vllm"
 )
 
@@ -52,8 +53,13 @@ func main() {
 	}
 
 	var tr inflight.Tracker
+	tr.OnChange = func(count int64) {
+		metrics.InFlightRequests.Set(float64(count))
+	}
 	mgr := vllm.NewManager(cfg)
 	coord := jukebox.NewCoordinator(cfg, mgr, &tr, time.Now)
+	metrics.SetState("idle")
+	metrics.ConsecutiveFailures.Set(0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

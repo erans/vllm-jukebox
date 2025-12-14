@@ -9,31 +9,38 @@ type Tracker struct {
 	mu      sync.Mutex
 	count   int64
 	waiters []chan struct{}
+
+	OnChange func(count int64)
 }
 
 func (t *Tracker) Track(_ context.Context) (done func()) {
 	t.mu.Lock()
 	t.count++
+	count := t.count
 	t.mu.Unlock()
+	t.notify(count)
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			t.mu.Lock()
-			defer t.mu.Unlock()
-
 			if t.count <= 0 {
 				t.count = 0
+				t.mu.Unlock()
+				t.notify(0)
 				return
 			}
 
 			t.count--
+			count := t.count
 			if t.count == 0 {
 				for _, ch := range t.waiters {
 					close(ch)
 				}
 				t.waiters = nil
 			}
+			t.mu.Unlock()
+			t.notify(count)
 		})
 	}
 }
@@ -62,3 +69,8 @@ func (t *Tracker) Count() int64 {
 	return t.count
 }
 
+func (t *Tracker) notify(count int64) {
+	if t.OnChange != nil {
+		t.OnChange(count)
+	}
+}

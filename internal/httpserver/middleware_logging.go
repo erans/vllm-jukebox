@@ -28,7 +28,7 @@ func requestLoggingMiddleware() fiber.Handler {
 			"duration_ms", dur.Milliseconds(),
 		)
 
-		metrics.ObserveRequest(c.Path(), c.Response().StatusCode(), model, dur)
+		metrics.ObserveRequest(c.Response().StatusCode(), model, dur)
 
 		return err
 	}

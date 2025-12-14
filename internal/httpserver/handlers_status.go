@@ -58,7 +58,6 @@ func statusHandler(cfg *config.Config, coord StatusProvider) fiber.Handler {
 			"swap_cooldown_remaining_seconds": cooldownRemaining,
 			"last_swap":                       lastSwap,
 			"failure_count":                   st.FailureCount,
-			"pid":                             st.PID,
 			"available_models":                available,
 		})
 	}

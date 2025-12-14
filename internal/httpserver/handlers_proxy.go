@@ -1,8 +1,8 @@
 package httpserver
 
 import (
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,36 +17,29 @@ import (
 func switchingProxyHandler(opts Options) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		if opts.Config == nil || opts.Coordinator == nil {
-			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-				"error": fiber.Map{
-					"message": "server not configured",
-					"type":    "internal_error",
-					"code":    "config_missing",
-				},
-			})
+			return writeOpenAIError(c, http.StatusInternalServerError, "server not configured", "internal_error", "config_missing")
 		}
 
 		modelName, err := extractModel(c.Body())
 		if err != nil {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
-				"error": fiber.Map{
-					"message": err.Error(),
-					"type":    "invalid_request_error",
-					"code":    "invalid_json",
-				},
-			})
+			return writeOpenAIError(c, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_json")
 		}
 		if modelName == "" {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
-				"error": fiber.Map{
-					"message": "missing required field 'model'",
-					"type":    "invalid_request_error",
-					"code":    "model_not_found",
-				},
-			})
+			return writeOpenAIError(c, http.StatusBadRequest, "missing required field 'model'", "invalid_request_error", "model_not_found")
 		}
 
 		c.Locals(requestedModelLocal, modelName)
+
+		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
+		if _, _, err := opts.Config.ResolveModel(modelName); err != nil {
+			return writeOpenAIError(
+				c,
+				http.StatusBadRequest,
+				fmt.Sprintf("Model %q not found in configuration", modelName),
+				"invalid_request_error",
+				"model_not_found",
+			)
+		}
 
 		requestID, _ := c.Locals(requestIDHeader).(string)
 		if requestID == "" {
@@ -75,26 +68,14 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 func passthroughProxyHandler(opts Options) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		if opts.Config == nil || opts.Coordinator == nil {
-			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-				"error": fiber.Map{
-					"message": "server not configured",
-					"type":    "internal_error",
-					"code":    "config_missing",
-				},
-			})
+			return writeOpenAIError(c, http.StatusInternalServerError, "server not configured", "internal_error", "config_missing")
 		}
 
 		st := opts.Coordinator.Status()
 		c.Locals(requestedModelLocal, st.CurrentModel)
 		if st.State != jukebox.StateReady {
 			c.Set("Retry-After", "5")
-			return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{
-				"error": fiber.Map{
-					"message": "Model switch in progress, please retry",
-					"type":    "service_unavailable",
-					"code":    "model_switching",
-				},
-			})
+			return writeOpenAIError(c, http.StatusServiceUnavailable, "Model switch in progress, please retry", "service_unavailable", "model_switching")
 		}
 
 		requestID, _ := c.Locals(requestIDHeader).(string)
@@ -140,33 +121,14 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 			c.Set("Retry-After", fmt.Sprintf("%d", retryAfterSeconds))
 		}
 
-		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": fiber.Map{
-				"message": "Model switch in progress, please retry",
-				"type":    "service_unavailable",
-				"code":    "model_switching",
-			},
-		})
+		// Treat backoff as a 500 (spec: error state returns 500) but include Retry-After.
+		if rej.Reason == jukebox.RejectBackoff {
+			return writeOpenAIError(c, http.StatusInternalServerError, "vLLM in error state, please retry", "internal_error", "vllm_error")
+		}
+		return writeOpenAIError(c, http.StatusServiceUnavailable, "Model switch in progress, please retry", "service_unavailable", "model_switching")
 	}
 
-	msg := err.Error()
-	if strings.Contains(msg, "model") && strings.Contains(msg, "not found") {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
-			"error": fiber.Map{
-				"message": fmt.Sprintf("Model %q not found in configuration", extractModelNameFromError(err)),
-				"type":    "invalid_request_error",
-				"code":    "model_not_found",
-			},
-		})
-	}
-
-	return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-		"error": fiber.Map{
-			"message": "vLLM unavailable",
-			"type":    "internal_error",
-			"code":    "vllm_unavailable",
-		},
-	})
+	return writeOpenAIError(c, http.StatusInternalServerError, "vLLM unavailable", "internal_error", "vllm_unavailable")
 }
 
 func extractModelNameFromError(err error) string {
