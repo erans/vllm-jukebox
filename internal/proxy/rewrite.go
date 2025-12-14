@@ -51,6 +51,7 @@ func RewriteSSEModel(r io.Reader, w io.Writer, requestedModel string) error {
 						_, _ = io.WriteString(w, "data: ")
 						_, _ = w.Write(bytes.TrimSpace(rewritten))
 						_, _ = io.WriteString(w, "\n")
+						flushIfPossible(w)
 						goto next
 					}
 				}
@@ -58,6 +59,7 @@ func RewriteSSEModel(r io.Reader, w io.Writer, requestedModel string) error {
 			if _, writeErr := io.WriteString(w, line); writeErr != nil {
 				return writeErr
 			}
+			flushIfPossible(w)
 		}
 	next:
 		if err != nil {
@@ -69,3 +71,12 @@ func RewriteSSEModel(r io.Reader, w io.Writer, requestedModel string) error {
 	}
 }
 
+type flusher interface {
+	Flush() error
+}
+
+func flushIfPossible(w io.Writer) {
+	if f, ok := w.(flusher); ok {
+		_ = f.Flush()
+	}
+}

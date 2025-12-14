@@ -77,7 +77,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 			if opts.RewriteModelName && opts.RequestedModel != "" {
 				_ = RewriteSSEModel(resp.Body, w, opts.RequestedModel)
 			} else {
-				_, _ = io.Copy(w, resp.Body)
+				_, _ = copyWithFlush(resp.Body, w)
 			}
 			_ = w.Flush()
 		})
@@ -97,6 +97,28 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	}
 
 	return c.Send(data)
+}
+
+func copyWithFlush(r io.Reader, w *bufio.Writer) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var total int64
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			written, werr := w.Write(buf[:n])
+			total += int64(written)
+			_ = w.Flush()
+			if werr != nil {
+				return total, werr
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+	}
 }
 
 func requestContext(c *fiber.Ctx) context.Context {

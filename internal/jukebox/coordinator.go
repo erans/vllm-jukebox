@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -328,16 +329,39 @@ func (c *Coordinator) handleSwapDone(ev swapDone) {
 			TriggeredByRequest: ev.requestID,
 		}
 		c.hasLastSwap = true
+		slog.Info(
+			"model_swap_completed",
+			"request_id", ev.requestID,
+			"from_model", ev.from,
+			"to_model", ev.model,
+			"duration_ms", ev.duration.Milliseconds(),
+		)
 		return
 	}
 
 	c.state = StateError
 	c.failureCount++
 	c.lastFailure = c.now()
+
+	slog.Error(
+		"model_swap_failed",
+		"request_id", ev.requestID,
+		"from_model", ev.from,
+		"to_model", ev.model,
+		"duration_ms", ev.duration.Milliseconds(),
+		"failure_count", c.failureCount,
+		"err", ev.err,
+	)
 }
 
 func (c *Coordinator) performSwap(fromModel, model, requestID string, done chan<- error) {
 	start := c.now()
+	slog.Info(
+		"model_swap_started",
+		"request_id", requestID,
+		"from_model", fromModel,
+		"to_model", model,
+	)
 	err := c.doSwap(model, requestID)
 	duration := c.now().Sub(start)
 

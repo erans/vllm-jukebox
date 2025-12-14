@@ -29,11 +29,13 @@ func NewApp(opts Options) *fiber.App {
 	app := fiber.New()
 
 	app.Use(requestIDMiddleware())
+	app.Use(requestLoggingMiddleware())
 
 	app.Get("/health", healthHandler(opts.Coordinator))
 	app.Get("/status", statusHandler(opts.Config, opts.Coordinator))
 
 	app.Get("/v1/models", listModelsHandler(opts.Config))
+	app.Get("/metrics", metricsHandler())
 
 	// Model-switching endpoints.
 	app.Post("/v1/responses", switchingProxyHandler(opts))
