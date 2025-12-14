@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -64,6 +66,7 @@ func main() {
 	app.Mount("/", httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
 		Coordinator: coord,
+		InFlight:    &tr,
 	}))
 
 	addr := net.JoinHostPort(cfg.Server.Host, fmt.Sprintf("%d", cfg.Server.Port))
@@ -78,8 +81,22 @@ func main() {
 		_ = app.Shutdown()
 	}()
 
-	if err := app.Listen(addr); err != nil {
+	if err := app.Listen(addr); err != nil && !isExpectedShutdownErr(err) {
 		slog.Error("server error", "err", err)
 		os.Exit(1)
 	}
+}
+
+func isExpectedShutdownErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	// Fiber/fasthttp doesn't consistently surface a typed error for shutdown across versions.
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "server closed") {
+		return true
+	}
+	return false
 }

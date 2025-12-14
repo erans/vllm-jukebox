@@ -1,6 +1,8 @@
 package httpserver
 
 import (
+	"sort"
+
 	"github.com/gofiber/fiber/v2"
 
 	"vllm-jukebox/internal/config"
@@ -20,6 +22,7 @@ func statusHandler(cfg *config.Config, coord StatusProvider) fiber.Handler {
 			for name := range cfg.Models {
 				available = append(available, name)
 			}
+			sort.Strings(available)
 		}
 
 		return c.JSON(fiber.Map{
@@ -33,4 +36,3 @@ func statusHandler(cfg *config.Config, coord StatusProvider) fiber.Handler {
 		})
 	}
 }
-
