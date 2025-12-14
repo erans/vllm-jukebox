@@ -158,3 +158,73 @@ models:
 	}
 }
 
+func TestCoordinator_RestartsIfProcessCrashedWhileReady(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load cfg: %v", err)
+	}
+
+	var tr inflight.Tracker
+	mgr := &fakeManager{}
+	clock := func() time.Time { return time.Unix(0, 0) }
+
+	c := jukebox.NewCoordinator(cfg, mgr, &tr, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "m", "req_1"); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	if mgr.startCalls != 1 {
+		t.Fatalf("expected 1 start call, got %d", mgr.startCalls)
+	}
+
+	// Simulate crash: pid is now unknown/zero.
+	mgr.pid = 0
+
+	if err := c.EnsureModel(context.Background(), "m", "req_2"); err != nil {
+		t.Fatalf("EnsureModel after crash: %v", err)
+	}
+	if mgr.startCalls != 2 {
+		t.Fatalf("expected restart (2 start calls), got %d", mgr.startCalls)
+	}
+}
+
+func TestCoordinator_StatusReportsErrorIfReadyButNoPID(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load cfg: %v", err)
+	}
+
+	var tr inflight.Tracker
+	mgr := &fakeManager{}
+	clock := func() time.Time { return time.Unix(0, 0) }
+
+	c := jukebox.NewCoordinator(cfg, mgr, &tr, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "m", "req_1"); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	mgr.pid = 0
+
+	st := c.Status()
+	if st.State != jukebox.StateError {
+		t.Fatalf("expected status state error, got %s", st.State)
+	}
+}

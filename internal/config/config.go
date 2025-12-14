@@ -29,9 +29,9 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	VLLM     VLLMConfig     `yaml:"vllm"`
-	Behavior BehaviorConfig `yaml:"behavior"`
+	Server   ServerConfig           `yaml:"server"`
+	VLLM     VLLMConfig             `yaml:"vllm"`
+	Behavior BehaviorConfig         `yaml:"behavior"`
 	Models   map[string]ModelConfig `yaml:"models"`
 }
 
@@ -51,7 +51,7 @@ type VLLMConfig struct {
 	SwapCooldown    Duration `yaml:"swap_cooldown"`
 	SwapWaitTimeout Duration `yaml:"swap_wait_timeout"`
 
-	Defaults   VLLMDefaults       `yaml:"defaults"`
+	Defaults   VLLMDefaults      `yaml:"defaults"`
 	DefaultEnv map[string]string `yaml:"default_env"`
 }
 
@@ -112,7 +112,7 @@ func (c *Config) applyDefaults() {
 		c.VLLM.Port = 8000
 	}
 	if c.VLLM.Binary == "" {
-		c.VLLM.Binary = "vllm"
+		c.VLLM.Binary = "uvx"
 	}
 	if c.VLLM.StartupTimeout.Duration == 0 {
 		c.VLLM.StartupTimeout = Duration{Duration: 300 * time.Second}

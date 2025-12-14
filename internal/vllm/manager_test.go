@@ -198,6 +198,47 @@ models:
 	_ = cfg // silence unused in case we refactor later
 }
 
+func TestManager_CurrentPIDBecomesZeroAfterProcessExit(t *testing.T) {
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "exit.sh")
+	if err := os.WriteFile(scriptPath, []byte(`#!/bin/sh
+sleep 0.05
+exit 0
+`), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	cfgLoaded, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "` + scriptPath + `"
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	mgr := vllm.NewManager(cfgLoaded)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := mgr.Start(ctx, "m"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	deadline := time.Now().Add(750 * time.Millisecond)
+	for {
+		if mgr.CurrentPID() == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected pid to become 0 after exit, still %d", mgr.CurrentPID())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func bytesTrimSpace(b []byte) []byte {
 	i := 0
 	j := len(b)

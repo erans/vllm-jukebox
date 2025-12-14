@@ -19,9 +19,10 @@ import (
 type Manager struct {
 	cfg *config.Config
 
-	mu  sync.Mutex
-	cmd *exec.Cmd
-	pid int
+	mu     sync.Mutex
+	cmd    *exec.Cmd
+	pid    int
+	waitCh chan error
 }
 
 func NewManager(cfg *config.Config) *Manager {
@@ -71,10 +72,26 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 		return 0, err
 	}
 
+	waitCh := make(chan error, 1)
 	m.mu.Lock()
 	m.cmd = cmd
 	m.pid = cmd.Process.Pid
+	m.waitCh = waitCh
 	m.mu.Unlock()
+
+	go func() {
+		err := cmd.Wait()
+		waitCh <- normalizeStopWaitErr(err)
+
+		m.mu.Lock()
+		// Only clear if this is still the current process.
+		if m.cmd == cmd {
+			m.cmd = nil
+			m.pid = 0
+			m.waitCh = nil
+		}
+		m.mu.Unlock()
+	}()
 
 	return cmd.Process.Pid, nil
 }
@@ -83,33 +100,25 @@ func (m *Manager) Stop(ctx context.Context) error {
 	m.mu.Lock()
 	cmd := m.cmd
 	pid := m.pid
+	waitCh := m.waitCh
 	m.mu.Unlock()
 
 	if cmd == nil || pid == 0 {
 		return nil
 	}
 
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
-
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 
 	select {
 	case err := <-waitCh:
-		m.clear()
-		return normalizeStopWaitErr(err)
+		_ = err
+		return nil
 	case <-ctx.Done():
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		select {
-		case err := <-waitCh:
-			m.clear()
-			_ = normalizeStopWaitErr(err)
+		case <-waitCh:
 		case <-time.After(2 * time.Second):
-			// Best effort; avoid blocking forever.
 		}
-		m.clear()
 		return ctx.Err()
 	}
 }
@@ -145,11 +154,4 @@ func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 	}
 
 	return VerifyModelLoaded(ctx, base, expectedModel, modelCfg.Path)
-}
-
-func (m *Manager) clear() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cmd = nil
-	m.pid = 0
 }

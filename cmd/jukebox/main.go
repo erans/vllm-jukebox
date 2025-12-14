@@ -59,6 +59,24 @@ func main() {
 	defer cancel()
 	go coord.Run(ctx)
 
+	if cfg.Behavior.DefaultModel != "" {
+		go func() {
+			preloadTimeout := cfg.VLLM.StartupTimeout.Duration + cfg.VLLM.SwapWaitTimeout.Duration
+			if preloadTimeout <= 0 {
+				preloadTimeout = 5 * time.Minute
+			}
+			preCtx, preCancel := context.WithTimeout(context.Background(), preloadTimeout)
+			defer preCancel()
+
+			slog.Info("preloading default model", "model", cfg.Behavior.DefaultModel)
+			if err := coord.EnsureModel(preCtx, cfg.Behavior.DefaultModel, "startup"); err != nil {
+				slog.Error("default model preload failed", "model", cfg.Behavior.DefaultModel, "err", err)
+			} else {
+				slog.Info("default model preload complete", "model", cfg.Behavior.DefaultModel)
+			}
+		}()
+	}
+
 	app := fiber.New(fiber.Config{
 		ReadTimeout:  cfg.Server.ReadTimeout.Duration,
 		WriteTimeout: cfg.Server.WriteTimeout.Duration,

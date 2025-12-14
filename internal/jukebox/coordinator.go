@@ -200,8 +200,15 @@ func (c *Coordinator) Status() Status {
 		pid = c.mgr.CurrentPID()
 	}
 
+	state := c.state
+	// If we think we're ready but there's no running process, surface this as error immediately
+	// (covers unexpected vLLM exit without needing a new request to arrive).
+	if state == StateReady && pid == 0 {
+		state = StateError
+	}
+
 	var uptimeSeconds int64
-	if c.state == StateReady && !c.lastReadyAt.IsZero() {
+	if state == StateReady && !c.lastReadyAt.IsZero() {
 		uptimeSeconds = int64(now.Sub(c.lastReadyAt).Seconds())
 		if uptimeSeconds < 0 {
 			uptimeSeconds = 0
@@ -217,7 +224,7 @@ func (c *Coordinator) Status() Status {
 	}
 
 	return Status{
-		State:         c.state,
+		State:         state,
 		CurrentModel:  c.currentModel,
 		InFlight:      inFlight,
 		PID:           pid,
@@ -246,9 +253,15 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 	c.mu.RUnlock()
 
 	if state == StateReady && current == resolvedName {
-		req.resp <- ensureReply{}
-		return
+		if c.mgr == nil || c.mgr.CurrentPID() == 0 {
+			// Treat "ready but no pid" as error and fall through to perform a restart.
+		} else {
+			req.resp <- ensureReply{}
+			return
+		}
 	}
+
+	isCrashed := state == StateReady && current == resolvedName && c.mgr != nil && c.mgr.CurrentPID() == 0
 
 	if inProgress || state == StateStarting || state == StateStopping {
 		req.resp <- ensureReply{err: &RejectError{Reason: RejectSwapInProgress, RetryAfter: 5 * time.Second}}
@@ -266,11 +279,13 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 		}
 	}
 
-	if cooldown := c.cfg.VLLM.SwapCooldown.Duration; cooldown > 0 && !lastSwap.IsZero() {
-		nextAllowed := lastSwap.Add(cooldown)
-		if now := c.now(); now.Before(nextAllowed) {
-			req.resp <- ensureReply{err: &RejectError{Reason: RejectCooldown, RetryAfter: nextAllowed.Sub(now)}}
-			return
+	if !isCrashed {
+		if cooldown := c.cfg.VLLM.SwapCooldown.Duration; cooldown > 0 && !lastSwap.IsZero() {
+			nextAllowed := lastSwap.Add(cooldown)
+			if now := c.now(); now.Before(nextAllowed) {
+				req.resp <- ensureReply{err: &RejectError{Reason: RejectCooldown, RetryAfter: nextAllowed.Sub(now)}}
+				return
+			}
 		}
 	}
 

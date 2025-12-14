@@ -134,3 +134,18 @@ models:
 	}
 }
 
+func TestLoad_DefaultsVLLMBinaryToUVX(t *testing.T) {
+	cfg, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.VLLM.Binary != "uvx" {
+		t.Fatalf("expected vllm.binary default uvx, got %q", cfg.VLLM.Binary)
+	}
+}
