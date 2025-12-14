@@ -1,0 +1,13 @@
+.worktrees/
+worktrees/
+
+# Go
+/bin/
+/*.exe
+*.test
+*.out
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
