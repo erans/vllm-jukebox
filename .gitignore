@@ -6,7 +6,8 @@ worktrees/
 /*.exe
 *.test
 *.out
-
+/jukebox
+ 
 # OS/editor
 .DS_Store
 .idea/
