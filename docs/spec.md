@@ -895,9 +895,11 @@ Log levels:
 
 ---
 
-## Metrics (Future)
+## Metrics
 
-Prometheus metrics to expose:
+Prometheus metrics are exposed at `GET /metrics` (when enabled).
+
+Metrics to expose:
 
 ```
 # Counter: requests by model and status

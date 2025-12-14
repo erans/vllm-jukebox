@@ -46,6 +46,8 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			})
 		}
 
+		c.Locals(requestedModelLocal, modelName)
+
 		requestID, _ := c.Locals(requestIDHeader).(string)
 		if requestID == "" {
 			requestID = c.Get(requestIDHeader)
@@ -83,6 +85,7 @@ func passthroughProxyHandler(opts Options) fiber.Handler {
 		}
 
 		st := opts.Coordinator.Status()
+		c.Locals(requestedModelLocal, st.CurrentModel)
 		if st.State != jukebox.StateReady {
 			c.Set("Retry-After", "5")
 			return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{

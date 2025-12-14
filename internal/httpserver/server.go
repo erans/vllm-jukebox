@@ -53,6 +53,8 @@ func NewApp(opts Options) *fiber.App {
 	app.All("/v1/files*", notImplementedHandler())
 	app.All("/v1/fine-tuning/*", notImplementedHandler())
 	app.All("/v1/assistants/*", notImplementedHandler())
+	// Fallback for unknown /v1 endpoints: return 501 rather than 404.
+	app.All("/v1/*", notImplementedHandler())
 
 	return app
 }

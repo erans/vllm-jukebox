@@ -10,6 +10,7 @@ import (
 
 	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/inflight"
+	"vllm-jukebox/internal/metrics"
 )
 
 type State string
@@ -176,6 +177,7 @@ func (c *Coordinator) EnsureModel(ctx context.Context, requestedModel, requestID
 	case err := <-reply.wait:
 		return err
 	case <-timer.C:
+		metrics.SwapRejectionsTotal.WithLabelValues(string(RejectWaitTimeout)).Inc()
 		return &RejectError{
 			Reason:     RejectWaitTimeout,
 			RetryAfter: 0,
@@ -265,6 +267,7 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 	isCrashed := state == StateReady && current == resolvedName && c.mgr != nil && c.mgr.CurrentPID() == 0
 
 	if inProgress || state == StateStarting || state == StateStopping {
+		metrics.SwapRejectionsTotal.WithLabelValues(string(RejectSwapInProgress)).Inc()
 		req.resp <- ensureReply{err: &RejectError{Reason: RejectSwapInProgress, RetryAfter: 5 * time.Second}}
 		return
 	}
@@ -274,6 +277,7 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 		if delay > 0 {
 			until := lastFailure.Add(delay)
 			if remaining := time.Until(until); remaining > 0 {
+				metrics.SwapRejectionsTotal.WithLabelValues(string(RejectBackoff)).Inc()
 				req.resp <- ensureReply{err: &RejectError{Reason: RejectBackoff, RetryAfter: remaining}}
 				return
 			}
@@ -284,6 +288,7 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 		if cooldown := c.cfg.VLLM.SwapCooldown.Duration; cooldown > 0 && !lastSwap.IsZero() {
 			nextAllowed := lastSwap.Add(cooldown)
 			if now := c.now(); now.Before(nextAllowed) {
+				metrics.SwapRejectionsTotal.WithLabelValues(string(RejectCooldown)).Inc()
 				req.resp <- ensureReply{err: &RejectError{Reason: RejectCooldown, RetryAfter: nextAllowed.Sub(now)}}
 				return
 			}
@@ -302,6 +307,7 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 		c.state = StateStarting
 	}
 	c.mu.Unlock()
+	metrics.SetState(string(c.Status().State))
 
 	go c.performSwap(fromModel, resolvedName, req.requestID, done)
 	req.resp <- ensureReply{wait: done}
@@ -329,6 +335,11 @@ func (c *Coordinator) handleSwapDone(ev swapDone) {
 			TriggeredByRequest: ev.requestID,
 		}
 		c.hasLastSwap = true
+		metrics.SetState(string(c.state))
+		if ev.from != "" || ev.model != "" {
+			metrics.SwapsTotal.WithLabelValues(ev.from, ev.model).Inc()
+			metrics.SwapDurationSeconds.WithLabelValues(ev.from, ev.model).Observe(ev.duration.Seconds())
+		}
 		slog.Info(
 			"model_swap_completed",
 			"request_id", ev.requestID,
@@ -342,6 +353,7 @@ func (c *Coordinator) handleSwapDone(ev swapDone) {
 	c.state = StateError
 	c.failureCount++
 	c.lastFailure = c.now()
+	metrics.SetState(string(c.state))
 
 	slog.Error(
 		"model_swap_failed",
