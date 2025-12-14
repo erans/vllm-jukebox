@@ -146,11 +146,22 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 		})
 	}
 
-	return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+	msg := err.Error()
+	if strings.Contains(msg, "model") && strings.Contains(msg, "not found") {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error": fiber.Map{
+				"message": fmt.Sprintf("Model %q not found in configuration", extractModelNameFromError(err)),
+				"type":    "invalid_request_error",
+				"code":    "model_not_found",
+			},
+		})
+	}
+
+	return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
 		"error": fiber.Map{
-			"message": fmt.Sprintf("Model %q not found in configuration", extractModelNameFromError(err)),
-			"type":    "invalid_request_error",
-			"code":    "model_not_found",
+			"message": "vLLM unavailable",
+			"type":    "internal_error",
+			"code":    "vllm_unavailable",
 		},
 	})
 }

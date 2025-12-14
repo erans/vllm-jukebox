@@ -3,6 +3,7 @@ package httpserver_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -239,6 +240,41 @@ models:
 	}
 	if resp.Header.Get("Retry-After") == "" {
 		t.Fatalf("expected Retry-After header")
+	}
+}
+
+func TestSwitchingProxy_EnsureFailureReturns500(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	coord := &stubCoord{
+		st:        jukebox.Status{State: jukebox.StateError},
+		ensureErr: errors.New("boom"),
+	}
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: coord,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", resp.StatusCode)
 	}
 }
 
