@@ -1,10 +1,23 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+
+	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/httpserver"
+	"vllm-jukebox/internal/inflight"
+	"vllm-jukebox/internal/jukebox"
+	"vllm-jukebox/internal/vllm"
 )
 
 func main() {
@@ -30,5 +43,43 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("jukebox bootstrap ok", "config_path", configPath, "config_bytes", len(data))
+	cfg, err := config.Load(data)
+	if err != nil {
+		slog.Error("failed to parse config", "path", configPath, "err", err)
+		os.Exit(1)
+	}
+
+	var tr inflight.Tracker
+	mgr := vllm.NewManager(cfg)
+	coord := jukebox.NewCoordinator(cfg, mgr, &tr, time.Now)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go coord.Run(ctx)
+
+	app := fiber.New(fiber.Config{
+		ReadTimeout:  cfg.Server.ReadTimeout.Duration,
+		WriteTimeout: cfg.Server.WriteTimeout.Duration,
+	})
+	app.Mount("/", httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: coord,
+	}))
+
+	addr := net.JoinHostPort(cfg.Server.Host, fmt.Sprintf("%d", cfg.Server.Port))
+	slog.Info("jukebox listening", "addr", addr)
+
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+		<-ch
+		slog.Info("shutdown signal received")
+		cancel()
+		_ = app.Shutdown()
+	}()
+
+	if err := app.Listen(addr); err != nil {
+		slog.Error("server error", "err", err)
+		os.Exit(1)
+	}
 }
