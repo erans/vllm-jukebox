@@ -1,0 +1,31 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+vllm:
+  # Use uvx to run vLLM (assumes uvx is already installed).
+  binary: "uvx"
+  port: 8000
+  startup_timeout: 300s
+  shutdown_timeout: 30s
+  drain_timeout: 60s
+  swap_cooldown: 30s
+  swap_wait_timeout: 60s
+
+  defaults:
+    gpu_memory_utilization: 0.9
+    dtype: "auto"
+    max_model_len: null
+
+behavior:
+  rewrite_model_name: true
+
+models:
+  llama-3-8b:
+    path: "/models/Meta-Llama-3-8B-Instruct"
+    tensor_parallel_size: 1
+
+  # Example alias
+  gpt-3.5-turbo:
+    alias: llama-3-8b
+
