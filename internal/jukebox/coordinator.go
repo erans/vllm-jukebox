@@ -54,11 +54,15 @@ type Manager interface {
 }
 
 type Status struct {
-	State        State
-	CurrentModel string
-	InFlight     int64
-	PID          int
-	FailureCount int
+	State         State
+	CurrentModel  string
+	InFlight      int64
+	PID           int
+	FailureCount  int
+	UptimeSeconds int64
+	LastReadyAt   time.Time
+	LastSwap      *LastSwap
+	LastSwapAt    time.Time
 }
 
 type Coordinator struct {
@@ -77,6 +81,10 @@ type Coordinator struct {
 	failureCount   int
 	lastFailure    time.Time
 	swapInProgress bool
+
+	lastReadyAt time.Time
+	lastSwap    LastSwap
+	hasLastSwap bool
 }
 
 type ensureReq struct {
@@ -91,8 +99,19 @@ type ensureReply struct {
 }
 
 type swapDone struct {
-	model string
-	err   error
+	from      string
+	model     string
+	requestID string
+	duration  time.Duration
+	err       error
+}
+
+type LastSwap struct {
+	From               string
+	To                 string
+	At                 time.Time
+	Duration           time.Duration
+	TriggeredByRequest string
 }
 
 func NewCoordinator(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now func() time.Time) *Coordinator {
@@ -167,6 +186,7 @@ func (c *Coordinator) EnsureModel(ctx context.Context, requestedModel, requestID
 }
 
 func (c *Coordinator) Status() Status {
+	now := c.now()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -180,12 +200,32 @@ func (c *Coordinator) Status() Status {
 		pid = c.mgr.CurrentPID()
 	}
 
+	var uptimeSeconds int64
+	if c.state == StateReady && !c.lastReadyAt.IsZero() {
+		uptimeSeconds = int64(now.Sub(c.lastReadyAt).Seconds())
+		if uptimeSeconds < 0 {
+			uptimeSeconds = 0
+		}
+	}
+
+	var lastSwap *LastSwap
+	var lastSwapAt time.Time
+	if c.hasLastSwap {
+		copy := c.lastSwap
+		lastSwap = &copy
+		lastSwapAt = copy.At
+	}
+
 	return Status{
-		State:        c.state,
-		CurrentModel: c.currentModel,
-		InFlight:     inFlight,
-		PID:          pid,
-		FailureCount: c.failureCount,
+		State:         c.state,
+		CurrentModel:  c.currentModel,
+		InFlight:      inFlight,
+		PID:           pid,
+		FailureCount:  c.failureCount,
+		UptimeSeconds: uptimeSeconds,
+		LastReadyAt:   c.lastReadyAt,
+		LastSwap:      lastSwap,
+		LastSwapAt:    lastSwapAt,
 	}
 }
 
@@ -235,6 +275,9 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 	}
 
 	done := make(chan error, 1)
+	c.mu.RLock()
+	fromModel := c.currentModel
+	c.mu.RUnlock()
 	c.mu.Lock()
 	c.swapInProgress = true
 	if state == StateReady {
@@ -244,7 +287,7 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 	}
 	c.mu.Unlock()
 
-	go c.performSwap(resolvedName, req.requestID, done)
+	go c.performSwap(fromModel, resolvedName, req.requestID, done)
 	req.resp <- ensureReply{wait: done}
 }
 
@@ -258,8 +301,18 @@ func (c *Coordinator) handleSwapDone(ev swapDone) {
 		c.state = StateReady
 		c.currentModel = ev.model
 		c.lastSwapTime = c.now()
+		c.lastReadyAt = c.now()
 		c.failureCount = 0
 		c.lastFailure = time.Time{}
+
+		c.lastSwap = LastSwap{
+			From:               ev.from,
+			To:                 ev.model,
+			At:                 c.lastSwapTime,
+			Duration:           ev.duration,
+			TriggeredByRequest: ev.requestID,
+		}
+		c.hasLastSwap = true
 		return
 	}
 
@@ -268,8 +321,10 @@ func (c *Coordinator) handleSwapDone(ev swapDone) {
 	c.lastFailure = c.now()
 }
 
-func (c *Coordinator) performSwap(model, requestID string, done chan<- error) {
+func (c *Coordinator) performSwap(fromModel, model, requestID string, done chan<- error) {
+	start := c.now()
 	err := c.doSwap(model, requestID)
+	duration := c.now().Sub(start)
 
 	select {
 	case done <- err:
@@ -278,7 +333,7 @@ func (c *Coordinator) performSwap(model, requestID string, done chan<- error) {
 	close(done)
 
 	select {
-	case c.events <- swapDone{model: model, err: err}:
+	case c.events <- swapDone{from: fromModel, model: model, requestID: requestID, duration: duration, err: err}:
 	default:
 		// If the coordinator is shutting down, dropping this event is fine; state won't be updated.
 	}
@@ -339,4 +394,3 @@ func backoffDelay(failureCount int) time.Duration {
 		return 60 * time.Second
 	}
 }
-
