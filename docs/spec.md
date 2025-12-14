@@ -93,7 +93,7 @@ server:
 
 vllm:
   port: 8000                    # Internal vLLM port
-  binary: "vllm"                # Path to vLLM CLI or "vllm" if in PATH
+  binary: "uvx"                 # Launcher for vLLM (e.g. "uvx" to run `uvx vllm ...`, or "vllm")
   startup_timeout: 300s         # Max time to wait for model load
   shutdown_timeout: 30s         # Max time to wait for graceful stop
   drain_timeout: 60s            # Max time to wait for in-flight requests
@@ -160,7 +160,7 @@ models:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `port` | int | `8000` | Port for vLLM to listen on |
-| `binary` | string | `"vllm"` | Path to vLLM binary |
+| `binary` | string | `"uvx"` | vLLM launcher (use `"uvx"` to run `uvx vllm ...`, or `"vllm"`) |
 | `startup_timeout` | duration | `300s` | Max wait for vLLM to become ready |
 | `shutdown_timeout` | duration | `30s` | Max wait for vLLM process to exit |
 | `drain_timeout` | duration | `60s` | Max wait for in-flight requests before swap |
@@ -1014,4 +1014,3 @@ These are explicitly out of scope for v1 but worth noting:
 7. **Websocket support**: For vLLM's native websocket interface
 8. **Per-key model allowlists**: Restrict which API keys can request which models
 9. **Dynamic Retry-After**: Calculate based on remaining timeout
-
