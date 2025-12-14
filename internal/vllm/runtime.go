@@ -147,12 +147,18 @@ func (m *Manager) Stop(ctx context.Context) error {
 	cmd := m.cmd
 	pid := m.pid
 	waitCh := m.waitCh
-	m.stopRequested = true
 	m.mu.Unlock()
 
 	if cmd == nil || pid == 0 {
 		return nil
 	}
+
+	m.mu.Lock()
+	// Mark this process as an intentional stop (so wait() doesn't log it as a crash).
+	if m.cmd == cmd {
+		m.stopRequested = true
+	}
+	m.mu.Unlock()
 
 	slog.Info("vllm_process_stopping", "pid", pid)
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
@@ -163,7 +169,9 @@ func (m *Manager) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		select {
-		case <-waitCh:
+		case err := <-waitCh:
+			_ = normalizeStopWaitErr(err)
+			return nil
 		case <-time.After(2 * time.Second):
 		}
 		return ctx.Err()
