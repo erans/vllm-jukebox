@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -59,7 +60,8 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 		return 0, err
 	}
 
-	cmd := exec.CommandContext(ctx, m.cfg.VLLM.Binary, args...)
+	bin, binArgs := wrapBinaryArgs(m.cfg.VLLM.Binary, args)
+	cmd := exec.CommandContext(ctx, bin, binArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = BuildEnv(os.Environ(), m.cfg.VLLM.DefaultEnv, modelCfg.Env)
 	cmd.Stdout = io.Discard
@@ -110,6 +112,13 @@ func (m *Manager) Stop(ctx context.Context) error {
 		m.clear()
 		return ctx.Err()
 	}
+}
+
+func wrapBinaryArgs(binary string, args []string) (string, []string) {
+	if filepath.Base(binary) == "uvx" {
+		return binary, append([]string{"vllm"}, args...)
+	}
+	return binary, args
 }
 
 func normalizeStopWaitErr(err error) error {
