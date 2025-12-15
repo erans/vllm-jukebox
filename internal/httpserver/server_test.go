@@ -287,11 +287,15 @@ models:
 }
 
 func TestSwitchingProxy_EnsuresModelAndRewritesModelNameInJSON(t *testing.T) {
+	var backendReqBody []byte
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			http.NotFound(w, r)
 			return
 		}
+		b, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		backendReqBody = b
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"base"}`))
 	}))
@@ -338,6 +342,9 @@ models:
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(bodyBytes), `"model":"alias"`) {
 		t.Fatalf("expected rewritten model in body, got: %s", string(bodyBytes))
+	}
+	if !strings.Contains(string(backendReqBody), `"model":"/models/base"`) {
+		t.Fatalf("expected request model to be rewritten for vLLM, got: %s", string(backendReqBody))
 	}
 }
 

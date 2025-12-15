@@ -433,6 +433,10 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 	err = c.mgr.VerifyReady(verifyCtx, model)
 	cancel()
 	if err != nil {
+		// Ensure we don't leave a partially-started vLLM process around if verification fails.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), c.cfg.VLLM.ShutdownTimeout.Duration)
+		_ = c.mgr.Stop(stopCtx)
+		stopCancel()
 		return err
 	}
 

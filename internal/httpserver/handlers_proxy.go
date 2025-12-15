@@ -31,7 +31,8 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		c.Locals(requestedModelLocal, modelName)
 
 		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
-		if _, _, err := opts.Config.ResolveModel(modelName); err != nil {
+		_, modelCfg, err := opts.Config.ResolveModel(modelName)
+		if err != nil {
 			return writeOpenAIError(
 				c,
 				http.StatusBadRequest,
@@ -60,6 +61,7 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			BaseURL:          fmt.Sprintf("http://127.0.0.1:%d", opts.Config.VLLM.Port),
 			RewriteModelName: opts.Config.Behavior.RewriteModelName,
 			RequestedModel:   modelName,
+			UpstreamModel:    modelCfg.Path,
 			RequestID:        requestID,
 		})
 	}

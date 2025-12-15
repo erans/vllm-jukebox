@@ -11,9 +11,16 @@ set -euo pipefail
 #   RUN_VLLM_SMOKE=1 VLLM_MODEL=/path/to/model ./scripts/smoke_vllm.sh
 #   RUN_VLLM_SMOKE=1 VLLM_MODEL=meta-llama/Meta-Llama-3-8B-Instruct ./scripts/smoke_vllm.sh
 #
+# Note:
+#   Some HuggingFace model IDs (e.g. meta-llama/*) are gated and require access + a token
+#   (export `HUGGING_FACE_HUB_TOKEN` or `HF_TOKEN`) or vLLM will fail fast during startup.
+#
 # Optional:
 #   VLLM_STARTUP_TIMEOUT_SECS=600
 #   JBOX_REQUEST_TIMEOUT_SECS=120
+#   VLLM_GPU_MEMORY_UTILIZATION=0.70
+#   VLLM_MAX_MODEL_LEN=2048
+#   VLLM_DTYPE=float16
 
 if [[ "${RUN_VLLM_SMOKE:-}" != "1" ]]; then
   echo "skipping: set RUN_VLLM_SMOKE=1 to run real vLLM smoke"
@@ -23,6 +30,12 @@ fi
 if [[ -z "${VLLM_MODEL:-}" ]]; then
   echo "error: set VLLM_MODEL to a local model path or HuggingFace ID" >&2
   exit 2
+fi
+
+if [[ "${VLLM_MODEL}" == meta-llama/* ]]; then
+  if [[ -z "${HUGGING_FACE_HUB_TOKEN:-}" && -z "${HF_TOKEN:-}" ]]; then
+    echo "note: VLLM_MODEL=${VLLM_MODEL} is usually gated; you likely need access + HUGGING_FACE_HUB_TOKEN (or HF_TOKEN)" >&2
+  fi
 fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,6 +71,9 @@ PY
 
 startup_timeout="${VLLM_STARTUP_TIMEOUT_SECS:-600}"
 req_timeout="${JBOX_REQUEST_TIMEOUT_SECS:-120}"
+gpu_mem="${VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
+max_len="${VLLM_MAX_MODEL_LEN:-2048}"
+dtype="${VLLM_DTYPE:-float16}"
 
 tmp_cfg="$(mktemp)"
 tmp_out="$(mktemp)"
@@ -92,6 +108,9 @@ models:
   smoke:
     path: "${VLLM_MODEL}"
     tensor_parallel_size: 1
+    gpu_memory_utilization: ${gpu_mem}
+    max_model_len: ${max_len}
+    dtype: "${dtype}"
 YAML
 
 bin/jukebox -config "$tmp_cfg" &
@@ -155,4 +174,3 @@ curl -fsS "http://127.0.0.1:${jbox_port}/status" >/dev/null
 curl -fsS "http://127.0.0.1:${jbox_port}/metrics" >/dev/null
 
 echo "vllm smoke ok"
-

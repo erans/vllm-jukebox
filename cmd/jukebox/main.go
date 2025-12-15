@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"strings"
 	"syscall"
 	"time"
@@ -93,6 +94,22 @@ func main() {
 		InFlight:    &tr,
 	}))
 
+	var stopOnce sync.Once
+	stopVLLM := func() {
+		stopOnce.Do(func() {
+			timeout := cfg.VLLM.ShutdownTimeout.Duration
+			if timeout <= 0 {
+				timeout = 30 * time.Second
+			}
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), timeout)
+			defer stopCancel()
+			if err := mgr.Stop(stopCtx); err != nil {
+				slog.Error("failed to stop vLLM", "err", err)
+			}
+		})
+	}
+	defer stopVLLM()
+
 	addr := net.JoinHostPort(cfg.Server.Host, fmt.Sprintf("%d", cfg.Server.Port))
 	slog.Info("jukebox listening", "addr", addr)
 
@@ -103,6 +120,7 @@ func main() {
 		slog.Info("shutdown signal received")
 		cancel()
 		_ = app.Shutdown()
+		stopVLLM()
 	}()
 
 	if err := app.Listen(addr); err != nil && !isExpectedShutdownErr(err) {

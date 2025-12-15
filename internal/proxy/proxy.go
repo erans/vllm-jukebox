@@ -16,6 +16,7 @@ type ForwardOptions struct {
 	BaseURL           string
 	RewriteModelName  bool
 	RequestedModel    string
+	UpstreamModel     string
 	RequestID         string
 	AdditionalHeaders map[string]string
 	Timeout           time.Duration
@@ -26,6 +27,11 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 
 	var body io.Reader
 	if b := c.Body(); len(b) > 0 {
+		if opts.UpstreamModel != "" && strings.Contains(strings.ToLower(c.Get("Content-Type")), "application/json") {
+			if rewritten, ok, err := RewriteJSONModel(b, opts.UpstreamModel); err == nil && ok {
+				b = rewritten
+			}
+		}
 		body = bytes.NewReader(b)
 	}
 

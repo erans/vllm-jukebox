@@ -228,3 +228,37 @@ models:
 		t.Fatalf("expected status state error, got %s", st.State)
 	}
 }
+
+func TestCoordinator_StopsStartedProcessIfVerifyFails(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  shutdown_timeout: 1s
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load cfg: %v", err)
+	}
+
+	var tr inflight.Tracker
+	mgr := &fakeManager{verifyErr: errors.New("verify failed")}
+	clock := func() time.Time { return time.Unix(0, 0) }
+
+	c := jukebox.NewCoordinator(cfg, mgr, &tr, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	err = c.EnsureModel(context.Background(), "m", "req_1")
+	if err == nil {
+		t.Fatalf("expected EnsureModel to fail")
+	}
+	if mgr.startCalls != 1 {
+		t.Fatalf("expected 1 start call, got %d", mgr.startCalls)
+	}
+	if mgr.stopCalls != 1 {
+		t.Fatalf("expected 1 stop call after verify failure, got %d", mgr.stopCalls)
+	}
+}

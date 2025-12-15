@@ -239,6 +239,114 @@ models:
 	}
 }
 
+func TestManager_VerifyReady_FailsFastIfProcessExits(t *testing.T) {
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "exit_soon.sh")
+	if err := os.WriteFile(scriptPath, []byte(`#!/bin/sh
+sleep 0.1
+exit 1
+`), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	cfgLoaded, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "` + scriptPath + `"
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	mgr := vllm.NewManager(cfgLoaded)
+
+	startCtx, startCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer startCancel()
+	if _, err := mgr.Start(startCtx, "m"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer readyCancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- mgr.VerifyReady(readyCtx, "m")
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("expected VerifyReady to fail when process exits")
+		}
+	case <-time.After(750 * time.Millisecond):
+		readyCancel()
+		select {
+		case <-done:
+		case <-time.After(1 * time.Second):
+		}
+		t.Fatalf("expected VerifyReady to fail fast after process exit")
+	}
+}
+
+func TestManager_Start_DoesNotBindProcessLifetimeToContext(t *testing.T) {
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "sleep.sh")
+	if err := os.WriteFile(scriptPath, []byte(`#!/bin/sh
+sleep 1000
+`), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	cfgLoaded, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "` + scriptPath + `"
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	mgr := vllm.NewManager(cfgLoaded)
+
+	startCtx, cancel := context.WithCancel(context.Background())
+	pid, err := mgr.Start(startCtx, "m")
+	if err != nil {
+		cancel()
+		t.Fatalf("start: %v", err)
+	}
+	cancel()
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for {
+		if mgr.CurrentPID() != 0 && syscall.Kill(pid, 0) == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected process to still be running after ctx cancel (pid=%d current_pid=%d)", pid, mgr.CurrentPID())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// If Start binds process lifetime to the passed context, it should die quickly after cancel().
+	time.Sleep(200 * time.Millisecond)
+	if mgr.CurrentPID() == 0 {
+		t.Fatalf("expected process to remain running briefly after ctx cancel, but pid became 0")
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	if err := mgr.Stop(stopCtx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
 func bytesTrimSpace(b []byte) []byte {
 	i := 0
 	j := len(b)

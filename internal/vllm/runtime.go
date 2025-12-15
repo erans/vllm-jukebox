@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -25,11 +24,40 @@ type Manager struct {
 	cmd           *exec.Cmd
 	pid           int
 	waitCh        chan error
+	exitCh        chan struct{}
+	exitInfo      *processExitInfo
 	stopRequested bool
 	currentModel  string
 	startedAt     time.Time
 	stderrTail    *tailBuffer
+	stdoutTail    *tailBuffer
 }
+
+type processExitInfo struct {
+	pid        int
+	model      string
+	err        error
+	stdoutTail string
+	stderrTail string
+}
+
+type ProcessExitedError struct {
+	PID        int
+	Model      string
+	Err        error
+	StdoutTail string
+	StderrTail string
+}
+
+func (e *ProcessExitedError) Error() string {
+	msg := fmt.Sprintf("vLLM process exited (pid=%d model=%q)", e.PID, e.Model)
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+func (e *ProcessExitedError) Unwrap() error { return e.Err }
 
 func NewManager(cfg *config.Config) *Manager {
 	return &Manager{cfg: cfg}
@@ -50,6 +78,12 @@ func (m *Manager) BaseURL() string {
 }
 
 func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+
 	m.mu.Lock()
 	if m.cmd != nil {
 		m.mu.Unlock()
@@ -68,10 +102,11 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	}
 
 	bin, binArgs := wrapBinaryArgs(m.cfg.VLLM.Binary, args)
-	cmd := exec.CommandContext(ctx, bin, binArgs...)
+	cmd := exec.Command(bin, binArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = BuildEnv(os.Environ(), m.cfg.VLLM.DefaultEnv, modelCfg.Env)
-	cmd.Stdout = io.Discard
+	stdoutTail := newTailBuffer(16 * 1024)
+	cmd.Stdout = stdoutTail
 	stderrTail := newTailBuffer(16 * 1024)
 	cmd.Stderr = stderrTail
 
@@ -80,14 +115,18 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	}
 
 	waitCh := make(chan error, 1)
+	exitCh := make(chan struct{})
 	m.mu.Lock()
 	m.cmd = cmd
 	m.pid = cmd.Process.Pid
 	m.waitCh = waitCh
+	m.exitCh = exitCh
+	m.exitInfo = nil
 	m.stopRequested = false
 	m.currentModel = modelName
 	m.startedAt = time.Now()
 	m.stderrTail = stderrTail
+	m.stdoutTail = stdoutTail
 	m.mu.Unlock()
 
 	slog.Info(
@@ -106,21 +145,36 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 		pid := m.pid
 		model := m.currentModel
 		stderr := ""
+		stdout := ""
 		if m.stderrTail != nil {
 			stderr = m.stderrTail.String()
+		}
+		if m.stdoutTail != nil {
+			stdout = m.stdoutTail.String()
 		}
 
 		// Only clear if this is still the current process.
 		if m.cmd == cmd {
+			m.exitInfo = &processExitInfo{
+				pid:        pid,
+				model:      model,
+				err:        err,
+				stdoutTail: stdout,
+				stderrTail: stderr,
+			}
 			m.cmd = nil
 			m.pid = 0
 			m.waitCh = nil
+			m.exitCh = nil
 			m.stopRequested = false
 			m.currentModel = ""
 			m.startedAt = time.Time{}
 			m.stderrTail = nil
+			m.stdoutTail = nil
 		}
 		m.mu.Unlock()
+
+		close(exitCh)
 
 		if err != nil && !stopRequested {
 			slog.Error(
@@ -128,6 +182,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 				"pid", pid,
 				"model", model,
 				"err", err,
+				"stdout_tail", stdout,
 				"stderr_tail", stderr,
 			)
 		} else {
@@ -179,7 +234,8 @@ func (m *Manager) Stop(ctx context.Context) error {
 }
 
 func wrapBinaryArgs(binary string, args []string) (string, []string) {
-	if filepath.Base(binary) == "uvx" {
+	switch filepath.Base(binary) {
+	case "uvx", "uvx.exe":
 		return binary, append([]string{"vllm"}, args...)
 	}
 	return binary, args
@@ -199,7 +255,43 @@ func normalizeStopWaitErr(err error) error {
 
 func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 	base := m.BaseURL()
-	if err := WaitForHealth(ctx, base); err != nil {
+
+	m.mu.Lock()
+	exitCh := m.exitCh
+	exitInfo := m.exitInfo
+	cmd := m.cmd
+	pid := m.pid
+	m.mu.Unlock()
+
+	if cmd == nil || pid == 0 {
+		if exitInfo != nil {
+			return &ProcessExitedError{
+				PID:        exitInfo.pid,
+				Model:      exitInfo.model,
+				Err:        exitInfo.err,
+				StdoutTail: exitInfo.stdoutTail,
+				StderrTail: exitInfo.stderrTail,
+			}
+		}
+		return fmt.Errorf("vLLM process is not running")
+	}
+
+	if err := WaitForHealthOrExit(ctx, base, exitCh); err != nil {
+		if errors.Is(err, ErrProcessExited) {
+			m.mu.Lock()
+			exitInfo := m.exitInfo
+			m.mu.Unlock()
+			if exitInfo != nil {
+				return &ProcessExitedError{
+					PID:        exitInfo.pid,
+					Model:      exitInfo.model,
+					Err:        exitInfo.err,
+					StdoutTail: exitInfo.stdoutTail,
+					StderrTail: exitInfo.stderrTail,
+				}
+			}
+			return fmt.Errorf("vLLM process exited while waiting for health")
+		}
 		return err
 	}
 
