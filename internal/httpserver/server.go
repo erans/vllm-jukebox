@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 
 	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/inflight"
@@ -28,8 +29,11 @@ type Options struct {
 func NewApp(opts Options) *fiber.App {
 	app := fiber.New()
 
+	app.Use(recover.New())
 	app.Use(requestIDMiddleware())
-	app.Use(requestLoggingMiddleware())
+	if opts.Config == nil || opts.Config.Server.LogRequests == nil || *opts.Config.Server.LogRequests {
+		app.Use(requestLoggingMiddleware())
+	}
 
 	app.Get("/health", healthHandler(opts.Coordinator))
 	app.Get("/status", statusHandler(opts.Config, opts.Coordinator))

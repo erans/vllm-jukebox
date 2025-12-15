@@ -181,6 +181,69 @@ func TestNewApp_ReturnsFiberApp(t *testing.T) {
 	}
 }
 
+func TestServer_LogRequestsCanBeDisabled(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+	})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_RecoveryMiddlewareReturns500OnPanic(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	app := httpserver.NewApp(httpserver.Options{
+		Config:      cfg,
+		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+	})
+	app.Get("/_panic", func(c *fiber.Ctx) error {
+		panic("boom")
+	})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/_panic", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	}
+}
+
 func TestModels_ReturnsConfiguredModels(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 vllm:

@@ -40,6 +40,7 @@ type ServerConfig struct {
 	Port         int      `yaml:"port"`
 	ReadTimeout  Duration `yaml:"read_timeout"`
 	WriteTimeout Duration `yaml:"write_timeout"`
+	LogRequests  *bool    `yaml:"log_requests"`
 }
 
 type VLLMConfig struct {
@@ -106,6 +107,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.WriteTimeout.Duration == 0 {
 		c.Server.WriteTimeout = Duration{Duration: 300 * time.Second}
+	}
+	if c.Server.LogRequests == nil {
+		// Default to logging requests (can be noisy in prod; make it configurable).
+		v := true
+		c.Server.LogRequests = &v
 	}
 
 	if c.VLLM.Port == 0 {

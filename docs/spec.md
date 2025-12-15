@@ -154,6 +154,7 @@ models:
 | `port` | int | `8080` | Listen port |
 | `read_timeout` | duration | `30s` | HTTP read timeout |
 | `write_timeout` | duration | `300s` | HTTP write timeout |
+| `log_requests` | bool | `true` | Emit per-request logs |
 
 #### `vllm`
 
