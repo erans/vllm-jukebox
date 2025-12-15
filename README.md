@@ -2,7 +2,7 @@
 
 vLLM Jukebox is an OpenAI-compatible HTTP server that can run in either:
 
-- **Legacy swap mode**: fronts a **single** vLLM instance and automatically **swaps the loaded model** based on each incoming request’s `model`.
+- **Swap mode**: fronts a **single** vLLM instance and automatically **swaps the loaded model** based on each incoming request’s `model`.
 - **Scheduler mode**: runs **multiple concurrent** vLLM instances (one per configured GPU set + port), routes requests by `model`, and can evict non-pinned instances (LRU) to make room for larger models.
 
 This is useful when:
