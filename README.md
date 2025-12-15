@@ -19,6 +19,11 @@ Health:
 curl -s http://127.0.0.1:8080/health
 ```
 
+Metrics:
+```bash
+curl -s http://127.0.0.1:8080/metrics
+```
+
 List configured models:
 ```bash
 curl -s http://127.0.0.1:8080/v1/models
@@ -44,3 +49,14 @@ Set `vllm.binary: "uvx"` and Jukebox will run vLLM as `uvx vllm serve ...`.
 
 `/status` can reveal operational details; bind it to localhost or put it behind auth in production.
 
+## Smoke tests
+
+Lightweight (no real vLLM required):
+```bash
+./scripts/smoke.sh
+```
+
+Real vLLM integration (opt-in; requires `uvx` and a model):
+```bash
+RUN_VLLM_SMOKE=1 VLLM_MODEL=/path/to/model ./scripts/smoke_vllm.sh
+```
