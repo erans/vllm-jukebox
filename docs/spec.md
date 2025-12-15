@@ -1,10 +1,13 @@
 # vLLM Jukebox
 
-**Technical Specification v0.2**
+**Technical Specification v0.3**
 
 ## Overview
 
-vLLM Jukebox is an OpenAI-compatible API server that fronts a single vLLM instance, providing automatic model switching based on incoming requests. When a request arrives for a model that isn't currently loaded, Jukebox gracefully drains in-flight requests, stops the current vLLM process, and starts a new one with the requested model.
+vLLM Jukebox is an OpenAI-compatible API server that can run in either:
+
+- **Legacy swap mode**: fronts a single vLLM instance, providing automatic model switching based on incoming requests.
+- **Scheduler mode**: runs multiple concurrent vLLM instances (one per model/GPU-set/port) and routes requests by `model`.
 
 ## Goals
 
@@ -15,7 +18,7 @@ vLLM Jukebox is an OpenAI-compatible API server that fronts a single vLLM instan
 
 ## Non-Goals (v1)
 
-- Multiple concurrent vLLM instances
+- Load balancing across multiple instances for the same model
 - Request queuing during model switches (beyond the triggering request)
 - LoRA adapter hot-swapping
 - Load balancing across multiple backends
@@ -84,6 +87,8 @@ Configuration is provided via a YAML file.
 
 ### Example Configuration
 
+#### Legacy swap mode
+
 ```yaml
 server:
   host: "0.0.0.0"
@@ -144,6 +149,33 @@ models:
     alias: llama-3-8b
 ```
 
+#### Scheduler mode (multi-instance)
+
+In scheduler mode, each non-alias model declares:
+- `gpus`: exact GPU IDs to use (scheduler sets `CUDA_VISIBLE_DEVICES` automatically)
+- `min_free_mem_mb_per_gpu`: placement guardrail based on `nvidia-smi` free memory
+- Optional `pinned: true` to prevent eviction
+
+```yaml
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8199
+  max_instances: 8
+  min_instance_uptime: 30s
+  nvidia_smi_binary: "nvidia-smi"
+
+models:
+  small:
+    path: "/models/small"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 4000
+
+  big:
+    path: "/models/big"
+    gpus: [0,1,2,3]
+    min_free_mem_mb_per_gpu: 40000
+```
+
 ### Configuration Schema
 
 #### `server`
@@ -170,6 +202,18 @@ models:
 | `defaults` | object | `{}` | Default vLLM arguments |
 | `default_env` | object | `{}` | Default environment variables |
 
+#### `scheduler`
+
+If `scheduler` is provided, Jukebox runs in scheduler mode (multi-instance) and **must not** set `CUDA_VISIBLE_DEVICES` in `vllm.default_env` or any `models.<name>.env` (the scheduler owns that setting).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `nvidia_smi_binary` | string | `"nvidia-smi"` | GPU inventory command |
+| `port_range_start` | int | (required) | First port for instance allocation |
+| `port_range_end` | int | (required) | Last port for instance allocation |
+| `max_instances` | int | `null` | Optional cap on concurrent instances |
+| `min_instance_uptime` | duration | `30s` | Minimum uptime before eviction (reduces thrash) |
+
 #### `behavior`
 
 | Field | Type | Default | Description |
@@ -183,6 +227,9 @@ models:
 |-------|------|----------|-------------|
 | `path` | string | Yes* | Path to model weights (local or HuggingFace ID) |
 | `alias` | string | No | Reference another model config by name |
+| `gpus` | []int | No** | Exact GPU IDs to assign (scheduler mode) |
+| `min_free_mem_mb_per_gpu` | int | No** | Required free MB per GPU (scheduler mode) |
+| `pinned` | bool | No | If true, instance is never evicted (scheduler mode) |
 | `tensor_parallel_size` | int | No | Number of GPUs for tensor parallelism |
 | `pipeline_parallel_size` | int | No | Number of GPUs for pipeline parallelism |
 | `max_model_len` | int | No | Maximum sequence length |
@@ -192,7 +239,8 @@ models:
 | `extra_args` | []string | No | Additional CLI arguments for vLLM |
 | `env` | object | No | Environment variables (merged with default_env) |
 
-*Required unless `alias` is specified.
+*Required unless `alias` is specified.  
+**Required for non-alias models when `scheduler` is enabled.
 
 ### Configuration Validation
 

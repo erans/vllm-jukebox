@@ -16,7 +16,7 @@ import (
 
 func switchingProxyHandler(opts Options) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		if opts.Config == nil || opts.Coordinator == nil {
+		if opts.Config == nil || opts.Router == nil {
 			return writeOpenAIError(c, http.StatusInternalServerError, "server not configured", "internal_error", "config_missing")
 		}
 
@@ -31,7 +31,7 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		c.Locals(requestedModelLocal, modelName)
 
 		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
-		_, modelCfg, err := opts.Config.ResolveModel(modelName)
+		_, _, err = opts.Config.ResolveModel(modelName)
 		if err != nil {
 			return writeOpenAIError(
 				c,
@@ -47,53 +47,20 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			requestID = c.Get(requestIDHeader)
 		}
 
-		if err := opts.Coordinator.EnsureModel(c.UserContext(), modelName, requestID); err != nil {
+		route, err := opts.Router.AcquireRoute(c.UserContext(), modelName, requestID)
+		if err != nil {
 			return mapEnsureError(c, err)
 		}
-
-		var done func()
-		if opts.InFlight != nil {
-			done = opts.InFlight.Track(c.UserContext())
-			defer done()
+		if route.Done != nil {
+			defer route.Done()
 		}
 
 		return proxy.ForwardFiber(c, proxy.ForwardOptions{
-			BaseURL:          fmt.Sprintf("http://127.0.0.1:%d", opts.Config.VLLM.Port),
+			BaseURL:          route.BaseURL,
 			RewriteModelName: opts.Config.Behavior.RewriteModelName,
 			RequestedModel:   modelName,
-			UpstreamModel:    modelCfg.Path,
+			UpstreamModel:    route.UpstreamModel,
 			RequestID:        requestID,
-		})
-	}
-}
-
-func passthroughProxyHandler(opts Options) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		if opts.Config == nil || opts.Coordinator == nil {
-			return writeOpenAIError(c, http.StatusInternalServerError, "server not configured", "internal_error", "config_missing")
-		}
-
-		st := opts.Coordinator.Status()
-		c.Locals(requestedModelLocal, st.CurrentModel)
-		if st.State != jukebox.StateReady {
-			c.Set("Retry-After", "5")
-			return writeOpenAIError(c, http.StatusServiceUnavailable, "Model switch in progress, please retry", "service_unavailable", "model_switching")
-		}
-
-		requestID, _ := c.Locals(requestIDHeader).(string)
-		if requestID == "" {
-			requestID = c.Get(requestIDHeader)
-		}
-
-		var done func()
-		if opts.InFlight != nil {
-			done = opts.InFlight.Track(c.UserContext())
-			defer done()
-		}
-
-		return proxy.ForwardFiber(c, proxy.ForwardOptions{
-			BaseURL:   fmt.Sprintf("http://127.0.0.1:%d", opts.Config.VLLM.Port),
-			RequestID: requestID,
 		})
 	}
 }
@@ -127,7 +94,18 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 		if rej.Reason == jukebox.RejectBackoff {
 			return writeOpenAIError(c, http.StatusInternalServerError, "vLLM in error state, please retry", "internal_error", "vllm_error")
 		}
-		return writeOpenAIError(c, http.StatusServiceUnavailable, "Model switch in progress, please retry", "service_unavailable", "model_switching")
+		msg := "Model switch in progress, please retry"
+		switch rej.Reason {
+		case jukebox.RejectPinnedConflict:
+			msg = "Insufficient resources: requested model conflicts with a pinned model"
+		case jukebox.RejectNoCapacity:
+			msg = "Insufficient capacity to start requested model, please retry"
+		case jukebox.RejectInsufficient:
+			msg = "Insufficient GPU resources to start requested model, please retry"
+		case jukebox.RejectMinUptime:
+			msg = "Insufficient GPU resources (min uptime), please retry"
+		}
+		return writeOpenAIError(c, http.StatusServiceUnavailable, msg, "service_unavailable", "model_switching")
 	}
 
 	return writeOpenAIError(c, http.StatusInternalServerError, "vLLM unavailable", "internal_error", "vllm_unavailable")

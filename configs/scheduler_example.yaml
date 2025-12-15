@@ -1,0 +1,47 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+vllm:
+  binary: "uvx"
+  startup_timeout: 300s
+  shutdown_timeout: 30s
+  drain_timeout: 60s
+  swap_wait_timeout: 60s
+  defaults:
+    gpu_memory_utilization: 0.70
+    dtype: "float16"
+    max_model_len: 2048
+
+scheduler:
+  # vLLM instances will be started on ports in this range.
+  port_range_start: 8100
+  port_range_end: 8199
+  # Optional cap on concurrent instances.
+  max_instances: 8
+  # Prevent thrash: don't evict instances that just started.
+  min_instance_uptime: 30s
+  # Command used for GPU inventory. Keep as "nvidia-smi" on NVIDIA systems.
+  nvidia_smi_binary: "nvidia-smi"
+
+behavior:
+  rewrite_model_name: true
+
+models:
+  # NOTE: In scheduler mode, do NOT set CUDA_VISIBLE_DEVICES in env; the scheduler owns it.
+  small:
+    path: "Qwen/Qwen2.5-0.5B-Instruct"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 4000
+
+  big:
+    path: "/models/Meta-Llama-3-70B-Instruct"
+    gpus: [0,1,2,3]
+    min_free_mem_mb_per_gpu: 40000
+
+  pinned-hot:
+    path: "/models/Some-Always-On-Model"
+    gpus: [4]
+    min_free_mem_mb_per_gpu: 16000
+    pinned: true
+

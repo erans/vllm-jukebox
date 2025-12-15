@@ -32,6 +32,7 @@ type Config struct {
 	Server   ServerConfig           `yaml:"server"`
 	VLLM     VLLMConfig             `yaml:"vllm"`
 	Behavior BehaviorConfig         `yaml:"behavior"`
+	Scheduler *SchedulerConfig      `yaml:"scheduler"`
 	Models   map[string]ModelConfig `yaml:"models"`
 }
 
@@ -56,6 +57,14 @@ type VLLMConfig struct {
 	DefaultEnv map[string]string `yaml:"default_env"`
 }
 
+type SchedulerConfig struct {
+	NvidiaSMIBinary   string   `yaml:"nvidia_smi_binary"`
+	PortRangeStart    int      `yaml:"port_range_start"`
+	PortRangeEnd      int      `yaml:"port_range_end"`
+	MaxInstances      *int     `yaml:"max_instances"`
+	MinInstanceUptime *Duration `yaml:"min_instance_uptime"`
+}
+
 type VLLMDefaults struct {
 	GPUMemoryUtilization *float64 `yaml:"gpu_memory_utilization"`
 	DType                string   `yaml:"dtype"`
@@ -70,6 +79,9 @@ type BehaviorConfig struct {
 type ModelConfig struct {
 	Path                 string            `yaml:"path"`
 	Alias                string            `yaml:"alias"`
+	GPUs                 []int             `yaml:"gpus"`
+	MinFreeMemMBPerGPU   *int              `yaml:"min_free_mem_mb_per_gpu"`
+	Pinned               *bool             `yaml:"pinned"`
 	TensorParallelSize   *int              `yaml:"tensor_parallel_size"`
 	PipelineParallelSize *int              `yaml:"pipeline_parallel_size"`
 	MaxModelLen          *int              `yaml:"max_model_len"`
@@ -138,6 +150,15 @@ func (c *Config) applyDefaults() {
 	if c.VLLM.DefaultEnv == nil {
 		c.VLLM.DefaultEnv = map[string]string{}
 	}
+
+	if c.Scheduler != nil {
+		if c.Scheduler.NvidiaSMIBinary == "" {
+			c.Scheduler.NvidiaSMIBinary = "nvidia-smi"
+		}
+		if c.Scheduler.MinInstanceUptime == nil {
+			c.Scheduler.MinInstanceUptime = &Duration{Duration: 30 * time.Second}
+		}
+	}
 }
 
 func (c *Config) Validate() error {
@@ -148,6 +169,10 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := validatePort("vllm.port", c.VLLM.Port); err != nil {
+		return err
+	}
+
+	if err := c.validateScheduler(); err != nil {
 		return err
 	}
 
@@ -170,6 +195,69 @@ func (c *Config) Validate() error {
 
 	if err := c.validateAliases(); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (c *Config) validateScheduler() error {
+	if c.Scheduler == nil {
+		return nil
+	}
+
+	if err := validatePort("scheduler.port_range_start", c.Scheduler.PortRangeStart); err != nil {
+		return err
+	}
+	if err := validatePort("scheduler.port_range_end", c.Scheduler.PortRangeEnd); err != nil {
+		return err
+	}
+	if c.Scheduler.PortRangeStart > c.Scheduler.PortRangeEnd {
+		return fmt.Errorf("scheduler.port_range_start must be <= scheduler.port_range_end")
+	}
+
+	if c.Scheduler.MaxInstances != nil {
+		if *c.Scheduler.MaxInstances <= 0 {
+			return fmt.Errorf("scheduler.max_instances must be > 0")
+		}
+		portCount := c.Scheduler.PortRangeEnd - c.Scheduler.PortRangeStart + 1
+		if *c.Scheduler.MaxInstances > portCount {
+			return fmt.Errorf("scheduler.max_instances (%d) must be <= number of ports in range (%d)", *c.Scheduler.MaxInstances, portCount)
+		}
+	}
+
+	if _, ok := c.VLLM.DefaultEnv["CUDA_VISIBLE_DEVICES"]; ok {
+		return fmt.Errorf("vllm.default_env must not set CUDA_VISIBLE_DEVICES when scheduler is enabled")
+	}
+	for name, model := range c.Models {
+		if model.Env != nil {
+			if _, ok := model.Env["CUDA_VISIBLE_DEVICES"]; ok {
+				return fmt.Errorf("model %q env must not set CUDA_VISIBLE_DEVICES when scheduler is enabled", name)
+			}
+		}
+	}
+
+	for name, model := range c.Models {
+		if model.Alias != "" {
+			continue
+		}
+
+		if len(model.GPUs) == 0 {
+			return fmt.Errorf("model %q requires 'gpus' when scheduler is enabled", name)
+		}
+		seen := map[int]bool{}
+		for _, gpu := range model.GPUs {
+			if gpu < 0 {
+				return fmt.Errorf("model %q gpus must be >= 0", name)
+			}
+			if seen[gpu] {
+				return fmt.Errorf("model %q gpus must not contain duplicates", name)
+			}
+			seen[gpu] = true
+		}
+
+		if model.MinFreeMemMBPerGPU == nil || *model.MinFreeMemMBPerGPU <= 0 {
+			return fmt.Errorf("model %q requires 'min_free_mem_mb_per_gpu' > 0 when scheduler is enabled", name)
+		}
 	}
 
 	return nil

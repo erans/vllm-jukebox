@@ -30,6 +30,10 @@ const (
 	RejectCooldown       RejectReason = "cooldown"
 	RejectBackoff        RejectReason = "backoff"
 	RejectWaitTimeout    RejectReason = "wait_timeout"
+	RejectPinnedConflict RejectReason = "pinned_conflict"
+	RejectNoCapacity     RejectReason = "no_capacity"
+	RejectInsufficient   RejectReason = "insufficient_resources"
+	RejectMinUptime      RejectReason = "min_uptime"
 )
 
 type RejectError struct {
@@ -65,6 +69,25 @@ type Status struct {
 	LastReadyAt   time.Time
 	LastSwap      *LastSwap
 	LastSwapAt    time.Time
+
+	// Scheduler mode (multi-instance). These fields are best-effort and are
+	// currently unused by the legacy single-instance coordinator.
+	SchedulerBusy bool
+	Waiters       []string
+	Instances     []InstanceStatus
+}
+
+type InstanceStatus struct {
+	Model      string
+	Port       int
+	GPUs       []int
+	PID        int
+	State      State
+	Pinned     bool
+	Draining   bool
+	InFlight   int64
+	StartedAt  time.Time
+	LastUsedAt time.Time
 }
 
 type Coordinator struct {
@@ -74,7 +97,6 @@ type Coordinator struct {
 	now func() time.Time
 
 	requests chan ensureReq
-	events   chan swapDone
 
 	mu             sync.RWMutex
 	state          State
@@ -126,7 +148,6 @@ func NewCoordinator(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now f
 		tr:       tr,
 		now:      now,
 		requests: make(chan ensureReq),
-		events:   make(chan swapDone, 1),
 		state:    StateIdle,
 	}
 }
@@ -136,8 +157,6 @@ func (c *Coordinator) Run(ctx context.Context) {
 		select {
 		case req := <-c.requests:
 			c.handleEnsure(req)
-		case ev := <-c.events:
-			c.handleSwapDone(ev)
 		case <-ctx.Done():
 			return
 		}
@@ -385,17 +404,13 @@ func (c *Coordinator) performSwap(fromModel, model, requestID string, done chan<
 	err := c.doSwap(model, requestID)
 	duration := c.now().Sub(start)
 
+	c.handleSwapDone(swapDone{from: fromModel, model: model, requestID: requestID, duration: duration, err: err})
+
 	select {
 	case done <- err:
 	default:
 	}
 	close(done)
-
-	select {
-	case c.events <- swapDone{from: fromModel, model: model, requestID: requestID, duration: duration, err: err}:
-	default:
-		// If the coordinator is shutting down, dropping this event is fine; state won't be updated.
-	}
 }
 
 func (c *Coordinator) doSwap(model, requestID string) error {

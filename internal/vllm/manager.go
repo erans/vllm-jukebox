@@ -9,6 +9,10 @@ import (
 )
 
 func BuildServeArgs(cfg *config.Config, requestedModel string) ([]string, error) {
+	return BuildServeArgsForPort(cfg, requestedModel, cfg.VLLM.Port)
+}
+
+func BuildServeArgsForPort(cfg *config.Config, requestedModel string, port int) ([]string, error) {
 	resolvedName, model, err := cfg.ResolveModel(requestedModel)
 	if err != nil {
 		return nil, err
@@ -20,7 +24,7 @@ func BuildServeArgs(cfg *config.Config, requestedModel string) ([]string, error)
 		"serve",
 		model.Path,
 		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(cfg.VLLM.Port),
+		"--port", strconv.Itoa(port),
 	}
 
 	if model.TensorParallelSize != nil {
@@ -85,4 +89,3 @@ func BuildEnv(base []string, defaultEnv map[string]string, modelEnv map[string]s
 	}
 	return out
 }
-

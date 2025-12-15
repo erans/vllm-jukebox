@@ -87,6 +87,42 @@ var (
 			Help: "Consecutive vLLM start/swap failures.",
 		},
 	)
+
+	// Gauge: running instances (scheduler mode)
+	RunningInstances = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_running_instances",
+			Help: "Running vLLM instances (1 = running).",
+		},
+		[]string{"model", "port"},
+	)
+
+	// Gauge: per-instance in-flight requests (scheduler mode)
+	InstanceInFlightRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_instance_in_flight_requests",
+			Help: "In-flight proxied requests per instance.",
+		},
+		[]string{"model", "port"},
+	)
+
+	// Counter: evictions (scheduler mode)
+	EvictionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_evictions_total",
+			Help: "Total instance evictions.",
+		},
+		[]string{"model"},
+	)
+
+	// Counter: scheduler rejections (scheduler mode)
+	ScheduleRejectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_schedule_rejections_total",
+			Help: "Total scheduler placement rejections by reason.",
+		},
+		[]string{"reason"},
+	)
 )
 
 func init() {
@@ -100,6 +136,10 @@ func init() {
 		InFlightRequests,
 		CurrentModel,
 		ConsecutiveFailures,
+		RunningInstances,
+		InstanceInFlightRequests,
+		EvictionsTotal,
+		ScheduleRejectionsTotal,
 	)
 }
 

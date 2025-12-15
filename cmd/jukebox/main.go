@@ -17,10 +17,12 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/gpu"
 	"vllm-jukebox/internal/httpserver"
 	"vllm-jukebox/internal/inflight"
 	"vllm-jukebox/internal/jukebox"
 	"vllm-jukebox/internal/metrics"
+	"vllm-jukebox/internal/ports"
 	"vllm-jukebox/internal/vllm"
 )
 
@@ -53,35 +55,128 @@ func main() {
 		os.Exit(1)
 	}
 
-	var tr inflight.Tracker
-	tr.OnChange = func(count int64) {
-		metrics.InFlightRequests.Set(float64(count))
-	}
-	mgr := vllm.NewManager(cfg)
-	coord := jukebox.NewCoordinator(cfg, mgr, &tr, time.Now)
 	metrics.SetState("idle")
 	metrics.ConsecutiveFailures.Set(0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go coord.Run(ctx)
 
-	if cfg.Behavior.DefaultModel != "" {
-		go func() {
-			preloadTimeout := cfg.VLLM.StartupTimeout.Duration + cfg.VLLM.SwapWaitTimeout.Duration
-			if preloadTimeout <= 0 {
-				preloadTimeout = 5 * time.Minute
+	var (
+		router jukebox.Router
+		stop   func()
+	)
+
+	if cfg.Scheduler == nil {
+		var tr inflight.Tracker
+		tr.OnChange = func(count int64) {
+			metrics.InFlightRequests.Set(float64(count))
+		}
+
+		mgr := vllm.NewManager(cfg)
+		coord := jukebox.NewCoordinator(cfg, mgr, &tr, time.Now)
+		go coord.Run(ctx)
+		router = jukebox.NewLegacyRouter(cfg, coord, &tr)
+
+		stopOnce := sync.Once{}
+		stop = func() {
+			stopOnce.Do(func() {
+				timeout := cfg.VLLM.ShutdownTimeout.Duration
+				if timeout <= 0 {
+					timeout = 30 * time.Second
+				}
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), timeout)
+				defer stopCancel()
+				if err := mgr.Stop(stopCtx); err != nil {
+					slog.Error("failed to stop vLLM", "err", err)
+				}
+			})
+		}
+
+		if cfg.Behavior.DefaultModel != "" {
+			go func() {
+				preloadTimeout := cfg.VLLM.StartupTimeout.Duration + cfg.VLLM.SwapWaitTimeout.Duration
+				if preloadTimeout <= 0 {
+					preloadTimeout = 5 * time.Minute
+				}
+				preCtx, preCancel := context.WithTimeout(context.Background(), preloadTimeout)
+				defer preCancel()
+
+				slog.Info("preloading default model", "model", cfg.Behavior.DefaultModel)
+				if err := coord.EnsureModel(preCtx, cfg.Behavior.DefaultModel, "startup"); err != nil {
+					slog.Error("default model preload failed", "model", cfg.Behavior.DefaultModel, "err", err)
+				} else {
+					slog.Info("default model preload complete", "model", cfg.Behavior.DefaultModel)
+				}
+			}()
+		}
+	} else {
+		inv := gpu.NvidiaSMIInventory{Binary: cfg.Scheduler.NvidiaSMIBinary}
+		pool := ports.New(cfg.Scheduler.PortRangeStart, cfg.Scheduler.PortRangeEnd)
+		sched := jukebox.NewScheduler(cfg, inv, pool, time.Now)
+		router = sched
+
+		// Fail fast if configured GPU IDs do not exist.
+		{
+			checkTimeout := 5 * time.Second
+			checkCtx, checkCancel := context.WithTimeout(context.Background(), checkTimeout)
+			defer checkCancel()
+
+			gpus, err := inv.List(checkCtx)
+			if err != nil {
+				slog.Error("failed to read GPU inventory (scheduler mode)", "err", err)
+				os.Exit(1)
 			}
-			preCtx, preCancel := context.WithTimeout(context.Background(), preloadTimeout)
-			defer preCancel()
+			exists := map[int]bool{}
+			for _, g := range gpus {
+				exists[g.Index] = true
+			}
+			for name, model := range cfg.Models {
+				if model.Alias != "" {
+					continue
+				}
+				for _, id := range model.GPUs {
+					if !exists[id] {
+						slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
+						os.Exit(1)
+					}
+				}
+			}
+		}
 
-			slog.Info("preloading default model", "model", cfg.Behavior.DefaultModel)
-			if err := coord.EnsureModel(preCtx, cfg.Behavior.DefaultModel, "startup"); err != nil {
-				slog.Error("default model preload failed", "model", cfg.Behavior.DefaultModel, "err", err)
-			} else {
+		stopOnce := sync.Once{}
+		stop = func() {
+			stopOnce.Do(func() {
+				timeout := cfg.VLLM.ShutdownTimeout.Duration
+				if timeout <= 0 {
+					timeout = 30 * time.Second
+				}
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), timeout)
+				defer stopCancel()
+				_ = sched.StopAll(stopCtx)
+			})
+		}
+
+		if cfg.Behavior.DefaultModel != "" {
+			go func() {
+				preloadTimeout := cfg.VLLM.StartupTimeout.Duration + cfg.VLLM.SwapWaitTimeout.Duration
+				if preloadTimeout <= 0 {
+					preloadTimeout = 5 * time.Minute
+				}
+				preCtx, preCancel := context.WithTimeout(context.Background(), preloadTimeout)
+				defer preCancel()
+
+				slog.Info("preloading default model", "model", cfg.Behavior.DefaultModel)
+				route, err := sched.AcquireRoute(preCtx, cfg.Behavior.DefaultModel, "startup")
+				if err != nil {
+					slog.Error("default model preload failed", "model", cfg.Behavior.DefaultModel, "err", err)
+					return
+				}
+				if route.Done != nil {
+					route.Done()
+				}
 				slog.Info("default model preload complete", "model", cfg.Behavior.DefaultModel)
-			}
-		}()
+			}()
+		}
 	}
 
 	app := fiber.New(fiber.Config{
@@ -89,26 +184,13 @@ func main() {
 		WriteTimeout: cfg.Server.WriteTimeout.Duration,
 	})
 	app.Mount("/", httpserver.NewApp(httpserver.Options{
-		Config:      cfg,
-		Coordinator: coord,
-		InFlight:    &tr,
+		Config: cfg,
+		Router: router,
 	}))
 
-	var stopOnce sync.Once
-	stopVLLM := func() {
-		stopOnce.Do(func() {
-			timeout := cfg.VLLM.ShutdownTimeout.Duration
-			if timeout <= 0 {
-				timeout = 30 * time.Second
-			}
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), timeout)
-			defer stopCancel()
-			if err := mgr.Stop(stopCtx); err != nil {
-				slog.Error("failed to stop vLLM", "err", err)
-			}
-		})
+	if stop != nil {
+		defer stop()
 	}
-	defer stopVLLM()
 
 	addr := net.JoinHostPort(cfg.Server.Host, fmt.Sprintf("%d", cfg.Server.Port))
 	slog.Info("jukebox listening", "addr", addr)
@@ -120,7 +202,9 @@ func main() {
 		slog.Info("shutdown signal received")
 		cancel()
 		_ = app.Shutdown()
-		stopVLLM()
+		if stop != nil {
+			stop()
+		}
 	}()
 
 	if err := app.Listen(addr); err != nil && !isExpectedShutdownErr(err) {

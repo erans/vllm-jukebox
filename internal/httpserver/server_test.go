@@ -21,24 +21,38 @@ import (
 type stubCoord struct {
 	st jukebox.Status
 
-	ensureErr     error
-	ensureCalls   int
+	acquireErr    error
+	acquireCalls  int
 	lastModel     string
 	lastRequestID string
+
+	baseURL       string
+	upstreamModel string
 }
 
 func (s stubCoord) Status() jukebox.Status { return s.st }
 
-func (s *stubCoord) EnsureModel(ctx context.Context, requestedModel, requestID string) error {
-	s.ensureCalls++
+func (s *stubCoord) AcquireRoute(ctx context.Context, requestedModel, requestID string) (jukebox.Route, error) {
+	s.acquireCalls++
 	s.lastModel = requestedModel
 	s.lastRequestID = requestID
-	return s.ensureErr
+	if s.acquireErr != nil {
+		return jukebox.Route{}, s.acquireErr
+	}
+	baseURL := s.baseURL
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:8000"
+	}
+	return jukebox.Route{
+		BaseURL:       baseURL,
+		UpstreamModel: s.upstreamModel,
+		Done:          func() {},
+	}, nil
 }
 
 func TestHealth_ReadyReturns200AndAcceptingRequests(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", PID: 123}},
+		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", PID: 123}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -65,7 +79,7 @@ func TestHealth_ReadyReturns200AndAcceptingRequests(t *testing.T) {
 
 func TestHealth_SchemaMatchesSpec(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", PID: 123, UptimeSeconds: 7}},
+		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", PID: 123, UptimeSeconds: 7}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -107,7 +121,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", InFlight: 2, UptimeSeconds: 3}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", InFlight: 2, UptimeSeconds: 3}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -126,6 +140,9 @@ models:
 		LastSwap                     any      `json:"last_swap"`
 		FailureCount                 int      `json:"failure_count"`
 		AvailableModels              []string `json:"available_models"`
+		SchedulerBusy                bool     `json:"scheduler_busy"`
+		Waiters                      []string `json:"waiters"`
+		Instances                    any      `json:"instances"`
 	}
 
 	dec := json.NewDecoder(resp.Body)
@@ -138,7 +155,7 @@ models:
 
 func TestHealth_StartingReturns503(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateStarting}},
+		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateStarting}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -154,7 +171,7 @@ func TestHealth_StartingReturns503(t *testing.T) {
 
 func TestHealth_ErrorReturns500(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateError}},
+		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateError}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -171,7 +188,7 @@ func TestHealth_ErrorReturns500(t *testing.T) {
 // Sanity: we should return a usable Fiber app.
 func TestNewApp_ReturnsFiberApp(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateIdle}},
+		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateIdle}},
 	})
 	if app == nil {
 		t.Fatalf("expected non-nil")
@@ -197,7 +214,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -227,7 +244,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
 	})
 	app.Get("/_panic", func(c *fiber.Ctx) error {
 		panic("boom")
@@ -260,7 +277,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/v1/models", nil))
@@ -319,11 +336,11 @@ models:
 		t.Fatalf("load: %v", err)
 	}
 
-	coord := &stubCoord{st: jukebox.Status{State: jukebox.StateReady}}
-	app := httpserver.NewApp(httpserver.Options{
-		Config:      cfg,
-		Coordinator: coord,
-	})
+		coord := &stubCoord{st: jukebox.Status{State: jukebox.StateReady}, baseURL: backend.URL, upstreamModel: "/models/base"}
+		app := httpserver.NewApp(httpserver.Options{
+			Config:      cfg,
+			Router:      coord,
+		})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -335,9 +352,9 @@ models:
 	}
 	defer resp.Body.Close()
 
-	if coord.ensureCalls != 1 || coord.lastModel != "alias" || coord.lastRequestID != "req_123" {
-		t.Fatalf("expected EnsureModel(alias, req_123) once, got calls=%d model=%q reqid=%q", coord.ensureCalls, coord.lastModel, coord.lastRequestID)
-	}
+		if coord.acquireCalls != 1 || coord.lastModel != "alias" || coord.lastRequestID != "req_123" {
+			t.Fatalf("expected AcquireRoute(alias, req_123) once, got calls=%d model=%q reqid=%q", coord.acquireCalls, coord.lastModel, coord.lastRequestID)
+		}
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(bodyBytes), `"model":"alias"`) {
@@ -360,14 +377,14 @@ models:
 		t.Fatalf("load: %v", err)
 	}
 
-	coord := &stubCoord{
-		st:        jukebox.Status{State: jukebox.StateStarting},
-		ensureErr: &jukebox.RejectError{Reason: jukebox.RejectSwapInProgress, RetryAfter: 5 * time.Second},
-	}
-	app := httpserver.NewApp(httpserver.Options{
-		Config:      cfg,
-		Coordinator: coord,
-	})
+		coord := &stubCoord{
+			st:         jukebox.Status{State: jukebox.StateStarting},
+			acquireErr: &jukebox.RejectError{Reason: jukebox.RejectSwapInProgress, RetryAfter: 5 * time.Second},
+		}
+		app := httpserver.NewApp(httpserver.Options{
+			Config:      cfg,
+			Router:      coord,
+		})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -398,14 +415,14 @@ models:
 		t.Fatalf("load: %v", err)
 	}
 
-	coord := &stubCoord{
-		st:        jukebox.Status{State: jukebox.StateError},
-		ensureErr: errors.New("boom"),
-	}
-	app := httpserver.NewApp(httpserver.Options{
-		Config:      cfg,
-		Coordinator: coord,
-	})
+		coord := &stubCoord{
+			st:         jukebox.Status{State: jukebox.StateError},
+			acquireErr: errors.New("boom"),
+		}
+		app := httpserver.NewApp(httpserver.Options{
+			Config:      cfg,
+			Router:      coord,
+		})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -435,7 +452,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"nope"}`))
@@ -482,7 +499,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{not json`))
@@ -513,7 +530,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[]}`))
@@ -563,7 +580,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}, baseURL: backend.URL, upstreamModel: "/models/base"},
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","stream":true}`))
@@ -581,10 +598,16 @@ models:
 	}
 }
 
-func TestPassthroughProxy_DoesNotCallEnsureModel(t *testing.T) {
+func TestEmbeddings_IsRoutedAndCallsAcquireRoute(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/embeddings" {
 			http.NotFound(w, r)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if !strings.Contains(string(b), `"model":"/models/m"`) {
+			http.Error(w, "expected rewritten model", http.StatusBadRequest)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -606,13 +629,13 @@ models:
 		t.Fatalf("load: %v", err)
 	}
 
-	coord := &stubCoord{st: jukebox.Status{State: jukebox.StateReady}}
+	coord := &stubCoord{st: jukebox.Status{State: jukebox.StateReady}, baseURL: backend.URL, upstreamModel: "/models/m"}
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: coord,
+		Router:      coord,
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"input":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"model":"m","input":"hi"}`))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := app.Test(req)
@@ -624,8 +647,8 @@ models:
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	if coord.ensureCalls != 0 {
-		t.Fatalf("expected EnsureModel not called, got %d", coord.ensureCalls)
+	if coord.acquireCalls != 1 || coord.lastModel != "m" {
+		t.Fatalf("expected AcquireRoute(m) once, got calls=%d model=%q", coord.acquireCalls, coord.lastModel)
 	}
 }
 
@@ -643,7 +666,7 @@ models:
 
 	app := httpserver.NewApp(httpserver.Options{
 		Config:      cfg,
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+		Router:      &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
 	})
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/v1/unknown", nil))

@@ -1,10 +1,14 @@
 # vLLM Jukebox
 
-vLLM Jukebox is an OpenAI-compatible HTTP server that fronts a **single** vLLM instance and automatically **swaps the loaded model** based on each incoming request’s `model`.
+vLLM Jukebox is an OpenAI-compatible HTTP server that can run in either:
+
+- **Legacy swap mode**: fronts a **single** vLLM instance and automatically **swaps the loaded model** based on each incoming request’s `model`.
+- **Scheduler mode**: runs **multiple concurrent** vLLM instances (one per configured GPU set + port), routes requests by `model`, and can evict non-pinned instances (LRU) to make room for larger models.
 
 This is useful when:
 - You want one stable OpenAI-compatible endpoint, but multiple models (with swap-on-demand).
 - You’re OK with only one model being loaded at a time (no multi-instance/zero-downtime swaps).
+- You have multiple GPUs and want multiple models served concurrently (scheduler mode).
 
 ## Features
 
@@ -100,6 +104,47 @@ models:
     alias: qwen
 ```
 
+### Scheduler mode (multi-instance, multi-GPU)
+
+In scheduler mode, each non-alias model declares an **exact GPU set** and a **minimum free VRAM requirement per GPU**. Jukebox allocates a unique port per running instance from the configured port range and sets `CUDA_VISIBLE_DEVICES` automatically (do not set it in `env`).
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+vllm:
+  binary: "uvx"
+  startup_timeout: 300s
+  shutdown_timeout: 30s
+  drain_timeout: 60s
+  swap_wait_timeout: 60s
+
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8199
+  max_instances: 8
+  min_instance_uptime: 30s
+  nvidia_smi_binary: "nvidia-smi"
+
+models:
+  small:
+    path: "Qwen/Qwen2.5-0.5B-Instruct"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 4000
+
+  big:
+    path: "/models/Meta-Llama-3-70B-Instruct"
+    gpus: [0,1,2,3]
+    min_free_mem_mb_per_gpu: 40000
+
+  pinned-hot:
+    path: "/models/Some-Always-On-Model"
+    gpus: [4]
+    min_free_mem_mb_per_gpu: 16000
+    pinned: true
+```
+
 Model naming rules:
 - Client-facing model names are the YAML keys under `models:`.
 - Aliases (`alias: other_name`) let you support multiple names for the same underlying model config.
@@ -107,15 +152,17 @@ Model naming rules:
 
 ## Endpoints
 
-Model-switching endpoints (extract `model` from body, ensure model is loaded, then proxy to vLLM):
+Model-bearing endpoints (extract `model` from body, ensure a backend instance is ready, then proxy to vLLM):
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
-
-Pass-through endpoints (proxied only when vLLM is ready):
 - `POST /v1/embeddings`
 - `POST /v1/tokenize`
 - `POST /v1/detokenize`
+
+Notes:
+- These endpoints require a `model` field in the JSON body (matching OpenAI semantics).
+- In scheduler mode, each request is routed to the vLLM instance for that model (potentially triggering eviction/start).
 
 Jukebox endpoints:
 - `GET /v1/models` (returns configured models, not vLLM’s)
@@ -141,6 +188,11 @@ Lightweight (no real vLLM required):
 ./scripts/smoke.sh
 ```
 
+Scheduler mode (no real vLLM / no GPU required; uses fake `nvidia-smi` + fake vLLM server):
+```bash
+./scripts/smoke_scheduler.sh
+```
+
 Real vLLM integration (opt-in; requires `uvx` and a model):
 ```bash
 RUN_VLLM_SMOKE=1 VLLM_MODEL=Qwen/Qwen2.5-0.5B-Instruct ./scripts/smoke_vllm.sh
@@ -157,4 +209,5 @@ Useful knobs for the real smoke test:
 
 - vLLM exits immediately with a gated-model error: export `HUGGING_FACE_HUB_TOKEN` (or `HF_TOKEN`) and ensure you have access.
 - vLLM fails with GPU memory errors: stop other GPU-heavy processes, or lower `gpu_memory_utilization` / `max_model_len`.
-- Model swap takes time: the first request for a new model blocks (up to `swap_wait_timeout`); other requests get `503` with `Retry-After`.
+- Model load/scheduling takes time: the triggering request can block (up to `swap_wait_timeout`); other requests that require scheduling get `503` with `Retry-After`. Requests for already-ready models continue serving.
+- Scheduler mode: do not set `CUDA_VISIBLE_DEVICES` in `vllm.default_env` or `models.<name>.env` (the scheduler owns it).

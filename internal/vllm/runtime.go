@@ -19,6 +19,10 @@ import (
 
 type Manager struct {
 	cfg *config.Config
+	port int
+
+	// extraEnv is applied after default and model env, overriding on conflict.
+	extraEnv map[string]string
 
 	mu            sync.Mutex
 	cmd           *exec.Cmd
@@ -60,7 +64,15 @@ func (e *ProcessExitedError) Error() string {
 func (e *ProcessExitedError) Unwrap() error { return e.Err }
 
 func NewManager(cfg *config.Config) *Manager {
-	return &Manager{cfg: cfg}
+	return &Manager{cfg: cfg, port: cfg.VLLM.Port}
+}
+
+func NewInstanceManager(cfg *config.Config, port int, extraEnv map[string]string) *Manager {
+	copied := map[string]string{}
+	for k, v := range extraEnv {
+		copied[k] = v
+	}
+	return &Manager{cfg: cfg, port: port, extraEnv: copied}
 }
 
 func (m *Manager) CurrentPID() int {
@@ -72,7 +84,7 @@ func (m *Manager) CurrentPID() int {
 func (m *Manager) BaseURL() string {
 	u := url.URL{
 		Scheme: "http",
-		Host:   fmt.Sprintf("127.0.0.1:%d", m.cfg.VLLM.Port),
+		Host:   fmt.Sprintf("127.0.0.1:%d", m.port),
 	}
 	return u.String()
 }
@@ -91,7 +103,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	}
 	m.mu.Unlock()
 
-	args, err := BuildServeArgs(m.cfg, modelName)
+	args, err := BuildServeArgsForPort(m.cfg, modelName, m.port)
 	if err != nil {
 		return 0, err
 	}
@@ -104,7 +116,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	bin, binArgs := wrapBinaryArgs(m.cfg.VLLM.Binary, args)
 	cmd := exec.Command(bin, binArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = BuildEnv(os.Environ(), m.cfg.VLLM.DefaultEnv, modelCfg.Env)
+	cmd.Env = BuildEnv(os.Environ(), m.cfg.VLLM.DefaultEnv, mergeEnv(modelCfg.Env, m.extraEnv))
 	stdoutTail := newTailBuffer(16 * 1024)
 	cmd.Stdout = stdoutTail
 	stderrTail := newTailBuffer(16 * 1024)
@@ -195,6 +207,20 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	}()
 
 	return cmd.Process.Pid, nil
+}
+
+func mergeEnv(base map[string]string, overlay map[string]string) map[string]string {
+	if base == nil && overlay == nil {
+		return nil
+	}
+	out := map[string]string{}
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range overlay {
+		out[k] = v
+	}
+	return out
 }
 
 func (m *Manager) Stop(ctx context.Context) error {

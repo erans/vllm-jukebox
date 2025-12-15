@@ -14,7 +14,7 @@ import (
 
 func TestMetrics_ExposesPrometheusText(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
-		Coordinator: &stubCoord{st: jukebox.Status{State: jukebox.StateIdle}},
+		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateIdle}},
 	})
 
 	// Touch at least one metric instance before scraping.
