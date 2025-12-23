@@ -12,3 +12,6 @@ worktrees/
 .DS_Store
 .idea/
 .vscode/
+
+# Personal configs
+/configs/mine/
