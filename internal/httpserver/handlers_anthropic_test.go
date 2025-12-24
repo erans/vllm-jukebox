@@ -66,3 +66,72 @@ func TestAnthropicProxy_ExtractsModelAndRoutes(t *testing.T) {
 	respBody, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(respBody), `"model":"claude"`) // rewritten
 }
+
+func TestAnthropicProxy_InvalidJSONReturnsAnthropicError(t *testing.T) {
+	cfg := &config.Config{
+		Models: map[string]config.ModelConfig{
+			"claude": {Path: "/models/claude"},
+		},
+	}
+	router := &mockAnthropicRouter{}
+
+	app := fiber.New()
+	app.Post("/v1/messages", anthropicProxyHandler(Options{Config: cfg, Router: router}))
+
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{invalid`)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 400, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), `"type":"error"`)
+	assert.Contains(t, string(body), `"type":"invalid_request_error"`)
+}
+
+func TestAnthropicProxy_MissingModelReturns400(t *testing.T) {
+	cfg := &config.Config{
+		Models: map[string]config.ModelConfig{
+			"claude": {Path: "/models/claude"},
+		},
+	}
+	router := &mockAnthropicRouter{}
+
+	app := fiber.New()
+	app.Post("/v1/messages", anthropicProxyHandler(Options{Config: cfg, Router: router}))
+
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"messages":[]}`)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 400, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), `"type":"error"`)
+	assert.Contains(t, string(body), "missing required field")
+}
+
+func TestAnthropicProxy_UnknownModelReturns400(t *testing.T) {
+	cfg := &config.Config{
+		Models: map[string]config.ModelConfig{
+			"claude": {Path: "/models/claude"},
+		},
+	}
+	router := &mockAnthropicRouter{}
+
+	app := fiber.New()
+	app.Post("/v1/messages", anthropicProxyHandler(Options{Config: cfg, Router: router}))
+
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"model":"unknown"}`)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 400, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), `"type":"error"`)
+	assert.Contains(t, string(body), "not found")
+}
