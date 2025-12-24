@@ -12,16 +12,6 @@ func TestWrapBinaryArgs_UsesUVXVLLMWhenBinaryIsUVX(t *testing.T) {
 	}
 }
 
-func TestWrapBinaryArgs_UsesUVXVLLMWhenBinaryIsUVXExe(t *testing.T) {
-	bin, args := wrapBinaryArgs("uvx.exe", []string{"serve", "/models/m"})
-	if bin != "uvx.exe" {
-		t.Fatalf("expected bin=uvx.exe, got %q", bin)
-	}
-	if len(args) < 2 || args[0] != "vllm" || args[1] != "serve" {
-		t.Fatalf("expected args to start with [vllm serve], got %v", args)
-	}
-}
-
 func TestWrapBinaryArgs_UsesUVXVLLMWhenBinaryIsPathToUVX(t *testing.T) {
 	bin, args := wrapBinaryArgs("/usr/local/bin/uvx", []string{"serve", "/models/m"})
 	if bin != "/usr/local/bin/uvx" {

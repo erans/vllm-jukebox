@@ -57,8 +57,7 @@ server:
 
 vllm:
   # Use "uvx" to run `uvx vllm serve ...`
-  # You can also set this to an absolute path, e.g. "/opt/homebrew/bin/uvx".
-  # Windows-style "uvx.exe" is also supported.
+  # You can also set this to an absolute path, e.g. "/usr/local/bin/uvx".
   binary: "uvx"
   port: 8000
 

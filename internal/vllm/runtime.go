@@ -261,7 +261,7 @@ func (m *Manager) Stop(ctx context.Context) error {
 
 func wrapBinaryArgs(binary string, args []string) (string, []string) {
 	switch filepath.Base(binary) {
-	case "uvx", "uvx.exe":
+	case "uvx":
 		return binary, append([]string{"vllm"}, args...)
 	}
 	return binary, args
