@@ -17,6 +17,18 @@ vllm:
     dtype: "auto"
     max_model_len: null
 
+# GPU Power Management (optional)
+# Option A: Per-GPU power limits at startup
+# gpu_power_limits:
+#   0: 250
+#   1: 250
+
+# Option B: Single default for all GPUs (mutually exclusive with gpu_power_limits)
+# default_power_limit: 250
+
+# If true, fail startup when power limit cannot be set (default: false = warn only)
+# power_limit_required: false
+
 behavior:
   rewrite_model_name: true
 

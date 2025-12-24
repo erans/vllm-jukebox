@@ -13,6 +13,18 @@ vllm:
     dtype: "float16"
     max_model_len: 2048
 
+# GPU Power Management (optional)
+# Option A: Per-GPU power limits at startup
+# gpu_power_limits:
+#   0: 250
+#   1: 250
+
+# Option B: Single default for all GPUs (mutually exclusive with gpu_power_limits)
+# default_power_limit: 250
+
+# If true, fail startup when power limit cannot be set (default: false = warn only)
+# power_limit_required: false
+
 scheduler:
   # vLLM instances will be started on ports in this range.
   port_range_start: 8100
@@ -33,15 +45,21 @@ models:
     path: "Qwen/Qwen2.5-0.5B-Instruct"
     gpus: [0]
     min_free_mem_mb_per_gpu: 4000
+    # Per-model power limit (optional, overrides global settings for this model's GPUs)
+    # power_limit: 200
 
   big:
     path: "/models/Meta-Llama-3-70B-Instruct"
     gpus: [0,1,2,3]
     min_free_mem_mb_per_gpu: 40000
+    # Per-model power limit (optional, overrides global settings for this model's GPUs)
+    # power_limit: 350
 
   pinned-hot:
     path: "/models/Some-Always-On-Model"
     gpus: [4]
     min_free_mem_mb_per_gpu: 16000
     pinned: true
+    # Per-model power limit (optional, overrides global settings for this model's GPUs)
+    # power_limit: 300
 
