@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/gpu"
 	"vllm-jukebox/internal/inflight"
 	"vllm-jukebox/internal/metrics"
 )
@@ -91,10 +92,11 @@ type InstanceStatus struct {
 }
 
 type Coordinator struct {
-	cfg *config.Config
-	mgr Manager
-	tr  *inflight.Tracker
-	now func() time.Time
+	cfg      *config.Config
+	mgr      Manager
+	tr       *inflight.Tracker
+	powerMgr *gpu.PowerManager
+	now      func() time.Time
 
 	requests chan ensureReq
 
@@ -139,6 +141,10 @@ type LastSwap struct {
 }
 
 func NewCoordinator(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now func() time.Time) *Coordinator {
+	return NewCoordinatorWithPower(cfg, mgr, tr, now, nil)
+}
+
+func NewCoordinatorWithPower(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now func() time.Time, powerMgr *gpu.PowerManager) *Coordinator {
 	if now == nil {
 		now = time.Now
 	}
@@ -146,6 +152,7 @@ func NewCoordinator(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now f
 		cfg:      cfg,
 		mgr:      mgr,
 		tr:       tr,
+		powerMgr: powerMgr,
 		now:      now,
 		requests: make(chan ensureReq),
 		state:    StateIdle,
@@ -414,6 +421,11 @@ func (c *Coordinator) performSwap(fromModel, model, requestID string, done chan<
 }
 
 func (c *Coordinator) doSwap(model, requestID string) error {
+	_, modelCfg, err := c.cfg.ResolveModel(model)
+	if err != nil {
+		return err
+	}
+
 	// If we already have a running model, stop it after draining in-flight.
 	if st := c.Status(); st.State == StateStopping || st.State == StateReady {
 		if c.tr != nil {
@@ -431,14 +443,26 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 		if stopErr != nil {
 			return stopErr
 		}
+
+		// Revert power limits after stop (if we have GPUs configured)
+		if c.powerMgr != nil && len(modelCfg.GPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 	}
 
 	c.mu.Lock()
 	c.state = StateStarting
 	c.mu.Unlock()
 
+	// Apply power limits before start (if configured)
+	if c.powerMgr != nil && len(modelCfg.GPUs) > 0 {
+		if err := c.powerMgr.ApplyModelLimits(context.Background(), modelCfg.GPUs, modelCfg.PowerLimit, modelCfg.PowerLimits); err != nil {
+			return err
+		}
+	}
+
 	startCtx, cancel := context.WithTimeout(context.Background(), c.cfg.VLLM.StartupTimeout.Duration)
-	_, err := c.mgr.Start(startCtx, model)
+	_, err = c.mgr.Start(startCtx, model)
 	cancel()
 	if err != nil {
 		return err
