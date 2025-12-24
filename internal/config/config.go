@@ -58,6 +58,10 @@ type VLLMConfig struct {
 
 	Defaults   VLLMDefaults      `yaml:"defaults"`
 	DefaultEnv map[string]string `yaml:"default_env"`
+
+	LogDir       string `yaml:"log_dir"`
+	LogMaxSizeMB int    `yaml:"log_max_size_mb"`
+	LogMaxFiles  int    `yaml:"log_max_files"`
 }
 
 type SchedulerConfig struct {
@@ -154,6 +158,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.VLLM.DefaultEnv == nil {
 		c.VLLM.DefaultEnv = map[string]string{}
+	}
+	if c.VLLM.LogMaxSizeMB == 0 {
+		c.VLLM.LogMaxSizeMB = 50
+	}
+	if c.VLLM.LogMaxFiles == 0 {
+		c.VLLM.LogMaxFiles = 5
 	}
 
 	if c.Scheduler != nil {
