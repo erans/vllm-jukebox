@@ -49,3 +49,22 @@ func (p *PowerManager) SetLimit(ctx context.Context, gpuIndex, watts int) error 
 
 	return nil
 }
+
+func (p *PowerManager) RevertToDefault(ctx context.Context, gpuIndex int) error {
+	defaultWatts, ok := p.defaults[gpuIndex]
+	if !ok {
+		// No default configured for this GPU, nothing to revert to
+		return nil
+	}
+
+	p.mu.Lock()
+	currentWatts, hasOverride := p.current[gpuIndex]
+	p.mu.Unlock()
+
+	// Only revert if we actually applied an override
+	if !hasOverride || currentWatts == defaultWatts {
+		return nil
+	}
+
+	return p.SetLimit(ctx, gpuIndex, defaultWatts)
+}
