@@ -13,6 +13,7 @@ This is useful when:
 ## Features
 
 - OpenAI-ish endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/responses`
+- Anthropic protocol support: `POST /v1/messages`
 - Graceful swaps: drains in-flight requests before restarting vLLM
 - Aliases: multiple client-facing model names can point to one underlying model config
 - Prometheus metrics at `GET /metrics`
@@ -170,6 +171,9 @@ Model-bearing endpoints (extract `model` from body, ensure a backend instance is
 - `POST /v1/embeddings`
 - `POST /v1/tokenize`
 - `POST /v1/detokenize`
+
+Anthropic endpoints (proxy to vLLM):
+- `POST /v1/messages`
 
 Notes:
 - These endpoints require a `model` field in the JSON body (matching OpenAI semantics).
