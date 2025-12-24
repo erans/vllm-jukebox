@@ -105,3 +105,61 @@ func (p *PowerManager) ApplyStartupLimits(ctx context.Context) error {
 
 	return firstErr
 }
+
+// ApplyModelLimits sets power limits for the given GPUs based on model config.
+// If powerLimit is non-nil, it's applied to all GPUs.
+// If powerLimits is non-nil, per-GPU limits are used.
+func (p *PowerManager) ApplyModelLimits(ctx context.Context, gpus []int, powerLimit *int, powerLimits map[int]int) error {
+	if powerLimit == nil && powerLimits == nil {
+		return nil
+	}
+
+	var firstErr error
+	for _, gpuIndex := range gpus {
+		var watts int
+		if powerLimits != nil {
+			if w, ok := powerLimits[gpuIndex]; ok {
+				watts = w
+			} else {
+				continue // No override for this GPU
+			}
+		} else if powerLimit != nil {
+			watts = *powerLimit
+		} else {
+			continue
+		}
+
+		if err := p.SetLimit(ctx, gpuIndex, watts); err != nil {
+			slog.Warn("failed to set model power limit",
+				"gpu", gpuIndex,
+				"watts", watts,
+				"err", err,
+			)
+			if p.required && firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			slog.Info("set model power limit",
+				"gpu", gpuIndex,
+				"watts", watts,
+			)
+		}
+	}
+
+	return firstErr
+}
+
+// RevertModelLimits reverts power limits for the given GPUs to their defaults.
+func (p *PowerManager) RevertModelLimits(ctx context.Context, gpus []int) error {
+	var firstErr error
+	for _, gpuIndex := range gpus {
+		if err := p.RevertToDefault(ctx, gpuIndex); err != nil {
+			slog.Warn("failed to revert GPU power limit",
+				"gpu", gpuIndex,
+				"err", err,
+			)
+			// Always best-effort for reverts, don't fail
+		}
+	}
+	return firstErr
+}

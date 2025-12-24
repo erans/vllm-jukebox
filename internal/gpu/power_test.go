@@ -164,3 +164,105 @@ exit 1
 		t.Fatalf("expected no error when required=false, got: %v", err)
 	}
 }
+
+func TestPowerManager_ApplyModelLimits_SingleValue(t *testing.T) {
+	script := `#!/bin/bash
+echo "$@" >> /tmp/nvidia-smi-model.txt
+exit 0
+`
+	scriptPath := "/tmp/fake-nvidia-smi-model.sh"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+	defer os.Remove(scriptPath)
+	os.Remove("/tmp/nvidia-smi-model.txt")
+	defer os.Remove("/tmp/nvidia-smi-model.txt")
+
+	pm := gpu.NewPowerManager(scriptPath, nil, false)
+
+	gpus := []int{0, 1}
+	powerLimit := 300
+	err := pm.ApplyModelLimits(context.Background(), gpus, &powerLimit, nil)
+	if err != nil {
+		t.Fatalf("ApplyModelLimits: %v", err)
+	}
+
+	data, _ := os.ReadFile("/tmp/nvidia-smi-model.txt")
+	output := string(data)
+	if !strings.Contains(output, "-i 0 -pl 300") {
+		t.Errorf("expected GPU 0 at 300W, got: %s", output)
+	}
+	if !strings.Contains(output, "-i 1 -pl 300") {
+		t.Errorf("expected GPU 1 at 300W, got: %s", output)
+	}
+}
+
+func TestPowerManager_ApplyModelLimits_PerGPU(t *testing.T) {
+	script := `#!/bin/bash
+echo "$@" >> /tmp/nvidia-smi-pergpu.txt
+exit 0
+`
+	scriptPath := "/tmp/fake-nvidia-smi-pergpu.sh"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+	defer os.Remove(scriptPath)
+	os.Remove("/tmp/nvidia-smi-pergpu.txt")
+	defer os.Remove("/tmp/nvidia-smi-pergpu.txt")
+
+	pm := gpu.NewPowerManager(scriptPath, nil, false)
+
+	gpus := []int{0, 1}
+	powerLimits := map[int]int{0: 250, 1: 350}
+	err := pm.ApplyModelLimits(context.Background(), gpus, nil, powerLimits)
+	if err != nil {
+		t.Fatalf("ApplyModelLimits: %v", err)
+	}
+
+	data, _ := os.ReadFile("/tmp/nvidia-smi-pergpu.txt")
+	output := string(data)
+	if !strings.Contains(output, "-i 0 -pl 250") {
+		t.Errorf("expected GPU 0 at 250W, got: %s", output)
+	}
+	if !strings.Contains(output, "-i 1 -pl 350") {
+		t.Errorf("expected GPU 1 at 350W, got: %s", output)
+	}
+}
+
+func TestPowerManager_RevertModelLimits(t *testing.T) {
+	script := `#!/bin/bash
+echo "$@" >> /tmp/nvidia-smi-revert-model.txt
+exit 0
+`
+	scriptPath := "/tmp/fake-nvidia-smi-revert-model.sh"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+	defer os.Remove(scriptPath)
+	os.Remove("/tmp/nvidia-smi-revert-model.txt")
+	defer os.Remove("/tmp/nvidia-smi-revert-model.txt")
+
+	defaults := map[int]int{0: 200, 1: 200}
+	pm := gpu.NewPowerManager(scriptPath, defaults, false)
+
+	// First apply model limits to trigger override tracking
+	powerLimit := 300
+	_ = pm.ApplyModelLimits(context.Background(), []int{0, 1}, &powerLimit, nil)
+	os.Remove("/tmp/nvidia-smi-revert-model.txt") // Clear apply calls
+
+	// Now revert
+	gpus := []int{0, 1}
+	err := pm.RevertModelLimits(context.Background(), gpus)
+	if err != nil {
+		t.Fatalf("RevertModelLimits: %v", err)
+	}
+
+	data, _ := os.ReadFile("/tmp/nvidia-smi-revert-model.txt")
+	output := string(data)
+	if !strings.Contains(output, "-i 0 -pl 200") {
+		t.Errorf("expected GPU 0 revert to 200W, got: %s", output)
+	}
+	if !strings.Contains(output, "-i 1 -pl 200") {
+		t.Errorf("expected GPU 1 revert to 200W, got: %s", output)
+	}
+}
