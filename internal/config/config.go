@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -352,6 +353,27 @@ func (c *Config) ResolveModel(name string) (resolvedName string, model ModelConf
 		return "", ModelConfig{}, fmt.Errorf("alias %q references unknown model %q", name, cfg.Alias)
 	}
 	return cfg.Alias, target, nil
+}
+
+// ResolveLogPath returns the log file path for a model.
+// Returns empty string if logging is not configured.
+func (c *Config) ResolveLogPath(modelName string) string {
+	model, ok := c.Models[modelName]
+	if !ok {
+		return ""
+	}
+
+	// Per-model override takes precedence
+	if model.LogFile != "" {
+		return model.LogFile
+	}
+
+	// Fall back to log_dir/<model>.log
+	if c.VLLM.LogDir != "" {
+		return filepath.Join(c.VLLM.LogDir, modelName+".log")
+	}
+
+	return ""
 }
 
 func (c *Config) validatePowerLimits() error {
