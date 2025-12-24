@@ -99,6 +99,7 @@ type ModelConfig struct {
 	Env                  map[string]string `yaml:"env"`
 	PowerLimit           *int              `yaml:"power_limit"`
 	PowerLimits          map[int]int       `yaml:"power_limits"`
+	LogFile              string            `yaml:"log_file"`
 }
 
 func Load(data []byte) (*Config, error) {
