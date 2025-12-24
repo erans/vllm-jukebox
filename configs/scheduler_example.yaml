@@ -8,6 +8,12 @@ vllm:
   shutdown_timeout: 30s
   drain_timeout: 60s
   swap_wait_timeout: 60s
+
+  # Log vLLM output to files (optional)
+  # log_dir: "/var/log/vllm"
+  # log_max_size_mb: 50   # default: 50
+  # log_max_files: 5      # default: 5
+
   defaults:
     gpu_memory_utilization: 0.70
     dtype: "float16"
@@ -47,6 +53,8 @@ models:
     min_free_mem_mb_per_gpu: 4000
     # Per-model power limit (optional, overrides global settings for this model's GPUs)
     # power_limit: 200
+    # Per-model log file override (optional)
+    # log_file: "/var/log/vllm/custom-model.log"
 
   big:
     path: "/models/Meta-Llama-3-70B-Instruct"

@@ -12,6 +12,11 @@ vllm:
   swap_cooldown: 30s
   swap_wait_timeout: 60s
 
+  # Log vLLM output to files (optional)
+  # log_dir: "/var/log/vllm"
+  # log_max_size_mb: 50   # default: 50
+  # log_max_files: 5      # default: 5
+
   defaults:
     gpu_memory_utilization: 0.9
     dtype: "auto"
@@ -36,6 +41,8 @@ models:
   llama-3-8b:
     path: "/models/Meta-Llama-3-8B-Instruct"
     tensor_parallel_size: 1
+    # Per-model log file override (optional)
+    # log_file: "/var/log/vllm/custom-model.log"
 
   # Example alias
   gpt-3.5-turbo:
