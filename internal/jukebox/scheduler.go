@@ -18,11 +18,12 @@ import (
 )
 
 type Scheduler struct {
-	cfg   *config.Config
-	inv   gpu.Inventory
-	ports *ports.Pool
-	now   func() time.Time
-	new   InstanceFactory
+	cfg      *config.Config
+	inv      gpu.Inventory
+	ports    *ports.Pool
+	powerMgr *gpu.PowerManager
+	now      func() time.Time
+	new      InstanceFactory
 
 	// sched is a semaphore (size 1) that serializes scheduling operations.
 	sched chan struct{}
@@ -60,10 +61,10 @@ type InstanceManager interface {
 type InstanceFactory func(port int, cudaVisibleDevices string) InstanceManager
 
 func NewScheduler(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, now func() time.Time) *Scheduler {
-	return NewSchedulerWithFactory(cfg, inv, portPool, now, nil)
+	return NewSchedulerWithFactory(cfg, inv, portPool, now, nil, nil)
 }
 
-func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, now func() time.Time, factory InstanceFactory) *Scheduler {
+func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, now func() time.Time, factory InstanceFactory, powerMgr *gpu.PowerManager) *Scheduler {
 	if now == nil {
 		now = time.Now
 	}
@@ -73,12 +74,13 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		}
 	}
 	s := &Scheduler{
-		cfg:       cfg,
-		inv:       inv,
-		ports:     portPool,
-		now:       now,
-		new:       factory,
-		sched:     make(chan struct{}, 1),
+		cfg:      cfg,
+		inv:      inv,
+		ports:    portPool,
+		powerMgr: powerMgr,
+		now:      now,
+		new:      factory,
+		sched:    make(chan struct{}, 1),
 		instances: map[string]*schedInstance{},
 		waiters:   map[string]bool{},
 	}
@@ -243,6 +245,14 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	portLabel := strconv.Itoa(port)
 	inst.inflight.OnChange = func(count int64) {
 		metrics.InstanceInFlightRequests.WithLabelValues(inst.model, portLabel).Set(float64(count))
+	}
+
+	// Apply model power limits if configured
+	if s.powerMgr != nil {
+		if err := s.powerMgr.ApplyModelLimits(ctx, modelCfg.GPUs, modelCfg.PowerLimit, modelCfg.PowerLimits); err != nil {
+			s.ports.Release(port)
+			return Route{}, err
+		}
 	}
 
 	startCtx, cancel := context.WithTimeout(ctx, s.cfg.VLLM.StartupTimeout.Duration)
@@ -550,6 +560,11 @@ func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstanc
 		stopCtx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 		_ = inst.mgr.Stop(stopCtx)
 		cancel()
+
+		// Revert power limits to defaults
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), inst.gpus)
+		}
 	}
 
 	portLabel := strconv.Itoa(inst.port)
