@@ -1,6 +1,10 @@
 package gpu
 
 import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strconv"
 	"sync"
 )
 
@@ -27,4 +31,21 @@ func NewPowerManager(binary string, defaults map[int]int, required bool) *PowerM
 		required: required,
 		current:  make(map[int]int),
 	}
+}
+
+func (p *PowerManager) SetLimit(ctx context.Context, gpuIndex, watts int) error {
+	cmd := exec.CommandContext(ctx, p.binary,
+		"-i", strconv.Itoa(gpuIndex),
+		"-pl", strconv.Itoa(watts),
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nvidia-smi -i %d -pl %d failed: %w (output: %s)", gpuIndex, watts, err, string(output))
+	}
+
+	p.mu.Lock()
+	p.current[gpuIndex] = watts
+	p.mu.Unlock()
+
+	return nil
 }
