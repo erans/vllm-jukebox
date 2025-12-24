@@ -108,7 +108,7 @@ func main() {
 		}
 
 		mgr := vllm.NewManager(cfg)
-		coord := jukebox.NewCoordinator(cfg, mgr, &tr, time.Now)
+		coord := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, time.Now, powerMgr)
 		go coord.Run(ctx)
 		router = jukebox.NewLegacyRouter(cfg, coord, &tr)
 
