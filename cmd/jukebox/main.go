@@ -147,7 +147,7 @@ func main() {
 	} else {
 		inv := gpu.NvidiaSMIInventory{Binary: cfg.Scheduler.NvidiaSMIBinary}
 		pool := ports.New(cfg.Scheduler.PortRangeStart, cfg.Scheduler.PortRangeEnd)
-		sched := jukebox.NewScheduler(cfg, inv, pool, time.Now)
+		sched := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, nil, powerMgr)
 		router = sched
 
 		// Fail fast if configured GPU IDs do not exist.

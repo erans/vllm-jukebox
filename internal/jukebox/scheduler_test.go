@@ -131,7 +131,7 @@ models:
 	factory := func(port int, _ string) jukebox.InstanceManager { return &fakeInstance{ctrl: ctrl, port: port} }
 
 	now := time.Now()
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, func() time.Time { return now }, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, func() time.Time { return now }, factory, nil)
 
 	// Start model b (non-blocking).
 	routeB, err := s.AcquireRoute(context.Background(), "b", "req-b")
@@ -205,7 +205,7 @@ models:
 
 	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{}}
 	factory := func(port int, _ string) jukebox.InstanceManager { return &fakeInstance{ctrl: ctrl, port: port} }
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory, nil)
 
 	routeSmall, err := s.AcquireRoute(context.Background(), "small", "req-1")
 	if err != nil {
@@ -269,7 +269,7 @@ models:
 		nowMu.Unlock()
 	}
 
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, nowFn, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, nowFn, factory, nil)
 
 	// Start s0 then s1 (s0 is older / LRU).
 	routeS0, err := s.AcquireRoute(context.Background(), "s0", "req-s0")
@@ -327,7 +327,7 @@ models:
 	pool := ports.New(8100, 8109)
 	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{}}
 	factory := func(port int, _ string) jukebox.InstanceManager { return &fakeInstance{ctrl: ctrl, port: port} }
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory, nil)
 
 	_, err := s.AcquireRoute(context.Background(), "m", "req-1")
 	if err == nil {
@@ -353,7 +353,7 @@ models:
 	pool := ports.New(8100, 8109)
 	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{}}
 	factory := func(port int, _ string) jukebox.InstanceManager { return &fakeInstance{ctrl: ctrl, port: port} }
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory, nil)
 
 	_, err := s.AcquireRoute(context.Background(), "m", "req-1")
 	if err == nil {
@@ -391,7 +391,7 @@ models:
 	pool := ports.New(8100, 8109)
 	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{}}
 	factory := func(port int, _ string) jukebox.InstanceManager { return &fakeInstance{ctrl: ctrl, port: port} }
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory, nil)
 
 	routeA, err := s.AcquireRoute(context.Background(), "a", "req-a")
 	if err != nil {
@@ -442,7 +442,7 @@ models:
 		defer nowMu.Unlock()
 		return now
 	}
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, nowFn, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, nowFn, factory, nil)
 
 	routeSmall, err := s.AcquireRoute(context.Background(), "small", "req-1")
 	if err != nil {
@@ -486,7 +486,7 @@ models:
 	blockA := make(chan struct{})
 	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{"a": blockA}}
 	factory := func(port int, _ string) jukebox.InstanceManager { return &fakeInstance{ctrl: ctrl, port: port} }
-	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory, nil)
 
 	// First request acquires scheduling permit and blocks in Start.
 	firstDone := make(chan struct{})
