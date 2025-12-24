@@ -32,7 +32,19 @@ Notes:
 - Some HuggingFace models are gated (e.g. `meta-llama/*`) and require access + `HUGGING_FACE_HUB_TOKEN` (or `HF_TOKEN`).
 - vLLM needs sufficient free GPU memory; tune `gpu_memory_utilization` / `max_model_len` if you hit OOMs.
 
-## Build
+## Installation
+
+### Download pre-built binary
+
+Download the latest release from the [Releases page](https://github.com/erans/vllm-jukebox/releases):
+
+```bash
+# Download and extract
+curl -sL https://github.com/erans/vllm-jukebox/releases/latest/download/jukebox-linux-amd64.tar.gz | tar xz
+chmod +x jukebox
+```
+
+### Build from source
 
 ```bash
 go build -o bin/jukebox ./cmd/jukebox
