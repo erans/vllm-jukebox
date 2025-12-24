@@ -3,6 +3,7 @@ package gpu_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"vllm-jukebox/internal/gpu"
@@ -88,5 +89,78 @@ func TestPowerManager_RevertToDefault_NoDefault(t *testing.T) {
 	err := pm.RevertToDefault(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("RevertToDefault with no default should not error: %v", err)
+	}
+}
+
+func TestPowerManager_ApplyStartupLimits(t *testing.T) {
+	script := `#!/bin/bash
+echo "$@" >> /tmp/nvidia-smi-startup.txt
+exit 0
+`
+	scriptPath := "/tmp/fake-nvidia-smi-startup.sh"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+	defer os.Remove(scriptPath)
+	os.Remove("/tmp/nvidia-smi-startup.txt")
+	defer os.Remove("/tmp/nvidia-smi-startup.txt")
+
+	defaults := map[int]int{0: 200, 1: 250}
+	pm := gpu.NewPowerManager(scriptPath, defaults, false)
+
+	err := pm.ApplyStartupLimits(context.Background())
+	if err != nil {
+		t.Fatalf("ApplyStartupLimits: %v", err)
+	}
+
+	data, err := os.ReadFile("/tmp/nvidia-smi-startup.txt")
+	if err != nil {
+		t.Fatalf("failed to read calls: %v", err)
+	}
+	// Order might vary, so check both are present
+	output := string(data)
+	if !strings.Contains(output, "-i 0 -pl 200") {
+		t.Errorf("expected GPU 0 call, got: %s", output)
+	}
+	if !strings.Contains(output, "-i 1 -pl 250") {
+		t.Errorf("expected GPU 1 call, got: %s", output)
+	}
+}
+
+func TestPowerManager_ApplyStartupLimits_RequiredFailure(t *testing.T) {
+	script := `#!/bin/bash
+exit 1
+`
+	scriptPath := "/tmp/fake-nvidia-smi-fail.sh"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+	defer os.Remove(scriptPath)
+
+	defaults := map[int]int{0: 200}
+	pm := gpu.NewPowerManager(scriptPath, defaults, true) // required=true
+
+	err := pm.ApplyStartupLimits(context.Background())
+	if err == nil {
+		t.Fatal("expected error when required=true and command fails")
+	}
+}
+
+func TestPowerManager_ApplyStartupLimits_WarnOnFailure(t *testing.T) {
+	script := `#!/bin/bash
+exit 1
+`
+	scriptPath := "/tmp/fake-nvidia-smi-warn.sh"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+	defer os.Remove(scriptPath)
+
+	defaults := map[int]int{0: 200}
+	pm := gpu.NewPowerManager(scriptPath, defaults, false) // required=false
+
+	err := pm.ApplyStartupLimits(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error when required=false, got: %v", err)
 	}
 }

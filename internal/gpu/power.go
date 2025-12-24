@@ -3,7 +3,9 @@ package gpu
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/exec"
+	"sort"
 	"strconv"
 	"sync"
 )
@@ -67,4 +69,39 @@ func (p *PowerManager) RevertToDefault(ctx context.Context, gpuIndex int) error 
 	}
 
 	return p.SetLimit(ctx, gpuIndex, defaultWatts)
+}
+
+func (p *PowerManager) ApplyStartupLimits(ctx context.Context) error {
+	if len(p.defaults) == 0 {
+		return nil
+	}
+
+	// Sort GPU indices for deterministic order
+	gpuIndices := make([]int, 0, len(p.defaults))
+	for idx := range p.defaults {
+		gpuIndices = append(gpuIndices, idx)
+	}
+	sort.Ints(gpuIndices)
+
+	var firstErr error
+	for _, gpuIndex := range gpuIndices {
+		watts := p.defaults[gpuIndex]
+		if err := p.SetLimit(ctx, gpuIndex, watts); err != nil {
+			slog.Warn("failed to set GPU power limit",
+				"gpu", gpuIndex,
+				"watts", watts,
+				"err", err,
+			)
+			if p.required && firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			slog.Info("set GPU power limit",
+				"gpu", gpuIndex,
+				"watts", watts,
+			)
+		}
+	}
+
+	return firstErr
 }
