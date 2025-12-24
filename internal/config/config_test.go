@@ -563,3 +563,75 @@ models:
 		t.Errorf("expected 'must be > 0' error, got: %v", err)
 	}
 }
+
+func TestValidate_LogSettings(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "valid log settings",
+			yaml: `
+models:
+  test:
+    path: /models/test
+vllm:
+  log_dir: /var/log/vllm
+  log_max_size_mb: 100
+  log_max_files: 10
+`,
+			wantErr: "",
+		},
+		{
+			name: "negative log_max_size_mb",
+			yaml: `
+models:
+  test:
+    path: /models/test
+vllm:
+  log_max_size_mb: -1
+`,
+			wantErr: "log_max_size_mb must be >= 0",
+		},
+		{
+			name: "negative log_max_files",
+			yaml: `
+models:
+  test:
+    path: /models/test
+vllm:
+  log_max_files: -1
+`,
+			wantErr: "log_max_files must be >= 0",
+		},
+		{
+			name: "per-model log_file",
+			yaml: `
+models:
+  test:
+    path: /models/test
+    log_file: /var/log/test.log
+`,
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := config.Load([]byte(tt.yaml))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected error containing %q", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+				}
+			}
+		})
+	}
+}

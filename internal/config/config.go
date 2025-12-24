@@ -203,6 +203,11 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	// Validate log settings
+	if err := c.validateLogSettings(); err != nil {
+		return err
+	}
+
 	for name, model := range c.Models {
 		if model.Alias == "" && model.Path == "" {
 			return fmt.Errorf("model %q requires 'path' field", name)
@@ -402,5 +407,15 @@ func (c *Config) validateModelPowerLimits(name string, model ModelConfig) error 
 		}
 	}
 
+	return nil
+}
+
+func (c *Config) validateLogSettings() error {
+	if c.VLLM.LogMaxSizeMB < 0 {
+		return fmt.Errorf("vllm.log_max_size_mb must be >= 0, got %d", c.VLLM.LogMaxSizeMB)
+	}
+	if c.VLLM.LogMaxFiles < 0 {
+		return fmt.Errorf("vllm.log_max_files must be >= 0, got %d", c.VLLM.LogMaxFiles)
+	}
 	return nil
 }
