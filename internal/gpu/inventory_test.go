@@ -46,4 +46,3 @@ func TestParseInventoryCSV_RejectsMalformed(t *testing.T) {
 		}
 	}
 }
-

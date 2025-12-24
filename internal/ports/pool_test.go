@@ -34,4 +34,3 @@ func TestPool_ReleaseAllowsReuse(t *testing.T) {
 		t.Fatalf("expected reuse %d, got %d ok=%v (b=%d)", a, c, ok, b)
 	}
 }
-

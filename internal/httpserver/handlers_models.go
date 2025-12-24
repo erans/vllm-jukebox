@@ -44,4 +44,3 @@ func listModelsHandler(cfg *config.Config) fiber.Handler {
 		})
 	}
 }
-

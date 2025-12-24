@@ -72,4 +72,3 @@ models:
 		t.Fatalf("expected error")
 	}
 }
-

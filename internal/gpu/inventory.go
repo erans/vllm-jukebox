@@ -75,4 +75,3 @@ func (n NvidiaSMIInventory) List(ctx context.Context) ([]GPU, error) {
 	}
 	return ParseInventoryCSV(string(b))
 }
-

@@ -18,4 +18,3 @@ func requestIDMiddleware() fiber.Handler {
 		return c.Next()
 	}
 }
-

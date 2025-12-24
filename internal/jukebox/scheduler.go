@@ -74,13 +74,13 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		}
 	}
 	s := &Scheduler{
-		cfg:      cfg,
-		inv:      inv,
-		ports:    portPool,
-		powerMgr: powerMgr,
-		now:      now,
-		new:      factory,
-		sched:    make(chan struct{}, 1),
+		cfg:       cfg,
+		inv:       inv,
+		ports:     portPool,
+		powerMgr:  powerMgr,
+		now:       now,
+		new:       factory,
+		sched:     make(chan struct{}, 1),
 		instances: map[string]*schedInstance{},
 		waiters:   map[string]bool{},
 	}

@@ -53,4 +53,3 @@ func TestVerifyModelLoaded_MatchesByIDOrPath(t *testing.T) {
 		t.Fatalf("VerifyModelLoaded: %v", err)
 	}
 }
-

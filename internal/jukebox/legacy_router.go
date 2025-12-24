@@ -49,4 +49,3 @@ func (r *LegacyRouter) AcquireRoute(ctx context.Context, requestedModel, request
 		Done:          done,
 	}, nil
 }
-

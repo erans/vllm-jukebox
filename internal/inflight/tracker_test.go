@@ -56,4 +56,3 @@ func TestTracker_DoneIsIdempotent(t *testing.T) {
 		t.Fatalf("expected drain, got %v", err)
 	}
 }
-

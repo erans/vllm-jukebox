@@ -60,16 +60,16 @@ func statusHandler(cfg *config.Config, coord StatusProvider) fiber.Handler {
 			instances = make([]any, 0, len(st.Instances))
 			for _, inst := range st.Instances {
 				item := fiber.Map{
-					"model":               inst.Model,
-					"port":                inst.Port,
-					"gpus":                inst.GPUs,
-					"pid":                 inst.PID,
-					"state":               inst.State,
-					"pinned":              inst.Pinned,
-					"draining":            inst.Draining,
-					"in_flight_requests":  inst.InFlight,
-					"started_at":          formatTime(inst.StartedAt),
-					"last_used_at":        formatTime(inst.LastUsedAt),
+					"model":              inst.Model,
+					"port":               inst.Port,
+					"gpus":               inst.GPUs,
+					"pid":                inst.PID,
+					"state":              inst.State,
+					"pinned":             inst.Pinned,
+					"draining":           inst.Draining,
+					"in_flight_requests": inst.InFlight,
+					"started_at":         formatTime(inst.StartedAt),
+					"last_used_at":       formatTime(inst.LastUsedAt),
 				}
 				instances = append(instances, item)
 			}
