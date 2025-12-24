@@ -187,6 +187,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate global power limit settings
+	if err := c.validatePowerLimits(); err != nil {
+		return err
+	}
+
 	for name, model := range c.Models {
 		if model.Alias == "" && model.Path == "" {
 			return fmt.Errorf("model %q requires 'path' field", name)
@@ -195,6 +200,11 @@ func (c *Config) Validate() error {
 			if *model.GPUMemoryUtilization < 0.0 || *model.GPUMemoryUtilization > 1.0 {
 				return fmt.Errorf("model %q gpu_memory_utilization must be between 0.0 and 1.0", name)
 			}
+		}
+
+		// Validate per-model power limit settings
+		if err := c.validateModelPowerLimits(name, model); err != nil {
+			return err
 		}
 	}
 
@@ -326,4 +336,60 @@ func (c *Config) ResolveModel(name string) (resolvedName string, model ModelConf
 		return "", ModelConfig{}, fmt.Errorf("alias %q references unknown model %q", name, cfg.Alias)
 	}
 	return cfg.Alias, target, nil
+}
+
+func (c *Config) validatePowerLimits() error {
+	// gpu_power_limits and default_power_limit are mutually exclusive
+	if len(c.GPUPowerLimits) > 0 && c.DefaultPowerLimit != nil {
+		return fmt.Errorf("gpu_power_limits and default_power_limit are mutually exclusive")
+	}
+
+	// Validate global gpu_power_limits values are positive
+	for gpu, limit := range c.GPUPowerLimits {
+		if limit <= 0 {
+			return fmt.Errorf("gpu_power_limits[%d] must be > 0, got %d", gpu, limit)
+		}
+	}
+
+	// Validate default_power_limit is positive
+	if c.DefaultPowerLimit != nil && *c.DefaultPowerLimit <= 0 {
+		return fmt.Errorf("default_power_limit must be > 0, got %d", *c.DefaultPowerLimit)
+	}
+
+	return nil
+}
+
+func (c *Config) validateModelPowerLimits(name string, model ModelConfig) error {
+	// power_limit and power_limits are mutually exclusive
+	if model.PowerLimit != nil && len(model.PowerLimits) > 0 {
+		return fmt.Errorf("model %q: power_limit and power_limits are mutually exclusive", name)
+	}
+
+	// Validate power_limit is positive
+	if model.PowerLimit != nil && *model.PowerLimit <= 0 {
+		return fmt.Errorf("model %q: power_limit must be > 0, got %d", name, *model.PowerLimit)
+	}
+
+	// Validate power_limits values are positive
+	for gpu, limit := range model.PowerLimits {
+		if limit <= 0 {
+			return fmt.Errorf("model %q: power_limits[%d] must be > 0, got %d", name, gpu, limit)
+		}
+	}
+
+	// If model has power_limits, all GPU indices must be in the model's gpus list
+	if len(model.PowerLimits) > 0 && len(model.GPUs) > 0 {
+		validGPUs := make(map[int]bool)
+		for _, gpu := range model.GPUs {
+			validGPUs[gpu] = true
+		}
+
+		for gpu := range model.PowerLimits {
+			if !validGPUs[gpu] {
+				return fmt.Errorf("model %q: power_limits GPU %d not in gpus list %v", name, gpu, model.GPUs)
+			}
+		}
+	}
+
+	return nil
 }

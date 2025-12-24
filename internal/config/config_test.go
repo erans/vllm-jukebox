@@ -410,3 +410,156 @@ models:
 		t.Errorf("expected GPU 0 = 250, got %d", cfg.Models["test"].PowerLimits[0])
 	}
 }
+
+func TestConfig_GPUPowerLimitsAndDefaultMutuallyExclusive(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+gpu_power_limits:
+  0: 250
+default_power_limit: 200
+models:
+  test:
+    path: "/models/test"
+`
+	_, err := config.Load([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for mutually exclusive fields")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected 'mutually exclusive' error, got: %v", err)
+	}
+}
+
+func TestConfig_ModelPowerLimitAndPowerLimitsMutuallyExclusive(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+models:
+  test:
+    path: "/models/test"
+    power_limit: 300
+    power_limits:
+      0: 250
+`
+	_, err := config.Load([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for mutually exclusive fields")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("expected 'mutually exclusive' error, got: %v", err)
+	}
+}
+
+func TestConfig_ModelPowerLimitsGPUsMustBeSubset(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8199
+models:
+  test:
+    path: "/models/test"
+    gpus: [0, 1]
+    min_free_mem_mb_per_gpu: 1000
+    power_limits:
+      0: 250
+      2: 300
+`
+	_, err := config.Load([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for GPU not in gpus list")
+	}
+	if !strings.Contains(err.Error(), "not in gpus list") {
+		t.Errorf("expected 'not in gpus list' error, got: %v", err)
+	}
+}
+
+func TestConfig_GPUPowerLimitsMustBePositive(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+gpu_power_limits:
+  0: 0
+models:
+  test:
+    path: "/models/test"
+`
+	_, err := config.Load([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for non-positive power limit")
+	}
+	if !strings.Contains(err.Error(), "must be > 0") {
+		t.Errorf("expected 'must be > 0' error, got: %v", err)
+	}
+}
+
+func TestConfig_DefaultPowerLimitMustBePositive(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+default_power_limit: -100
+models:
+  test:
+    path: "/models/test"
+`
+	_, err := config.Load([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for non-positive power limit")
+	}
+	if !strings.Contains(err.Error(), "must be > 0") {
+		t.Errorf("expected 'must be > 0' error, got: %v", err)
+	}
+}
+
+func TestConfig_ModelPowerLimitMustBePositive(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+models:
+  test:
+    path: "/models/test"
+    power_limit: 0
+`
+	_, err := config.Load([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for non-positive power limit")
+	}
+	if !strings.Contains(err.Error(), "must be > 0") {
+		t.Errorf("expected 'must be > 0' error, got: %v", err)
+	}
+}
+
+func TestConfig_ModelPowerLimitsMapMustBePositive(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+models:
+  test:
+    path: "/models/test"
+    power_limits:
+      0: -50
+`
+	_, err := config.Load([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for non-positive power limit")
+	}
+	if !strings.Contains(err.Error(), "must be > 0") {
+		t.Errorf("expected 'must be > 0' error, got: %v", err)
+	}
+}
