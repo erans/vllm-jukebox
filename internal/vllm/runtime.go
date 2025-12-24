@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -35,6 +36,7 @@ type Manager struct {
 	startedAt     time.Time
 	stderrTail    *tailBuffer
 	stdoutTail    *tailBuffer
+	logWriter     *RotatingFileWriter
 }
 
 type processExitInfo struct {
@@ -118,9 +120,29 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = BuildEnv(os.Environ(), m.cfg.VLLM.DefaultEnv, mergeEnv(modelCfg.Env, m.extraEnv))
 	stdoutTail := newTailBuffer(16 * 1024)
-	cmd.Stdout = stdoutTail
 	stderrTail := newTailBuffer(16 * 1024)
-	cmd.Stderr = stderrTail
+
+	// Set up log file if configured
+	var logWriter *RotatingFileWriter
+	logPath := m.cfg.ResolveLogPath(modelName)
+	if logPath != "" {
+		var err error
+		logWriter, err = NewRotatingFileWriter(logPath, m.cfg.VLLM.LogMaxSizeMB, m.cfg.VLLM.LogMaxFiles)
+		if err != nil {
+			slog.Warn("failed to create log file, continuing without file logging",
+				"path", logPath,
+				"error", err)
+		}
+	}
+
+	// Tee output to both tail buffer and log file (if configured)
+	if logWriter != nil {
+		cmd.Stdout = io.MultiWriter(stdoutTail, logWriter)
+		cmd.Stderr = io.MultiWriter(stderrTail, logWriter)
+	} else {
+		cmd.Stdout = stdoutTail
+		cmd.Stderr = stderrTail
+	}
 
 	if err := cmd.Start(); err != nil {
 		return 0, err
@@ -139,6 +161,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	m.startedAt = time.Now()
 	m.stderrTail = stderrTail
 	m.stdoutTail = stdoutTail
+	m.logWriter = logWriter
 	m.mu.Unlock()
 
 	slog.Info(
@@ -173,6 +196,10 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 				err:        err,
 				stdoutTail: stdout,
 				stderrTail: stderr,
+			}
+			if m.logWriter != nil {
+				m.logWriter.Close()
+				m.logWriter = nil
 			}
 			m.cmd = nil
 			m.pid = 0
