@@ -19,7 +19,7 @@ import (
 )
 
 type Manager struct {
-	cfg *config.Config
+	cfg  *config.Config
 	port int
 
 	// extraEnv is applied after default and model env, overriding on conflict.

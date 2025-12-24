@@ -96,6 +96,7 @@ Model-bearing (proxy to vLLM):
 - `POST /v1/embeddings`
 - `POST /v1/tokenize`
 - `POST /v1/detokenize`
+- `POST /v1/messages`
 
 Jukebox-handled:
 - `GET /v1/models` - List configured models

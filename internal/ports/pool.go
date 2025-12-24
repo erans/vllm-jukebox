@@ -14,7 +14,7 @@ func New(start, end int) *Pool {
 	return &Pool{
 		start: start,
 		end:   end,
-		used: map[int]bool{},
+		used:  map[int]bool{},
 	}
 }
 
@@ -35,4 +35,3 @@ func (p *Pool) Release(port int) {
 	defer p.mu.Unlock()
 	delete(p.used, port)
 }
-

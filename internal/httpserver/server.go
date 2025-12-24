@@ -40,6 +40,9 @@ func NewApp(opts Options) *fiber.App {
 	app.Post("/v1/tokenize", switchingProxyHandler(opts))
 	app.Post("/v1/detokenize", switchingProxyHandler(opts))
 
+	// Anthropic endpoints
+	app.Post("/v1/messages", anthropicProxyHandler(opts))
+
 	// Explicit unsupported endpoints.
 	app.All("/v1/audio/*", notImplementedHandler())
 	app.All("/v1/images/*", notImplementedHandler())

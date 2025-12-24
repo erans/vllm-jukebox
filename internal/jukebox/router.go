@@ -12,4 +12,3 @@ type Router interface {
 	Status() Status
 	AcquireRoute(ctx context.Context, requestedModel, requestID string) (Route, error)
 }
-

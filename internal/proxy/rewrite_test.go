@@ -62,4 +62,3 @@ func TestRewriteSSEModel_RejectsNilReaderWriter(t *testing.T) {
 		t.Fatalf("expected error")
 	}
 }
-
