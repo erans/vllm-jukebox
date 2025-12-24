@@ -334,3 +334,31 @@ models:
 		t.Fatalf("expected default 30s, got %s", cfg.Scheduler.MinInstanceUptime.Duration)
 	}
 }
+
+func TestConfig_GPUPowerLimits(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+gpu_power_limits:
+  0: 250
+  1: 300
+models:
+  test:
+    path: "/models/test"
+`
+	cfg, err := config.Load([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.GPUPowerLimits == nil {
+		t.Fatal("expected GPUPowerLimits to be set")
+	}
+	if cfg.GPUPowerLimits[0] != 250 {
+		t.Errorf("expected GPU 0 power limit 250, got %d", cfg.GPUPowerLimits[0])
+	}
+	if cfg.GPUPowerLimits[1] != 300 {
+		t.Errorf("expected GPU 1 power limit 300, got %d", cfg.GPUPowerLimits[1])
+	}
+}

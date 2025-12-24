@@ -29,11 +29,14 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
-	Server   ServerConfig           `yaml:"server"`
-	VLLM     VLLMConfig             `yaml:"vllm"`
-	Behavior BehaviorConfig         `yaml:"behavior"`
-	Scheduler *SchedulerConfig      `yaml:"scheduler"`
-	Models   map[string]ModelConfig `yaml:"models"`
+	Server             ServerConfig           `yaml:"server"`
+	VLLM               VLLMConfig             `yaml:"vllm"`
+	Behavior           BehaviorConfig         `yaml:"behavior"`
+	Scheduler          *SchedulerConfig       `yaml:"scheduler"`
+	Models             map[string]ModelConfig `yaml:"models"`
+	GPUPowerLimits     map[int]int            `yaml:"gpu_power_limits"`
+	DefaultPowerLimit  *int                   `yaml:"default_power_limit"`
+	PowerLimitRequired bool                   `yaml:"power_limit_required"`
 }
 
 type ServerConfig struct {
