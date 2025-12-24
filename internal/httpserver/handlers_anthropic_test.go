@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
@@ -134,4 +135,30 @@ func TestAnthropicProxy_UnknownModelReturns400(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(body), `"type":"error"`)
 	assert.Contains(t, string(body), "not found")
+}
+
+func TestAnthropicProxy_SwapInProgressReturns503WithRetryAfter(t *testing.T) {
+	cfg := &config.Config{
+		Models: map[string]config.ModelConfig{
+			"claude": {Path: "/models/claude"},
+		},
+	}
+	router := &mockAnthropicRouter{
+		err: &jukebox.RejectError{Reason: jukebox.RejectSwapInProgress, RetryAfter: 5 * time.Second},
+	}
+
+	app := fiber.New()
+	app.Post("/v1/messages", anthropicProxyHandler(Options{Config: cfg, Router: router}))
+
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"model":"claude"}`)))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 503, resp.StatusCode)
+	assert.NotEmpty(t, resp.Header.Get("Retry-After"))
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), `"type":"error"`)
+	assert.Contains(t, string(body), `"type":"overloaded_error"`)
 }
