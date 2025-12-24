@@ -138,6 +138,27 @@ models:
 
 Power limits are applied via `nvidia-smi -i <gpu> -pl <watts>` and reverted to defaults when models unload.
 
+## vLLM Log Files
+
+vLLM process output can be redirected to rotating log files:
+
+```yaml
+vllm:
+  log_dir: "/var/log/vllm"    # Directory for log files
+  log_max_size_mb: 50         # Max size before rotation (default: 50)
+  log_max_files: 5            # Rotated files to keep (default: 5)
+
+models:
+  mymodel:
+    path: "..."
+    log_file: "/custom/path.log"  # Per-model override (optional)
+```
+
+- If `log_dir` is set, each model logs to `<log_dir>/<model-name>.log`
+- Per-model `log_file` overrides the auto-generated path
+- Logs are appended with size-based rotation
+- Tail buffer still available via `/status` endpoint
+
 ## Testing Notes
 
 - Smoke tests use fake vLLM servers and fake nvidia-smi for isolation
