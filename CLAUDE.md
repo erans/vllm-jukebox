@@ -111,6 +111,33 @@ Two example configs are provided:
 
 Key config sections: `server`, `vllm`, `scheduler` (optional), `behavior`, `models`
 
+## GPU Power Limits
+
+Power limits can be configured at startup and overridden per-model:
+
+```yaml
+# Option A: Per-GPU limits at startup
+gpu_power_limits:
+  0: 250
+  1: 300
+
+# Option B: Single default (mutually exclusive with above)
+default_power_limit: 250
+
+# Fail if power limit cannot be set (default: false)
+power_limit_required: false
+
+models:
+  mymodel:
+    power_limit: 300          # Single value for all model GPUs
+    # OR
+    power_limits:             # Per-GPU within model
+      0: 350
+      1: 300
+```
+
+Power limits are applied via `nvidia-smi -i <gpu> -pl <watts>` and reverted to defaults when models unload.
+
 ## Testing Notes
 
 - Smoke tests use fake vLLM servers and fake nvidia-smi for isolation
