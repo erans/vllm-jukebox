@@ -61,10 +61,10 @@ type VLLMConfig struct {
 }
 
 type SchedulerConfig struct {
-	NvidiaSMIBinary   string   `yaml:"nvidia_smi_binary"`
-	PortRangeStart    int      `yaml:"port_range_start"`
-	PortRangeEnd      int      `yaml:"port_range_end"`
-	MaxInstances      *int     `yaml:"max_instances"`
+	NvidiaSMIBinary   string    `yaml:"nvidia_smi_binary"`
+	PortRangeStart    int       `yaml:"port_range_start"`
+	PortRangeEnd      int       `yaml:"port_range_end"`
+	MaxInstances      *int      `yaml:"max_instances"`
 	MinInstanceUptime *Duration `yaml:"min_instance_uptime"`
 }
 
@@ -93,6 +93,8 @@ type ModelConfig struct {
 	Quantization         string            `yaml:"quantization"`
 	ExtraArgs            []string          `yaml:"extra_args"`
 	Env                  map[string]string `yaml:"env"`
+	PowerLimit           *int              `yaml:"power_limit"`
+	PowerLimits          map[int]int       `yaml:"power_limits"`
 }
 
 func Load(data []byte) (*Config, error) {

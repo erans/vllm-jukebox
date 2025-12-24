@@ -362,3 +362,51 @@ models:
 		t.Errorf("expected GPU 1 power limit 300, got %d", cfg.GPUPowerLimits[1])
 	}
 }
+
+func TestConfig_ModelPowerLimit(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+models:
+  test:
+    path: "/models/test"
+    power_limit: 300
+`
+	cfg, err := config.Load([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Models["test"].PowerLimit == nil {
+		t.Fatal("expected PowerLimit to be set")
+	}
+	if *cfg.Models["test"].PowerLimit != 300 {
+		t.Errorf("expected 300, got %d", *cfg.Models["test"].PowerLimit)
+	}
+}
+
+func TestConfig_ModelPowerLimitsMap(t *testing.T) {
+	yaml := `
+server:
+  port: 8080
+vllm:
+  port: 8000
+models:
+  test:
+    path: "/models/test"
+    power_limits:
+      0: 250
+      1: 300
+`
+	cfg, err := config.Load([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Models["test"].PowerLimits == nil {
+		t.Fatal("expected PowerLimits to be set")
+	}
+	if cfg.Models["test"].PowerLimits[0] != 250 {
+		t.Errorf("expected GPU 0 = 250, got %d", cfg.Models["test"].PowerLimits[0])
+	}
+}
