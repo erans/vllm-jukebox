@@ -9,8 +9,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -60,6 +60,41 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Create PowerManager if power limits are configured
+	var powerMgr *gpu.PowerManager
+	if cfg.GPUPowerLimits != nil || cfg.DefaultPowerLimit != nil {
+		defaults := cfg.GPUPowerLimits
+		if defaults == nil && cfg.DefaultPowerLimit != nil {
+			// Build defaults from inventory if using default_power_limit
+			defaults = make(map[int]int)
+
+			nvidiaBinary := "nvidia-smi"
+			if cfg.Scheduler != nil && cfg.Scheduler.NvidiaSMIBinary != "" {
+				nvidiaBinary = cfg.Scheduler.NvidiaSMIBinary
+			}
+			inv := gpu.NvidiaSMIInventory{Binary: nvidiaBinary}
+			gpus, err := inv.List(context.Background())
+			if err != nil {
+				slog.Warn("failed to list GPUs for default power limit", "err", err)
+			} else {
+				for _, g := range gpus {
+					defaults[g.Index] = *cfg.DefaultPowerLimit
+				}
+			}
+		}
+
+		nvidiaBinary := "nvidia-smi"
+		if cfg.Scheduler != nil && cfg.Scheduler.NvidiaSMIBinary != "" {
+			nvidiaBinary = cfg.Scheduler.NvidiaSMIBinary
+		}
+		powerMgr = gpu.NewPowerManager(nvidiaBinary, defaults, cfg.PowerLimitRequired)
+
+		if err := powerMgr.ApplyStartupLimits(ctx); err != nil {
+			slog.Error("failed to apply startup power limits", "err", err)
+			os.Exit(1)
+		}
+	}
 
 	var (
 		router jukebox.Router
