@@ -14,3 +14,14 @@ func writeOpenAIError(c *fiber.Ctx, status int, message, errType, code string) e
 		},
 	})
 }
+
+func writeAnthropicError(c *fiber.Ctx, status int, errType, message string) error {
+	c.Set("Content-Type", "application/json")
+	return c.Status(status).JSON(fiber.Map{
+		"type": "error",
+		"error": fiber.Map{
+			"type":    errType,
+			"message": message,
+		},
+	})
+}
