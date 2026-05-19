@@ -201,6 +201,10 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if err := c.validateRuntimes(); err != nil {
+		return err
+	}
+
 	if err := c.validateScheduler(); err != nil {
 		return err
 	}
@@ -238,10 +242,6 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.validateAliases(); err != nil {
-		return err
-	}
-
-	if err := c.validateRuntimes(); err != nil {
 		return err
 	}
 

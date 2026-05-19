@@ -759,3 +759,29 @@ models:
 		t.Fatalf("expected error to mention scheduler, got: %v", err)
 	}
 }
+
+func TestValidate_LlamaCppSchedulerErrorWinsOverMissingGPUs(t *testing.T) {
+	_, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "llama-server"
+scheduler:
+  port_range_start: 9000
+  port_range_end: 9009
+models:
+  m:
+    runtime: llama_cpp
+    path: "/models/m.gguf"
+`))
+	if err == nil {
+		t.Fatalf("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "scheduler") {
+		t.Fatalf("expected scheduler-mode error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "requires 'gpus'") {
+		t.Fatalf("scheduler missing-gpus error should not surface first, got: %v", err)
+	}
+}
