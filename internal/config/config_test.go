@@ -635,3 +635,50 @@ models:
 		})
 	}
 }
+
+func TestLoad_ModelRuntimeDefaultsToVLLM(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Models["m"].Runtime; got != "" && got != "vllm" {
+		t.Fatalf("expected runtime to default to \"\" or \"vllm\", got %q", got)
+	}
+}
+
+func TestLoad_LlamaCppBlockParses(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "/opt/llama.cpp/llama-server"
+  default_args: ["--jinja"]
+models:
+  m:
+    runtime: llama_cpp
+    path: "unsloth/foo-GGUF:Q4_K_M"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.LlamaCpp == nil {
+		t.Fatalf("expected llama_cpp block to parse, got nil")
+	}
+	if cfg.LlamaCpp.Binary != "/opt/llama.cpp/llama-server" {
+		t.Fatalf("binary: %q", cfg.LlamaCpp.Binary)
+	}
+	if got := cfg.Models["m"].Runtime; got != "llama_cpp" {
+		t.Fatalf("expected runtime=llama_cpp, got %q", got)
+	}
+	if len(cfg.LlamaCpp.DefaultArgs) != 1 || cfg.LlamaCpp.DefaultArgs[0] != "--jinja" {
+		t.Fatalf("default_args: %v", cfg.LlamaCpp.DefaultArgs)
+	}
+}

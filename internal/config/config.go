@@ -34,6 +34,7 @@ type Config struct {
 	VLLM               VLLMConfig             `yaml:"vllm"`
 	Behavior           BehaviorConfig         `yaml:"behavior"`
 	Scheduler          *SchedulerConfig       `yaml:"scheduler"`
+	LlamaCpp           *LlamaCppConfig        `yaml:"llama_cpp"`
 	Models             map[string]ModelConfig `yaml:"models"`
 	GPUPowerLimits     map[int]int            `yaml:"gpu_power_limits"`
 	DefaultPowerLimit  *int                   `yaml:"default_power_limit"`
@@ -73,6 +74,11 @@ type SchedulerConfig struct {
 	MinInstanceUptime *Duration `yaml:"min_instance_uptime"`
 }
 
+type LlamaCppConfig struct {
+	Binary      string   `yaml:"binary"`
+	DefaultArgs []string `yaml:"default_args"`
+}
+
 type VLLMDefaults struct {
 	GPUMemoryUtilization *float64 `yaml:"gpu_memory_utilization"`
 	DType                string   `yaml:"dtype"`
@@ -86,6 +92,7 @@ type BehaviorConfig struct {
 
 type ModelConfig struct {
 	Path                 string            `yaml:"path"`
+	Runtime              string            `yaml:"runtime"`
 	Alias                string            `yaml:"alias"`
 	GPUs                 []int             `yaml:"gpus"`
 	MinFreeMemMBPerGPU   *int              `yaml:"min_free_mem_mb_per_gpu"`
