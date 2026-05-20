@@ -2,6 +2,7 @@ package runtime_test
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"vllm-jukebox/internal/config"
@@ -53,7 +54,11 @@ models:
 }
 
 func TestRuntimeFor_UnknownName(t *testing.T) {
-	if _, err := runtime.For("tgi"); err == nil {
+	_, err := runtime.For("tgi")
+	if err == nil {
 		t.Fatalf("expected unknown runtime to error")
+	}
+	if !strings.Contains(err.Error(), "tgi") {
+		t.Fatalf("expected error to mention %q, got: %v", "tgi", err)
 	}
 }
