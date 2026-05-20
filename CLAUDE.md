@@ -177,28 +177,34 @@ Two gotchas to know before you turn it on:
   shipped `configs/qwen36-35b-a3b-llamacpp.yaml` example points at this
   even though MTP is commented out by default; see below).
 - MTP being functional does not mean it makes the model faster. We
-  measured a **~10–12% throughput regression** on Qwen 3.6 35B-A3B
-  (UD-Q4_K_M, `temperature=0`, `max_tokens=4000` long-form generation)
-  with `--spec-type draft-mtp` at default `--spec-draft-n-max 3`:
+  measured the full `--spec-draft-n-max` curve on Qwen 3.6 35B-A3B
+  (UD-Q4_K_M, 8× RTX 3090 layer-split, `temperature=0`, long-form
+  `max_tokens=4000`):
 
-  | Setup | baseline tok/s | MTP tok/s | delta |
+  | Config | tok/s | acceptance | vs baseline |
   |---|---|---|---|
-  | 8× RTX 3090, `--split-mode layer` | 128.16 | 115.22 | −10.1% |
-  | 2× RTX 3090, `--split-mode layer` | 129.18 | 113.23 | −12.3% |
+  | baseline (no `--spec-type`) | 128.16 | — | — |
+  | `n_max=1` | 127.56 | 77.5% | **−0.5%** |
+  | `n_max=2` | 126.48 | 60.9% | −1.3% |
+  | `n_max=3` (llama-server default) | 115.22 | 47.5% | −10.1% |
 
-  Draft acceptance was ~47% in both setups (identical draft/accept counts
-  across the two GPU configurations, since the prompt is deterministic).
-  The regression is not GPU-count dependent — the bottleneck is structural:
-  the MTP draft pass is dense, while the main model is an A3B MoE (~3B
-  active), so a single draft pass costs roughly the same as a single main
-  pass. At 47% acceptance and `n_max=3`, the expected gain of `1 + 3·0.47
-  = 2.41×` collapses to ~0.9× once draft cost is comparable to main cost.
+  Best operating point is `n_max=1` and it's still slightly below
+  baseline. We also verified this is not GPU-count dependent: on 2× RTX
+  3090, baseline = 129.18 tok/s and MTP at default `n_max=3` = 113.23
+  tok/s (−12.3%) — actually *worse* than the 8-GPU regression. Identical
+  draft/accept counts between 2-GPU and 8-GPU runs prove the deterministic
+  prompt produces the same speculation behavior; the wall-clock difference
+  is purely execution cost.
+
+  The bottleneck is structural: the MTP draft layer is dense, while the
+  main model is an A3B MoE (~3B active). A draft pass costs ~50–80% of a
+  main pass, so the acceptance savings don't pay it back. The big jump
+  between `n_max=2` (−1.3%) and `n_max=3` (−10.1%) is a kernel-batching
+  nonlinearity (3 tokens triggers a different draft path than 1–2).
 
   The example config ships with `--spec-type draft-mtp` commented out
-  because of this. Uncomment it if you want to experiment (e.g. tune
-  `--spec-draft-n-max` lower to reduce wasted draft compute, try a
-  different prompt style with higher acceptance, or accept the regression
-  for the latency profile change).
+  because of this. If you want to enable it (e.g. for latency-profile
+  reasons rather than throughput), start with `--spec-draft-n-max 1`.
 
 ## GPU Power Limits
 

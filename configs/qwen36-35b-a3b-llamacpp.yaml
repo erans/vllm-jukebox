@@ -57,13 +57,20 @@ models:
       # "context type MTP requested but model doesn't contain MTP layers".
       #
       # Performance caveat: on this exact config (35B-A3B MoE, UD-Q4_K_M,
-      # 8x RTX 3090 layer-split) MTP measured ~10-12% SLOWER than baseline
-      # at default --spec-draft-n-max 3, on long-form generation
-      # (max_tokens=4000), with ~47% draft acceptance. The dense MTP draft
-      # pass costs roughly the same as the MoE main pass (~3B active), so
-      # acceptance savings get eaten. The regression is not GPU-count
-      # dependent (verified 2-GPU vs 8-GPU runs). Try tuning
-      # --spec-draft-n-max lower if you want to experiment.
+      # 8x RTX 3090 layer-split, long-form max_tokens=4000) MTP cannot
+      # speed this model up — measured curve relative to baseline:
+      #
+      #   n_max=1: -0.5%  (77.5% acceptance)  <- least-bad operating point
+      #   n_max=2: -1.3%  (60.9% acceptance)
+      #   n_max=3: -10.1% (47.5% acceptance)  <- llama-server default
+      #
+      # The dense MTP draft pass on the A3B MoE main model costs ~50-80%
+      # of a main pass, so acceptance savings get eaten. The jump from
+      # n_max=2 to n_max=3 is a kernel-batching nonlinearity (3 tokens
+      # triggers a different draft path than 1-2). If you want to enable
+      # MTP anyway (e.g. for latency-profile reasons), start with n_max=1.
       #
       # - "--spec-type"
       # - "draft-mtp"
+      # - "--spec-draft-n-max"
+      # - "1"
