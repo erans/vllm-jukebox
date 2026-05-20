@@ -14,7 +14,7 @@ vllm:
   log_max_files: 3
 
 llama_cpp:
-  binary: "llama-server"
+  binary: "/home/eran/llama.cpp/build/bin/llama-server"
 
 behavior:
   rewrite_model_name: true
@@ -23,8 +23,10 @@ models:
   qwen36-35b-a3b:
     runtime: llama_cpp
     # Hugging Face repo coordinate; llama-server downloads on first start.
-    # Pick a quant tag that fits your VRAM budget.
-    path: "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
+    # Pick a quant tag that fits your VRAM budget. Unsloth ships "UD-" dynamic
+    # quants; see https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF for the
+    # full list of files.
+    path: "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"
     max_model_len: 65536
     extra_args:
       - "--jinja"
