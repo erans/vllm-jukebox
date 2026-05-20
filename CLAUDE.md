@@ -155,6 +155,33 @@ exists on disk, is an absolute or `./`/`../` path, or ends in `.gguf`.
 Scheduler mode does not yet support `runtime: llama_cpp`; the config
 validator rejects that combination.
 
+### Multi-Token Prediction (MTP) for Qwen 3.5 / 3.6
+
+llama.cpp implements MTP as a speculative-decoding mode that runs against
+the model's own NextN layers — no separate draft model is needed. Enable it
+by adding to a model's `extra_args`:
+
+```yaml
+extra_args:
+  - "--spec-type"
+  - "draft-mtp"
+```
+
+Two gotchas to know before you turn it on:
+
+- The GGUF must include the NextN/MTP layers. Many community quants
+  (including the default `unsloth/Qwen3.6-35B-A3B-GGUF`) strip them to save
+  space and llama-server will exit at load with
+  `context type MTP requested but model doesn't contain MTP layers`. Use
+  an `-MTP-GGUF` variant such as `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` (the
+  shipped `configs/qwen36-35b-a3b-llamacpp.yaml` example points at this).
+- MTP being functional doesn't guarantee a throughput win. On Qwen 3.6
+  35B-A3B (MoE, ~3B active) at default `--spec-draft-n-max 3` we measured
+  ~59% draft acceptance but ~0% net tok/s gain (129 → 128 tok/s) because
+  the dense MTP draft pass costs about as much as the MoE main pass. Try
+  tuning `--spec-draft-n-max` (try lower for cheaper drafts, higher for
+  more aggressive speculation) if you want to push throughput further.
+
 ## GPU Power Limits
 
 Power limits can be configured at startup and overridden per-model:
