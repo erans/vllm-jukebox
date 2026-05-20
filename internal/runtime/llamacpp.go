@@ -2,9 +2,12 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -52,7 +55,47 @@ func (llamaCppRuntime) BuildArgs(cfg *config.Config, model config.ModelConfig, r
 }
 
 func (llamaCppRuntime) VerifyModelLoaded(ctx context.Context, baseURL, expectedID, expectedPath string) error {
-	return fmt.Errorf("llama_cpp runtime: VerifyModelLoaded not implemented yet")
+	url := strings.TrimRight(baseURL, "/") + "/v1/models"
+	client := &http.Client{}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GET /v1/models returned %s", resp.Status)
+	}
+
+	var decoded struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return err
+	}
+
+	base := ""
+	if expectedPath != "" {
+		base = filepath.Base(expectedPath)
+	}
+	for _, m := range decoded.Data {
+		if m.ID == expectedID {
+			return nil
+		}
+		if expectedPath != "" && m.ID == expectedPath {
+			return nil
+		}
+		if base != "" && m.ID == base {
+			return nil
+		}
+	}
+	return fmt.Errorf("expected model %q (or path %q) not found in /v1/models", expectedID, expectedPath)
 }
 
 // looksLikeLocalGGUF matches the heuristic from scripts/llama-server-wrapper.sh:

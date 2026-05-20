@@ -1,10 +1,15 @@
 package runtime_test
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/runtime"
@@ -160,5 +165,56 @@ models:
 				t.Fatalf("vLLM-only flag %q leaked into llama.cpp args: %v", banned, got)
 			}
 		}
+	}
+}
+
+func newModelsServer(t *testing.T, ids ...string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		type m struct {
+			ID string `json:"id"`
+		}
+		data := []m{}
+		for _, id := range ids {
+			data = append(data, m{ID: id})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+}
+
+func TestLlamaCppRuntime_VerifyModelLoaded_MatchesExpectedID(t *testing.T) {
+	s := newModelsServer(t, "qwen36-35b-a3b")
+	defer s.Close()
+	rt, _ := runtime.For("llama_cpp")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.VerifyModelLoaded(ctx, s.URL, "qwen36-35b-a3b", "unsloth/qwen-GGUF"); err != nil {
+		t.Fatalf("VerifyModelLoaded: %v", err)
+	}
+}
+
+func TestLlamaCppRuntime_VerifyModelLoaded_MatchesPathBasename(t *testing.T) {
+	s := newModelsServer(t, "Qwen3.6-35B-A3B-Q4_K_M.gguf")
+	defer s.Close()
+	rt, _ := runtime.For("llama_cpp")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.VerifyModelLoaded(ctx, s.URL, "qwen36", "/models/Qwen3.6-35B-A3B-Q4_K_M.gguf"); err != nil {
+		t.Fatalf("VerifyModelLoaded: %v", err)
+	}
+}
+
+func TestLlamaCppRuntime_VerifyModelLoaded_RejectsMismatch(t *testing.T) {
+	s := newModelsServer(t, "wrong-model")
+	defer s.Close()
+	rt, _ := runtime.For("llama_cpp")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rt.VerifyModelLoaded(ctx, s.URL, "qwen", "/models/qwen.gguf"); err == nil {
+		t.Fatalf("expected mismatch to error")
 	}
 }
