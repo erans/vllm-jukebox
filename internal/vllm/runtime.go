@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"vllm-jukebox/internal/config"
+	rt "vllm-jukebox/internal/runtime"
 )
 
 type Manager struct {
@@ -105,17 +106,22 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	}
 	m.mu.Unlock()
 
-	args, err := BuildServeArgsForPort(m.cfg, modelName, m.port)
+	resolvedName, modelCfg, err := m.cfg.ResolveModel(modelName)
 	if err != nil {
 		return 0, err
 	}
 
-	_, modelCfg, err := m.cfg.ResolveModel(modelName)
+	runtimeImpl, err := rt.For(modelCfg.Runtime)
 	if err != nil {
 		return 0, err
 	}
 
-	bin, binArgs := wrapBinaryArgs(m.cfg.VLLM.Binary, args)
+	args, err := runtimeImpl.BuildArgs(m.cfg, modelCfg, resolvedName, m.port)
+	if err != nil {
+		return 0, err
+	}
+
+	bin, binArgs := wrapBinaryArgs(runtimeImpl.Binary(m.cfg), args)
 	cmd := exec.Command(bin, binArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = BuildEnv(os.Environ(), m.cfg.VLLM.DefaultEnv, mergeEnv(modelCfg.Env, m.extraEnv))
@@ -353,7 +359,12 @@ func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 		return err
 	}
 
-	return VerifyModelLoaded(ctx, base, expectedModel, modelCfg.Path)
+	runtimeImpl, err := rt.For(modelCfg.Runtime)
+	if err != nil {
+		return err
+	}
+
+	return runtimeImpl.VerifyModelLoaded(ctx, base, expectedModel, modelCfg.Path)
 }
 
 type tailBuffer struct {

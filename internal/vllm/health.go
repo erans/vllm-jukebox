@@ -2,12 +2,12 @@ package vllm
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"vllm-jukebox/internal/vllmcli"
 )
 
 var ErrProcessExited = errors.New("process exited")
@@ -82,37 +82,10 @@ func WaitForHealthOrExit(ctx context.Context, baseURL string, exited <-chan stru
 	}
 }
 
+// VerifyModelLoaded is a thin re-export of vllmcli.VerifyModelLoaded so
+// existing callers (and tests) inside this package keep compiling. The real
+// implementation lives in internal/vllmcli to avoid an import cycle with
+// internal/runtime.
 func VerifyModelLoaded(ctx context.Context, baseURL, expectedID, expectedPath string) error {
-	url := strings.TrimRight(baseURL, "/") + "/v1/models"
-	client := &http.Client{}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("GET /v1/models returned %s", resp.Status)
-	}
-
-	var decoded struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		return err
-	}
-
-	for _, m := range decoded.Data {
-		if m.ID == expectedID || (expectedPath != "" && m.ID == expectedPath) {
-			return nil
-		}
-	}
-	return fmt.Errorf("expected model %q not found in /v1/models", expectedID)
+	return vllmcli.VerifyModelLoaded(ctx, baseURL, expectedID, expectedPath)
 }
