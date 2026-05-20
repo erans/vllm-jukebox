@@ -1,0 +1,46 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+vllm:
+  port: 8000
+  startup_timeout: 1800s
+  shutdown_timeout: 30s
+  drain_timeout: 60s
+  swap_cooldown: 30s
+  swap_wait_timeout: 60s
+  log_dir: "/tmp/vllm-logs"
+  log_max_size_mb: 100
+  log_max_files: 3
+
+llama_cpp:
+  binary: "llama-server"
+
+behavior:
+  rewrite_model_name: true
+
+models:
+  qwen36-35b-a3b:
+    runtime: llama_cpp
+    # Hugging Face repo coordinate; llama-server downloads on first start.
+    # Pick a quant tag that fits your VRAM budget.
+    path: "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
+    max_model_len: 65536
+    extra_args:
+      - "--jinja"
+      - "--flash-attn"
+      - "on"
+      - "--n-gpu-layers"
+      - "all"
+      - "--split-mode"
+      - "layer"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--parallel"
+      - "4"
+      - "--batch-size"
+      - "2048"
+      - "--ubatch-size"
+      - "512"

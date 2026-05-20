@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -783,5 +784,15 @@ models:
 	}
 	if strings.Contains(err.Error(), "requires 'gpus'") {
 		t.Fatalf("scheduler missing-gpus error should not surface first, got: %v", err)
+	}
+}
+
+func TestLoad_QwenLlamaCppExampleParses(t *testing.T) {
+	data, err := os.ReadFile("../../configs/qwen36-35b-a3b-llamacpp.yaml")
+	if err != nil {
+		t.Skipf("example config not readable: %v", err)
+	}
+	if _, err := config.Load(data); err != nil {
+		t.Fatalf("expected example to parse, got: %v", err)
 	}
 }
