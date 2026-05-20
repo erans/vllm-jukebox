@@ -48,12 +48,22 @@ models:
       - "2048"
       - "--ubatch-size"
       - "512"
-      # Multi-Token Prediction (MTP). Qwen 3.5/3.6 ship NextN/MTP layers in
-      # the "-MTP-GGUF" repo variants (not the plain "-GGUF" repos, which
-      # strip them). --spec-type draft-mtp turns on speculative decoding
-      # against those layers — no separate draft model needed. Tuning of
-      # --spec-draft-n-max / --spec-draft-p-* is left at llama-server
-      # defaults; A/B against this same GGUF without --spec-type is in the
-      # commit that introduced this flag.
-      - "--spec-type"
-      - "draft-mtp"
+      # Multi-Token Prediction (MTP) — uncomment to enable.
+      #
+      # llama.cpp implements MTP as a speculative-decoding mode using the
+      # model's own NextN layers (no separate draft model). Qwen 3.5/3.6
+      # ship those layers in "-MTP-GGUF" repo variants only; the plain
+      # "-GGUF" repos strip them and llama-server will exit at load with
+      # "context type MTP requested but model doesn't contain MTP layers".
+      #
+      # Performance caveat: on this exact config (35B-A3B MoE, UD-Q4_K_M,
+      # 8x RTX 3090 layer-split) MTP measured ~10-12% SLOWER than baseline
+      # at default --spec-draft-n-max 3, on long-form generation
+      # (max_tokens=4000), with ~47% draft acceptance. The dense MTP draft
+      # pass costs roughly the same as the MoE main pass (~3B active), so
+      # acceptance savings get eaten. The regression is not GPU-count
+      # dependent (verified 2-GPU vs 8-GPU runs). Try tuning
+      # --spec-draft-n-max lower if you want to experiment.
+      #
+      # - "--spec-type"
+      # - "draft-mtp"

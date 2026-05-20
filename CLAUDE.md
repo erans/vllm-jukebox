@@ -174,13 +174,31 @@ Two gotchas to know before you turn it on:
   space and llama-server will exit at load with
   `context type MTP requested but model doesn't contain MTP layers`. Use
   an `-MTP-GGUF` variant such as `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` (the
-  shipped `configs/qwen36-35b-a3b-llamacpp.yaml` example points at this).
-- MTP being functional doesn't guarantee a throughput win. On Qwen 3.6
-  35B-A3B (MoE, ~3B active) at default `--spec-draft-n-max 3` we measured
-  ~59% draft acceptance but ~0% net tok/s gain (129 → 128 tok/s) because
-  the dense MTP draft pass costs about as much as the MoE main pass. Try
-  tuning `--spec-draft-n-max` (try lower for cheaper drafts, higher for
-  more aggressive speculation) if you want to push throughput further.
+  shipped `configs/qwen36-35b-a3b-llamacpp.yaml` example points at this
+  even though MTP is commented out by default; see below).
+- MTP being functional does not mean it makes the model faster. We
+  measured a **~10–12% throughput regression** on Qwen 3.6 35B-A3B
+  (UD-Q4_K_M, `temperature=0`, `max_tokens=4000` long-form generation)
+  with `--spec-type draft-mtp` at default `--spec-draft-n-max 3`:
+
+  | Setup | baseline tok/s | MTP tok/s | delta |
+  |---|---|---|---|
+  | 8× RTX 3090, `--split-mode layer` | 128.16 | 115.22 | −10.1% |
+  | 2× RTX 3090, `--split-mode layer` | 129.18 | 113.23 | −12.3% |
+
+  Draft acceptance was ~47% in both setups (identical draft/accept counts
+  across the two GPU configurations, since the prompt is deterministic).
+  The regression is not GPU-count dependent — the bottleneck is structural:
+  the MTP draft pass is dense, while the main model is an A3B MoE (~3B
+  active), so a single draft pass costs roughly the same as a single main
+  pass. At 47% acceptance and `n_max=3`, the expected gain of `1 + 3·0.47
+  = 2.41×` collapses to ~0.9× once draft cost is comparable to main cost.
+
+  The example config ships with `--spec-type draft-mtp` commented out
+  because of this. Uncomment it if you want to experiment (e.g. tune
+  `--spec-draft-n-max` lower to reduce wasted draft compute, try a
+  different prompt style with higher acceptance, or accept the regression
+  for the latency profile change).
 
 ## GPU Power Limits
 
