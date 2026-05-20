@@ -7,23 +7,32 @@ import (
 
 	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/runtime"
-	"vllm-jukebox/internal/vllm"
 )
 
-func TestVLLMRuntime_BuildArgsMatchesLegacy(t *testing.T) {
+func TestVLLMRuntime_BuildArgs_FullShape(t *testing.T) {
+	// Set every leg that BuildServeArgsForPort touches to a non-default value
+	// so any future refactor that drops or reorders a flag will fail this test.
 	cfg, err := config.Load([]byte(`
 vllm:
   port: 8000
   binary: "vllm"
   defaults:
-    gpu_memory_utilization: 0.9
-    dtype: auto
+    gpu_memory_utilization: 0.5
+    dtype: float16
+    max_model_len: 4096
 models:
   m:
     path: "/models/m"
     tensor_parallel_size: 4
-    max_model_len: 8192
-    extra_args: ["--enforce-eager"]
+    pipeline_parallel_size: 2
+    max_model_len: 32768
+    gpu_memory_utilization: 0.9
+    dtype: bfloat16
+    quantization: awq
+    extra_args:
+      - "--enforce-eager"
+      - "--seed"
+      - "42"
 `))
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -40,16 +49,25 @@ models:
 		t.Fatalf("Binary: %q", got)
 	}
 
-	legacy, err := vllm.BuildServeArgsForPort(cfg, "m", 8000)
-	if err != nil {
-		t.Fatalf("legacy: %v", err)
-	}
 	got, err := rt.BuildArgs(cfg, cfg.Models["m"], "m", 8000)
 	if err != nil {
 		t.Fatalf("BuildArgs: %v", err)
 	}
-	if !reflect.DeepEqual(legacy, got) {
-		t.Fatalf("vllm runtime BuildArgs diverges from legacy.\n  legacy: %v\n     got: %v", legacy, got)
+
+	want := []string{
+		"serve", "/models/m",
+		"--host", "127.0.0.1",
+		"--port", "8000",
+		"--tensor-parallel-size", "4",
+		"--pipeline-parallel-size", "2",
+		"--gpu-memory-utilization", "0.9",
+		"--max-model-len", "32768",
+		"--dtype", "bfloat16",
+		"--quantization", "awq",
+		"--enforce-eager", "--seed", "42",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("vllm runtime args don't match expected shape\n  got: %v\n want: %v", got, want)
 	}
 }
 
