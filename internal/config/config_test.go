@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -633,5 +634,165 @@ models:
 				}
 			}
 		})
+	}
+}
+
+func TestLoad_ModelRuntimeDefaultsToVLLM(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Models["m"].Runtime; got != "" && got != "vllm" {
+		t.Fatalf("expected runtime to default to \"\" or \"vllm\", got %q", got)
+	}
+}
+
+func TestLoad_LlamaCppBlockParses(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "/opt/llama.cpp/llama-server"
+  default_args: ["--jinja"]
+models:
+  m:
+    runtime: llama_cpp
+    path: "unsloth/foo-GGUF:Q4_K_M"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.LlamaCpp == nil {
+		t.Fatalf("expected llama_cpp block to parse, got nil")
+	}
+	if cfg.LlamaCpp.Binary != "/opt/llama.cpp/llama-server" {
+		t.Fatalf("binary: %q", cfg.LlamaCpp.Binary)
+	}
+	if got := cfg.Models["m"].Runtime; got != "llama_cpp" {
+		t.Fatalf("expected runtime=llama_cpp, got %q", got)
+	}
+	if len(cfg.LlamaCpp.DefaultArgs) != 1 || cfg.LlamaCpp.DefaultArgs[0] != "--jinja" {
+		t.Fatalf("default_args: %v", cfg.LlamaCpp.DefaultArgs)
+	}
+}
+
+func TestValidate_UnknownRuntimeRejected(t *testing.T) {
+	_, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+models:
+  m:
+    runtime: "tgi"
+    path: "/models/m"
+`))
+	if err == nil {
+		t.Fatalf("expected unknown runtime to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime") {
+		t.Fatalf("expected error to mention runtime, got: %v", err)
+	}
+}
+
+func TestValidate_LlamaCppRequiresBinary(t *testing.T) {
+	_, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+models:
+  m:
+    runtime: llama_cpp
+    path: "/models/m.gguf"
+`))
+	if err == nil {
+		t.Fatalf("expected missing llama_cpp.binary to be rejected")
+	}
+	if !strings.Contains(err.Error(), "llama_cpp.binary") {
+		t.Fatalf("expected error to mention llama_cpp.binary, got: %v", err)
+	}
+}
+
+func TestValidate_LlamaCppOK(t *testing.T) {
+	if _, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "llama-server"
+models:
+  m:
+    runtime: llama_cpp
+    path: "/models/m.gguf"
+`)); err != nil {
+		t.Fatalf("expected llama_cpp config with binary to load, got: %v", err)
+	}
+}
+
+func TestValidate_LlamaCppRejectedInSchedulerMode(t *testing.T) {
+	_, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "llama-server"
+scheduler:
+  port_range_start: 9000
+  port_range_end: 9009
+models:
+  m:
+    runtime: llama_cpp
+    path: "/models/m.gguf"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+`))
+	if err == nil {
+		t.Fatalf("expected llama_cpp under scheduler mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "scheduler") {
+		t.Fatalf("expected error to mention scheduler, got: %v", err)
+	}
+}
+
+func TestValidate_LlamaCppSchedulerErrorWinsOverMissingGPUs(t *testing.T) {
+	_, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "llama-server"
+scheduler:
+  port_range_start: 9000
+  port_range_end: 9009
+models:
+  m:
+    runtime: llama_cpp
+    path: "/models/m.gguf"
+`))
+	if err == nil {
+		t.Fatalf("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "scheduler") {
+		t.Fatalf("expected scheduler-mode error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "requires 'gpus'") {
+		t.Fatalf("scheduler missing-gpus error should not surface first, got: %v", err)
+	}
+}
+
+func TestLoad_QwenLlamaCppExampleParses(t *testing.T) {
+	data, err := os.ReadFile("../../configs/qwen36-35b-a3b-llamacpp.yaml")
+	if err != nil {
+		t.Skipf("example config not readable: %v", err)
+	}
+	if _, err := config.Load(data); err != nil {
+		t.Fatalf("expected example to parse, got: %v", err)
 	}
 }

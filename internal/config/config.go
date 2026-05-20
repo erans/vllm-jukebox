@@ -13,6 +13,11 @@ type Duration struct {
 	time.Duration
 }
 
+const (
+	RuntimeVLLM     = "vllm"
+	RuntimeLlamaCpp = "llama_cpp"
+)
+
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
 		d.Duration = 0
@@ -34,6 +39,7 @@ type Config struct {
 	VLLM               VLLMConfig             `yaml:"vllm"`
 	Behavior           BehaviorConfig         `yaml:"behavior"`
 	Scheduler          *SchedulerConfig       `yaml:"scheduler"`
+	LlamaCpp           *LlamaCppConfig        `yaml:"llama_cpp"`
 	Models             map[string]ModelConfig `yaml:"models"`
 	GPUPowerLimits     map[int]int            `yaml:"gpu_power_limits"`
 	DefaultPowerLimit  *int                   `yaml:"default_power_limit"`
@@ -73,6 +79,11 @@ type SchedulerConfig struct {
 	MinInstanceUptime *Duration `yaml:"min_instance_uptime"`
 }
 
+type LlamaCppConfig struct {
+	Binary      string   `yaml:"binary"`
+	DefaultArgs []string `yaml:"default_args"`
+}
+
 type VLLMDefaults struct {
 	GPUMemoryUtilization *float64 `yaml:"gpu_memory_utilization"`
 	DType                string   `yaml:"dtype"`
@@ -86,6 +97,7 @@ type BehaviorConfig struct {
 
 type ModelConfig struct {
 	Path                 string            `yaml:"path"`
+	Runtime              string            `yaml:"runtime"`
 	Alias                string            `yaml:"alias"`
 	GPUs                 []int             `yaml:"gpus"`
 	MinFreeMemMBPerGPU   *int              `yaml:"min_free_mem_mb_per_gpu"`
@@ -189,6 +201,10 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if err := c.validateRuntimes(); err != nil {
+		return err
+	}
+
 	if err := c.validateScheduler(); err != nil {
 		return err
 	}
@@ -229,6 +245,30 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	return nil
+}
+
+func (c *Config) validateRuntimes() error {
+	anyLlama := false
+	for name, model := range c.Models {
+		switch model.Runtime {
+		case "", RuntimeVLLM, RuntimeLlamaCpp:
+			// ok
+		default:
+			return fmt.Errorf("model %q: unknown runtime %q (must be one of: vllm, llama_cpp)", name, model.Runtime)
+		}
+		if model.Runtime == RuntimeLlamaCpp {
+			anyLlama = true
+			if c.Scheduler != nil {
+				return fmt.Errorf("model %q: runtime llama_cpp is not supported in scheduler mode (use swap mode for llama.cpp)", name)
+			}
+		}
+	}
+	if anyLlama {
+		if c.LlamaCpp == nil || c.LlamaCpp.Binary == "" {
+			return fmt.Errorf("at least one model uses runtime: llama_cpp but llama_cpp.binary is not set")
+		}
+	}
 	return nil
 }
 
