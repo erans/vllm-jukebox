@@ -34,6 +34,7 @@ type Manager struct {
 	exitInfo      *processExitInfo
 	stopRequested bool
 	currentModel  string
+	currentRuntime string
 	startedAt     time.Time
 	stderrTail    *tailBuffer
 	stdoutTail    *tailBuffer
@@ -43,6 +44,7 @@ type Manager struct {
 type processExitInfo struct {
 	pid        int
 	model      string
+	runtime    string
 	err        error
 	stdoutTail string
 	stderrTail string
@@ -51,13 +53,18 @@ type processExitInfo struct {
 type ProcessExitedError struct {
 	PID        int
 	Model      string
+	Runtime    string
 	Err        error
 	StdoutTail string
 	StderrTail string
 }
 
 func (e *ProcessExitedError) Error() string {
-	msg := fmt.Sprintf("vLLM process exited (pid=%d model=%q)", e.PID, e.Model)
+	rt := e.Runtime
+	if rt == "" {
+		rt = "runtime"
+	}
+	msg := fmt.Sprintf("%s process exited (pid=%d model=%q)", rt, e.PID, e.Model)
 	if e.Err != nil {
 		msg += ": " + e.Err.Error()
 	}
@@ -102,7 +109,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	m.mu.Lock()
 	if m.cmd != nil {
 		m.mu.Unlock()
-		return 0, fmt.Errorf("vLLM process already running (pid=%d)", m.pid)
+		return 0, fmt.Errorf("runtime process already running (pid=%d)", m.pid)
 	}
 	m.mu.Unlock()
 
@@ -154,6 +161,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 		return 0, err
 	}
 
+	runtimeName := runtimeImpl.Name()
 	waitCh := make(chan error, 1)
 	exitCh := make(chan struct{})
 	m.mu.Lock()
@@ -164,6 +172,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	m.exitInfo = nil
 	m.stopRequested = false
 	m.currentModel = modelName
+	m.currentRuntime = runtimeName
 	m.startedAt = time.Now()
 	m.stderrTail = stderrTail
 	m.stdoutTail = stdoutTail
@@ -171,7 +180,8 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	m.mu.Unlock()
 
 	slog.Info(
-		"vllm_process_started",
+		"runtime_process_started",
+		"runtime", runtimeName,
 		"pid", cmd.Process.Pid,
 		"model", modelName,
 		"command", strings.Join(append([]string{bin}, binArgs...), " "),
@@ -199,6 +209,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 			m.exitInfo = &processExitInfo{
 				pid:        pid,
 				model:      model,
+				runtime:    runtimeName,
 				err:        err,
 				stdoutTail: stdout,
 				stderrTail: stderr,
@@ -213,6 +224,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 			m.exitCh = nil
 			m.stopRequested = false
 			m.currentModel = ""
+			m.currentRuntime = ""
 			m.startedAt = time.Time{}
 			m.stderrTail = nil
 			m.stdoutTail = nil
@@ -223,7 +235,8 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 
 		if err != nil && !stopRequested {
 			slog.Error(
-				"vllm_process_exited",
+				"runtime_process_exited",
+				"runtime", runtimeName,
 				"pid", pid,
 				"model", model,
 				"err", err,
@@ -232,7 +245,8 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 			)
 		} else {
 			slog.Info(
-				"vllm_process_stopped",
+				"runtime_process_stopped",
+				"runtime", runtimeName,
 				"pid", pid,
 				"model", model,
 			)
@@ -274,7 +288,10 @@ func (m *Manager) Stop(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
-	slog.Info("vllm_process_stopping", "pid", pid)
+	m.mu.Lock()
+	stoppingRuntime := m.currentRuntime
+	m.mu.Unlock()
+	slog.Info("runtime_process_stopping", "runtime", stoppingRuntime, "pid", pid)
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 
 	select {
@@ -327,12 +344,13 @@ func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 			return &ProcessExitedError{
 				PID:        exitInfo.pid,
 				Model:      exitInfo.model,
+				Runtime:    exitInfo.runtime,
 				Err:        exitInfo.err,
 				StdoutTail: exitInfo.stdoutTail,
 				StderrTail: exitInfo.stderrTail,
 			}
 		}
-		return fmt.Errorf("vLLM process is not running")
+		return fmt.Errorf("runtime process is not running")
 	}
 
 	if err := WaitForHealthOrExit(ctx, base, exitCh); err != nil {
@@ -344,12 +362,13 @@ func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 				return &ProcessExitedError{
 					PID:        exitInfo.pid,
 					Model:      exitInfo.model,
+					Runtime:    exitInfo.runtime,
 					Err:        exitInfo.err,
 					StdoutTail: exitInfo.stdoutTail,
 					StderrTail: exitInfo.stderrTail,
 				}
 			}
-			return fmt.Errorf("vLLM process exited while waiting for health")
+			return fmt.Errorf("runtime process exited while waiting for health")
 		}
 		return err
 	}

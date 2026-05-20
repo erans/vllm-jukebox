@@ -92,7 +92,7 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 
 		// Treat backoff as a 500 (spec: error state returns 500) but include Retry-After.
 		if rej.Reason == jukebox.RejectBackoff {
-			return writeOpenAIError(c, http.StatusInternalServerError, "vLLM in error state, please retry", "internal_error", "vllm_error")
+			return writeOpenAIError(c, http.StatusInternalServerError, "Backend in error state, please retry", "internal_error", "backend_error")
 		}
 		msg := "Model switch in progress, please retry"
 		switch rej.Reason {
@@ -108,7 +108,7 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 		return writeOpenAIError(c, http.StatusServiceUnavailable, msg, "service_unavailable", "model_switching")
 	}
 
-	return writeOpenAIError(c, http.StatusInternalServerError, "vLLM unavailable", "internal_error", "vllm_unavailable")
+	return writeOpenAIError(c, http.StatusInternalServerError, "Backend unavailable", "internal_error", "backend_unavailable")
 }
 
 func extractModelNameFromError(err error) string {
