@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/claude-code) when working 
 
 ## Project Overview
 
-vLLM Jukebox is an OpenAI-compatible HTTP server written in Go that orchestrates vLLM (Large Language Model inference server) instances. It operates in two modes:
+vLLM Jukebox is an OpenAI-compatible HTTP server written in Go that orchestrates LLM inference backends. The default backend is vLLM; `llama-server` (llama.cpp) is supported in swap mode as an alternative per-model runtime. It operates in two modes:
 
 - **Swap mode**: Single vLLM instance that swaps models on-demand based on incoming requests
 - **Scheduler mode**: Multiple concurrent vLLM instances (one per GPU set) with LRU eviction for non-pinned models
@@ -111,6 +111,49 @@ Two example configs are provided:
 - `configs/scheduler_example.yaml` - Scheduler mode (multi-instance)
 
 Key config sections: `server`, `vllm`, `scheduler` (optional), `behavior`, `models`
+
+## Runtimes
+
+Each model picks an inference runtime via the `runtime` field (default: `vllm`).
+Two runtimes are supported today:
+
+- `vllm` — the default. Uses the `vllm:` block's `binary` and the existing
+  vLLM CLI shape (`serve <path> --host ... --tensor-parallel-size ...`).
+- `llama_cpp` — runs llama.cpp's `llama-server`. Requires the top-level
+  `llama_cpp:` block.
+
+```yaml
+llama_cpp:
+  binary: "llama-server"   # required if any model uses runtime: llama_cpp
+  default_args: []         # optional; prepended to every llama_cpp launch
+
+models:
+  my-gguf:
+    runtime: llama_cpp
+    path: "org/repo-GGUF:Q4_K_M"   # treated as --hf-repo
+    # or: path: "/models/model.gguf" # treated as -m
+    max_model_len: 32768            # mapped to --ctx-size
+    extra_args:
+      - "--n-gpu-layers"
+      - "all"
+      - "--jinja"
+```
+
+Field mapping for `runtime: llama_cpp`:
+
+| YAML field            | llama-server flag                                        |
+|-----------------------|----------------------------------------------------------|
+| `path`                | `--hf-repo <p>` if not a local path, else `-m <p>`       |
+| `max_model_len`       | `--ctx-size <n>`                                         |
+| `extra_args`          | passthrough (after `llama_cpp.default_args`)             |
+| `tensor_parallel_size`, `pipeline_parallel_size`, `gpu_memory_utilization`, `dtype`, `quantization` | ignored (with a startup warning) — translate to the equivalent llama.cpp flags via `extra_args` |
+
+The `--hf-repo` vs `-m` choice mirrors the heuristic in
+`scripts/llama-server-wrapper.sh`: a value is treated as a local file when it
+exists on disk, is an absolute or `./`/`../` path, or ends in `.gguf`.
+
+Scheduler mode does not yet support `runtime: llama_cpp`; the config
+validator rejects that combination.
 
 ## GPU Power Limits
 
