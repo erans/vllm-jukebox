@@ -19,10 +19,55 @@ vLLM Jukebox is an OpenAI-compatible API server that can run in either:
 ## Non-Goals (v1)
 
 - Load balancing across multiple instances for the same model
-- Request queuing during model switches (beyond the triggering request)
+- ~~Request queuing during model switches (beyond the triggering request)~~ — **Crossed for sleep mode**: with `sleep_mode: true`, concurrent requests for a sleeping model share a single wake operation via the wakeOp fan-out and are all served when wake completes (no 503 rejections). Full cross-model queueing is still out of scope.
 - LoRA adapter hot-swapping
 - Load balancing across multiple backends
 - API key validation / per-key model allowlists (use an API gateway)
+
+## Sleep Mode + lifecycle: external (added v0.4)
+
+For models marked `sleep_mode: true` (vLLM 0.22+), jukebox uses vLLM's `/sleep` / `/wake_up` / `/is_sleeping` API in place of full process stop/start when the instance is evicted or auto-suspended.
+
+State machine adds `StateSleeping`:
+
+```
+                    ┌──────────────┐
+                    │     Idle     │
+                    └──────┬───────┘
+                           │ start() / register_external()
+                           ▼
+                    ┌──────────────┐
+        ┌───────────│   Starting   │
+        │           └──────┬───────┘
+        │                  │ health + model verified
+        │                  ▼
+        │           ┌──────────────┐
+        │           │    Ready     │◄────┐
+        │           └──────┬───────┘     │
+        │                  │             │
+        │       evict /    │             │ wake_up
+        │   auto-suspend   │             │
+        │                  ▼             │
+        │           ┌──────────────┐     │
+        │           │  Sleeping    │─────┘
+        │           └──────────────┘
+        │
+        └─────► Error
+```
+
+`lifecycle: external` models bypass `Starting → Ready` startup — they are seeded in `Ready` at boot (best-effort health probe) and can only ever transition to/from `Sleeping` (jukebox is not authorized to start or stop the process).
+
+### Auto-suspend
+
+The Scheduler (and Coordinator) runs a 30s tick goroutine that scans for instances meeting all of: `sleep_mode: true`, `idle_timeout > 0`, not `pinned`, `state == Ready`, `inflight == 0`, and `time.Since(lastUsedAt) >= idle_timeout`. Matches are slept via `sleepInstance`.
+
+### Wake fan-out
+
+`tryRouteFromSleep` tracks an in-flight wake per resolved model name via `wakeOps map[string]*wakeOp`. The first request to find a sleeping instance creates a `wakeOp{done: make(chan struct{})}`, performs the wake (no scheduler semaphore — wake doesn't touch GPU layouts), and closes `done`. Concurrent requests for the same model select on `op.done` (or `time.After(wake_timeout)`), then re-enter the fast path. No request receives 503 during the wake window.
+
+### Settle delay
+
+After `/sleep` returns and `IsSleeping` reports true, jukebox waits `settleAfterSleep` (2s) before considering the instance's GPU memory released. CUDA managed-memory free is async; without this delay a "sleep A → wake B" sequence on the same GPU set can OOM.
 
 ---
 

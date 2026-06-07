@@ -3,6 +3,7 @@ package jukebox
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ type Scheduler struct {
 	mu        sync.RWMutex
 	instances map[string]*schedInstance // keyed by resolved model name
 	waiters   map[string]bool           // at most one waiter per resolved model
+	wakeOps   map[string]*wakeOp        // in-flight wake per resolved model (fan-out)
 
 	total inflight.Tracker
 }
@@ -83,6 +85,7 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		sched:     make(chan struct{}, 1),
 		instances: map[string]*schedInstance{},
 		waiters:   map[string]bool{},
+		wakeOps:   map[string]*wakeOp{},
 	}
 	s.total.OnChange = func(count int64) {
 		metrics.InFlightRequests.Set(float64(count))
@@ -125,16 +128,26 @@ func (s *Scheduler) Status() Status {
 	busy := len(s.sched) == cap(s.sched) // held if channel full
 
 	accepting := false
+	anySleeping := false
 	for _, inst := range s.instances {
 		if inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
 			accepting = true
 			break
+		}
+		if inst.state == StateSleeping {
+			anySleeping = true
 		}
 	}
 
 	state := StateIdle
 	if accepting {
 		state = StateReady
+	} else if anySleeping {
+		// Slept instances can be woken on demand, so jukebox is still
+		// effectively accepting work — just at higher latency for the
+		// first request. Report StateSleeping rather than StateIdle so
+		// /health and metrics make this state visible.
+		state = StateSleeping
 	} else if busy {
 		state = StateStarting
 	}
@@ -178,6 +191,20 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 
 	if route, ok := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); ok {
 		return route, nil
+	}
+
+	// Sleep-mode fast path: if there's already a slept instance for this
+	// model, wake it rather than building a new one. Multiple concurrent
+	// requests share a single wakeOp — none get 503'd during wake.
+	if route, handled, err := s.tryRouteFromSleep(ctx, resolvedName, modelCfg); handled {
+		if err != nil {
+			return Route{}, err
+		}
+		if route.BaseURL != "" {
+			return route, nil
+		}
+		// Wake "handled" the path but instance state shifted (e.g. auto-suspend
+		// re-slept it). Fall through to full scheduling.
 	}
 
 	// Scheduling required.
@@ -534,6 +561,41 @@ func (s *Scheduler) evictConflicts(ctx context.Context, targetGPUs []int) error 
 func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstance, evicted bool) error {
 	if inst == nil {
 		return nil
+	}
+
+	// Sleep-mode branch: if the model opts into sleep, try to sleep
+	// instead of stopping. On success, KEEP the instance in the map
+	// (port, power limits, GPU allocation all retained — wake will
+	// restore the instance without re-scheduling). On failure, fall
+	// through to the hard-stop path.
+	modelCfg, modelOk := s.cfg.Models[inst.model]
+	if modelOk {
+		// External-lifecycle instances are never hard-stopped by jukebox.
+		if modelCfg.EffectiveLifecycle() == config.LifecycleExternal {
+			if modelCfg.SleepMode {
+				reason := "evict"
+				if !evicted {
+					reason = "manual"
+				}
+				return s.sleepInstance(ctx, inst, modelCfg.EffectiveSleepLevel(), reason)
+			}
+			slog.Warn("cannot drain external instance without sleep_mode (no-op)",
+				"model", inst.model,
+				"hint", "set sleep_mode: true to enable jukebox eviction of external instances",
+			)
+			return nil
+		}
+		// Managed-lifecycle with sleep_mode: try sleep first, fall back to stop.
+		if modelCfg.SleepMode {
+			reason := "evict"
+			if !evicted {
+				reason = "manual"
+			}
+			if err := s.sleepInstance(ctx, inst, modelCfg.EffectiveSleepLevel(), reason); err == nil {
+				return nil
+			}
+			slog.Warn("sleep failed; falling back to hard stop", "model", inst.model)
+		}
 	}
 
 	s.mu.Lock()

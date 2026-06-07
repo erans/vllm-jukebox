@@ -16,6 +16,12 @@ func healthHandler(coord StatusProvider) fiber.Handler {
 		}
 
 		accepting := st.State == jukebox.StateReady
+		// Sleeping instances can be woken on demand, so jukebox accepts
+		// requests for them (with higher first-request latency). Surface
+		// "accepting" so upstream LBs don't drain traffic.
+		if st.State == jukebox.StateSleeping {
+			accepting = true
+		}
 
 		code := http.StatusOK
 		switch st.State {

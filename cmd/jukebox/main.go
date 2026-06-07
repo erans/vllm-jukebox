@@ -110,6 +110,7 @@ func main() {
 		mgr := vllm.NewManager(cfg)
 		coord := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, time.Now, powerMgr)
 		go coord.Run(ctx)
+		go coord.IdleMonitor(ctx)
 		router = jukebox.NewLegacyRouter(cfg, coord, &tr)
 
 		stopOnce := sync.Once{}
@@ -150,8 +151,21 @@ func main() {
 		sched := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, nil, powerMgr)
 		router = sched
 
-		// Fail fast if configured GPU IDs do not exist.
-		{
+		// Fail fast if configured GPU IDs do not exist. SKIPPED entirely
+		// when every non-alias model is lifecycle: external — those don't
+		// allocate local GPUs and nvidia-smi may not even be installed in
+		// the jukebox container.
+		anyManaged := false
+		for _, model := range cfg.Models {
+			if model.Alias != "" {
+				continue
+			}
+			if model.EffectiveLifecycle() != config.LifecycleExternal {
+				anyManaged = true
+				break
+			}
+		}
+		if anyManaged {
 			checkTimeout := 5 * time.Second
 			checkCtx, checkCancel := context.WithTimeout(context.Background(), checkTimeout)
 			defer checkCancel()
@@ -169,6 +183,13 @@ func main() {
 				if model.Alias != "" {
 					continue
 				}
+				// External-lifecycle instances may declare GPUs that live on
+				// a different host (jukebox doesn't own the process). Skip
+				// the local nvidia-smi check for them — the gpus field on an
+				// external model is informational.
+				if model.EffectiveLifecycle() == config.LifecycleExternal {
+					continue
+				}
 				for _, id := range model.GPUs {
 					if !exists[id] {
 						slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
@@ -176,7 +197,17 @@ func main() {
 					}
 				}
 			}
+		} else {
+			slog.Info("all scheduler models are lifecycle: external — skipping local nvidia-smi GPU check")
 		}
+
+		// Bootstrap lifecycle: external instances + start the auto-suspend
+		// idle monitor.
+		if err := sched.RegisterExternalInstances(ctx); err != nil {
+			slog.Error("failed to register external instances", "err", err)
+			os.Exit(1)
+		}
+		go sched.IdleMonitor(ctx)
 
 		stopOnce := sync.Once{}
 		stop = func() {

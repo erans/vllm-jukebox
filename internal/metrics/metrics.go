@@ -123,6 +123,53 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// Counter: sleep operations
+	SleepsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_sleeps_total",
+			Help: "Total vLLM sleep operations.",
+		},
+		[]string{"model", "reason"},
+	)
+
+	// Counter: wake operations
+	WakesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_wakes_total",
+			Help: "Total vLLM wake operations.",
+		},
+		[]string{"model", "trigger"},
+	)
+
+	// Histogram: sleep duration
+	SleepDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jukebox_sleep_duration_seconds",
+			Help:    "Duration of sleep operations (drain + sleep HTTP call + GPU memory settle).",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"model"},
+	)
+
+	// Histogram: wake duration
+	WakeDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jukebox_wake_duration_seconds",
+			Help:    "Duration of wake operations (wake HTTP call + /health poll).",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"model"},
+	)
+
+	// Counter: sleep/wake failures
+	SleepFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_sleep_failures_total",
+			Help: "Total failures during sleep/wake operations.",
+		},
+		[]string{"model", "kind"},
+	)
 )
 
 func init() {
@@ -140,6 +187,11 @@ func init() {
 		InstanceInFlightRequests,
 		EvictionsTotal,
 		ScheduleRejectionsTotal,
+		SleepsTotal,
+		WakesTotal,
+		SleepDurationSeconds,
+		WakeDurationSeconds,
+		SleepFailuresTotal,
 	)
 }
 
@@ -152,7 +204,7 @@ func ObserveRequest(statusCode int, model string, dur time.Duration) {
 }
 
 func SetState(state string) {
-	for _, s := range []string{"idle", "starting", "ready", "stopping", "error"} {
+	for _, s := range []string{"idle", "starting", "ready", "stopping", "sleeping", "error"} {
 		v := 0.0
 		if s == state {
 			v = 1.0
