@@ -18,6 +18,11 @@ const (
 	RuntimeLlamaCpp = "llama_cpp"
 )
 
+const (
+	RunnerGenerate = "generate"
+	RunnerPooling  = "pooling"
+)
+
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
 		d.Duration = 0
@@ -98,6 +103,7 @@ type BehaviorConfig struct {
 type ModelConfig struct {
 	Path                 string            `yaml:"path"`
 	Runtime              string            `yaml:"runtime"`
+	Runner               string            `yaml:"runner"`
 	Alias                string            `yaml:"alias"`
 	GPUs                 []int             `yaml:"gpus"`
 	MinFreeMemMBPerGPU   *int              `yaml:"min_free_mem_mb_per_gpu"`
@@ -256,6 +262,15 @@ func (c *Config) validateRuntimes() error {
 			// ok
 		default:
 			return fmt.Errorf("model %q: unknown runtime %q (must be one of: vllm, llama_cpp)", name, model.Runtime)
+		}
+		switch model.Runner {
+		case "", RunnerGenerate, RunnerPooling:
+			// ok
+		default:
+			return fmt.Errorf("model %q: unknown runner %q (must be one of: generate, pooling)", name, model.Runner)
+		}
+		if model.Runner == RunnerPooling && model.Runtime == RuntimeLlamaCpp {
+			return fmt.Errorf("model %q: runner: pooling is not supported with runtime: llama_cpp (vLLM-only)", name)
 		}
 		if model.Runtime == RuntimeLlamaCpp {
 			anyLlama = true
