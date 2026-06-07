@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"time"
 
@@ -77,6 +78,7 @@ type SchedulerConfig struct {
 	PortRangeEnd      int       `yaml:"port_range_end"`
 	MaxInstances      *int      `yaml:"max_instances"`
 	MinInstanceUptime *Duration `yaml:"min_instance_uptime"`
+	NVLinkPairs       [][]int   `yaml:"nvlink_pairs"`
 }
 
 type LlamaCppConfig struct {
@@ -297,6 +299,10 @@ func (c *Config) validateScheduler() error {
 		}
 	}
 
+	if err := c.validateNVLinkPairs(); err != nil {
+		return err
+	}
+
 	if _, ok := c.VLLM.DefaultEnv["CUDA_VISIBLE_DEVICES"]; ok {
 		return fmt.Errorf("vllm.default_env must not set CUDA_VISIBLE_DEVICES when scheduler is enabled")
 	}
@@ -330,9 +336,111 @@ func (c *Config) validateScheduler() error {
 		if model.MinFreeMemMBPerGPU == nil || *model.MinFreeMemMBPerGPU <= 0 {
 			return fmt.Errorf("model %q requires 'min_free_mem_mb_per_gpu' > 0 when scheduler is enabled", name)
 		}
+
+		warnNVLinkTopology(name, model.GPUs, c.Scheduler.NVLinkPairs)
 	}
 
 	return nil
+}
+
+// validateNVLinkPairs ensures the optional scheduler.nvlink_pairs config has a
+// sane shape: each pair is exactly two distinct non-negative GPU IDs, and no
+// GPU appears in more than one pair. When unset, validation is a no-op.
+func (c *Config) validateNVLinkPairs() error {
+	if c.Scheduler == nil || len(c.Scheduler.NVLinkPairs) == 0 {
+		return nil
+	}
+	seen := map[int]int{} // gpu → pair index
+	for i, pair := range c.Scheduler.NVLinkPairs {
+		if len(pair) != 2 {
+			return fmt.Errorf("scheduler.nvlink_pairs[%d]: each pair must have exactly 2 GPUs, got %d", i, len(pair))
+		}
+		if pair[0] == pair[1] {
+			return fmt.Errorf("scheduler.nvlink_pairs[%d]: pair must contain two distinct GPUs, got [%d,%d]", i, pair[0], pair[1])
+		}
+		for _, g := range pair {
+			if g < 0 {
+				return fmt.Errorf("scheduler.nvlink_pairs[%d]: gpu ids must be >= 0, got %d", i, g)
+			}
+			if prev, dup := seen[g]; dup {
+				return fmt.Errorf("scheduler.nvlink_pairs: gpu %d appears in pair %d and pair %d (each GPU may appear in at most one pair)", g, prev, i)
+			}
+			seen[g] = i
+		}
+	}
+	return nil
+}
+
+// warnNVLinkTopology emits a slog.Warn when a model's GPU layout looks
+// inefficient against the configured NVLink pairs. It never returns an error
+// — topology is operator advice, not a hard constraint.
+//
+// Heuristic:
+//   - 2-GPU models: warn if the pair isn't one of the configured nvlink_pairs
+//   - 4-GPU models: warn if the four GPUs aren't the union of exactly two
+//     configured pairs
+//   - Other model sizes (1, 3, 5+): no warning (NVLink topology doesn't apply
+//     to single-GPU models, and uncommon sizes have no canonical layout)
+func warnNVLinkTopology(modelName string, gpus []int, pairs [][]int) {
+	if len(pairs) == 0 {
+		return
+	}
+	switch len(gpus) {
+	case 2:
+		if !pairMatches(gpus, pairs) {
+			slog.Warn("model gpus do not match a configured NVLink pair — collective ops may cross slower interconnect",
+				"model", modelName,
+				"gpus", gpus,
+				"nvlink_pairs", pairs,
+			)
+		}
+	case 4:
+		if !fourGPUsMatchTwoPairs(gpus, pairs) {
+			slog.Warn("model gpus do not cleanly span two configured NVLink pairs — collective ops may cross slower interconnect",
+				"model", modelName,
+				"gpus", gpus,
+				"nvlink_pairs", pairs,
+				"hint", "for TP=2 PP=2 prefer arranging gpus as the union of two NVLink-bonded pairs",
+			)
+		}
+	}
+}
+
+// pairMatches returns true when {gpus[0], gpus[1]} equals one of the configured
+// pairs (order-independent within the pair).
+func pairMatches(gpus []int, pairs [][]int) bool {
+	if len(gpus) != 2 {
+		return false
+	}
+	for _, p := range pairs {
+		if (p[0] == gpus[0] && p[1] == gpus[1]) || (p[0] == gpus[1] && p[1] == gpus[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+// fourGPUsMatchTwoPairs returns true when the 4 GPUs are exactly the union of
+// two distinct configured pairs (order-independent).
+func fourGPUsMatchTwoPairs(gpus []int, pairs [][]int) bool {
+	if len(gpus) != 4 {
+		return false
+	}
+	gpuSet := map[int]bool{}
+	for _, g := range gpus {
+		gpuSet[g] = true
+	}
+	if len(gpuSet) != 4 {
+		return false
+	}
+	// Find pairs whose BOTH members are in the model's gpu set.
+	matched := 0
+	for _, p := range pairs {
+		if gpuSet[p[0]] && gpuSet[p[1]] {
+			matched++
+		}
+	}
+	return matched == 2
 }
 
 func (c *Config) validateAliases() error {
