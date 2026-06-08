@@ -21,6 +21,7 @@ const (
 	StateStarting State = "starting"
 	StateReady    State = "ready"
 	StateStopping State = "stopping"
+	StateSleeping State = "sleeping"
 	StateError    State = "error"
 )
 
@@ -288,6 +289,21 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 			req.resp <- ensureReply{}
 			return
 		}
+	}
+
+	// Sleep-mode wake path: if we're currently sleeping the requested
+	// model, wake it (re-uses CPU-RAM weights, no full restart).
+	if state == StateSleeping && current == resolvedName {
+		c.mu.Lock()
+		c.swapInProgress = true
+		c.state = StateStarting
+		c.mu.Unlock()
+		metrics.SetState(string(StateStarting))
+
+		done := make(chan error, 1)
+		go c.performWake(context.Background(), req.requestID, done)
+		req.resp <- ensureReply{wait: done}
+		return
 	}
 
 	isCrashed := state == StateReady && current == resolvedName && c.mgr != nil && c.mgr.CurrentPID() == 0

@@ -110,6 +110,7 @@ func main() {
 		mgr := vllm.NewManager(cfg)
 		coord := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, time.Now, powerMgr)
 		go coord.Run(ctx)
+		go coord.IdleMonitor(ctx)
 		router = jukebox.NewLegacyRouter(cfg, coord, &tr)
 
 		stopOnce := sync.Once{}
@@ -150,8 +151,21 @@ func main() {
 		sched := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, nil, powerMgr)
 		router = sched
 
-		// Fail fast if configured GPU IDs do not exist.
-		{
+		// Fail fast if configured GPU IDs do not exist. SKIPPED entirely
+		// when every non-alias model is lifecycle: external — those don't
+		// allocate local GPUs and nvidia-smi may not even be installed in
+		// the jukebox container.
+		anyManaged := false
+		for _, model := range cfg.Models {
+			if model.Alias != "" {
+				continue
+			}
+			if model.EffectiveLifecycle() != config.LifecycleExternal {
+				anyManaged = true
+				break
+			}
+		}
+		if anyManaged {
 			checkTimeout := 5 * time.Second
 			checkCtx, checkCancel := context.WithTimeout(context.Background(), checkTimeout)
 			defer checkCancel()
@@ -169,6 +183,13 @@ func main() {
 				if model.Alias != "" {
 					continue
 				}
+				// External-lifecycle instances may declare GPUs that live on
+				// a different host (jukebox doesn't own the process). Skip
+				// the local nvidia-smi check for them — the gpus field on an
+				// external model is informational.
+				if model.EffectiveLifecycle() == config.LifecycleExternal {
+					continue
+				}
 				for _, id := range model.GPUs {
 					if !exists[id] {
 						slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
@@ -176,7 +197,48 @@ func main() {
 					}
 				}
 			}
+		} else {
+			slog.Info("all scheduler models are lifecycle: external — skipping local nvidia-smi GPU check")
 		}
+
+		// Build admission controller if any model has it enabled. Requires
+		// a live nvidia-smi to read per-GPU TotalMB. If the probe fails
+		// (e.g. jukebox container has no nvidia-smi, host driver
+		// unreachable), log a loud warning and DEGRADE — the scheduler
+		// runs without admission. Operators who want admission MUST make
+		// nvidia-smi available to the jukebox container.
+		if cfg.AdmissionEnabled() {
+			probeTimeout := 5 * time.Second
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
+			gpus, err := inv.List(probeCtx)
+			probeCancel()
+			if err != nil {
+				slog.Warn("admission_control_disabled_no_nvidia_smi",
+					"err", err,
+					"hint", "expected_vram_mb_per_gpu was set on at least one model but nvidia-smi probe failed — admission control will NOT be active",
+				)
+			} else {
+				totalsByGPU := map[int]int{}
+				for _, g := range gpus {
+					totalsByGPU[g.Index] = g.TotalMB
+				}
+				evictor := &jukebox.SchedulerEvictor{S: sched}
+				adm := jukebox.NewAdmissionController(cfg, totalsByGPU, evictor)
+				sched.SetAdmission(adm)
+				slog.Info("admission_control_attached",
+					"tracked_models", adm.TrackedModels(),
+					"gpus", len(totalsByGPU),
+				)
+			}
+		}
+
+		// Bootstrap lifecycle: external instances + start the auto-suspend
+		// idle monitor.
+		if err := sched.RegisterExternalInstances(ctx); err != nil {
+			slog.Error("failed to register external instances", "err", err)
+			os.Exit(1)
+		}
+		go sched.IdleMonitor(ctx)
 
 		stopOnce := sync.Once{}
 		stop = func() {

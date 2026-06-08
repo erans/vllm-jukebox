@@ -796,3 +796,71 @@ func TestLoad_QwenLlamaCppExampleParses(t *testing.T) {
 		t.Fatalf("expected example to parse, got: %v", err)
 	}
 }
+
+func TestValidate_RunnerPoolingParses(t *testing.T) {
+	cfg, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  bge:
+    path: "BAAI/bge-m3"
+    runner: pooling
+`)
+	if err != nil {
+		t.Fatalf("expected runner: pooling to parse, got: %v", err)
+	}
+	if cfg.Models["bge"].Runner != "pooling" {
+		t.Fatalf("expected runner=pooling, got %q", cfg.Models["bge"].Runner)
+	}
+}
+
+func TestValidate_RunnerGenerateParses(t *testing.T) {
+	if _, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    runner: generate
+`); err != nil {
+		t.Fatalf("expected runner: generate to parse, got: %v", err)
+	}
+}
+
+func TestValidate_RunnerUnknownRejected(t *testing.T) {
+	_, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    runner: classify
+`)
+	if err == nil {
+		t.Fatalf("expected unknown runner to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runner") {
+		t.Fatalf("expected error to mention runner, got: %v", err)
+	}
+}
+
+func TestValidate_RunnerPoolingWithLlamaCppRejected(t *testing.T) {
+	_, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "llama-server"
+models:
+  m:
+    runtime: llama_cpp
+    runner: pooling
+    path: "/models/m.gguf"
+`)
+	if err == nil {
+		t.Fatalf("expected runner: pooling + runtime: llama_cpp to be rejected")
+	}
+	if !strings.Contains(err.Error(), "pooling") || !strings.Contains(err.Error(), "llama_cpp") {
+		t.Fatalf("expected error to mention pooling + llama_cpp, got: %v", err)
+	}
+}
