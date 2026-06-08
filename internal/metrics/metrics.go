@@ -123,6 +123,99 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// Counter: sleep operations
+	SleepsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_sleeps_total",
+			Help: "Total vLLM sleep operations.",
+		},
+		[]string{"model", "reason"},
+	)
+
+	// Counter: wake operations
+	WakesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_wakes_total",
+			Help: "Total vLLM wake operations.",
+		},
+		[]string{"model", "trigger"},
+	)
+
+	// Histogram: sleep duration
+	SleepDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jukebox_sleep_duration_seconds",
+			Help:    "Duration of sleep operations (drain + sleep HTTP call + GPU memory settle).",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"model"},
+	)
+
+	// Histogram: wake duration
+	WakeDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jukebox_wake_duration_seconds",
+			Help:    "Duration of wake operations (wake HTTP call + /health poll).",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"model"},
+	)
+
+	// Counter: sleep/wake failures
+	SleepFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_sleep_failures_total",
+			Help: "Total failures during sleep/wake operations.",
+		},
+		[]string{"model", "kind"},
+	)
+
+	// Counter: admission-initiated evictions (scheduler mode + sleep mode)
+	AdmissionEvictsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_admission_evicts_total",
+			Help: "Total peers slept by the admission controller to make room for an incoming wake.",
+		},
+		[]string{"model", "victim"},
+	)
+
+	// Counter: admission rejections (no feasible eviction set, evict failed, etc)
+	AdmissionRejectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_admission_rejections_total",
+			Help: "Total admission rejections by reason.",
+		},
+		[]string{"model", "reason"},
+	)
+
+	// Histogram: admission wait time (decision + eviction wall-clock)
+	AdmissionWaitSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jukebox_admission_wait_seconds",
+			Help:    "Time the admission controller spent admitting a wake (includes eviction wall-clock).",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"model"},
+	)
+
+	// Gauge: per-GPU awake VRAM (pinned + awake non-pinned, MB)
+	GPUBudgetAwakeMB = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_gpu_budget_awake_mb",
+			Help: "Per-GPU declared awake VRAM (pinned + awake non-pinned), in MB. From admission controller bookkeeping, NOT live nvidia-smi.",
+		},
+		[]string{"gpu"},
+	)
+
+	// Gauge: per-GPU available VRAM (total - pinned - awake - L1 residual, MB)
+	GPUBudgetAvailableMB = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_gpu_budget_available_mb",
+			Help: "Per-GPU available VRAM (total - pinned - awake - L1 residual), in MB. From admission controller bookkeeping.",
+		},
+		[]string{"gpu"},
+	)
 )
 
 func init() {
@@ -140,6 +233,16 @@ func init() {
 		InstanceInFlightRequests,
 		EvictionsTotal,
 		ScheduleRejectionsTotal,
+		SleepsTotal,
+		WakesTotal,
+		SleepDurationSeconds,
+		WakeDurationSeconds,
+		SleepFailuresTotal,
+		AdmissionEvictsTotal,
+		AdmissionRejectionsTotal,
+		AdmissionWaitSeconds,
+		GPUBudgetAwakeMB,
+		GPUBudgetAvailableMB,
 	)
 }
 
@@ -152,7 +255,7 @@ func ObserveRequest(statusCode int, model string, dur time.Duration) {
 }
 
 func SetState(state string) {
-	for _, s := range []string{"idle", "starting", "ready", "stopping", "error"} {
+	for _, s := range []string{"idle", "starting", "ready", "stopping", "sleeping", "error"} {
 		v := 0.0
 		if s == state {
 			v = 1.0

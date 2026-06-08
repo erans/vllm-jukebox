@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"time"
 
@@ -16,6 +17,43 @@ type Duration struct {
 const (
 	RuntimeVLLM     = "vllm"
 	RuntimeLlamaCpp = "llama_cpp"
+)
+
+const (
+	RunnerGenerate = "generate"
+	RunnerPooling  = "pooling"
+)
+
+const (
+	// LifecycleManaged: jukebox owns the vLLM process (default). Existing
+	// behavior — jukebox spawns, monitors, and stops the vllm subprocess.
+	LifecycleManaged = "managed"
+	// LifecycleExternal: an external service (e.g. a separate compose
+	// container) owns the vLLM process. Jukebox only proxies requests and,
+	// when sleep_mode is enabled, sends sleep/wake HTTP calls. The external
+	// service must be started with `--enable-sleep-mode` and
+	// `VLLM_SERVER_DEV_MODE=1` for sleep-mode to function.
+	LifecycleExternal = "external"
+)
+
+const (
+	// DefaultSleepLevel is the L1 sleep level (weights→CPU RAM, KV cache
+	// discarded, GPU memory released via CUDA managed memory).
+	DefaultSleepLevel = 1
+	// DefaultWakeTimeout is the max time to wait for /health to return 200
+	// after POSTing /wake_up.
+	DefaultWakeTimeout = 120 * time.Second
+)
+
+// Priority controls how the admission controller picks eviction victims.
+// "best-effort" is evicted first regardless of recency; "normal" is evicted
+// by LRU among non-critical peers; "critical" is never evicted. Pinned
+// models are always treated as critical regardless of this field.
+const (
+	PriorityCritical   = "critical"
+	PriorityNormal     = "normal"
+	PriorityBestEffort = "best-effort"
+	DefaultPriority    = PriorityNormal
 )
 
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
@@ -77,6 +115,7 @@ type SchedulerConfig struct {
 	PortRangeEnd      int       `yaml:"port_range_end"`
 	MaxInstances      *int      `yaml:"max_instances"`
 	MinInstanceUptime *Duration `yaml:"min_instance_uptime"`
+	NVLinkPairs       [][]int   `yaml:"nvlink_pairs"`
 }
 
 type LlamaCppConfig struct {
@@ -98,6 +137,7 @@ type BehaviorConfig struct {
 type ModelConfig struct {
 	Path                 string            `yaml:"path"`
 	Runtime              string            `yaml:"runtime"`
+	Runner               string            `yaml:"runner"`
 	Alias                string            `yaml:"alias"`
 	GPUs                 []int             `yaml:"gpus"`
 	MinFreeMemMBPerGPU   *int              `yaml:"min_free_mem_mb_per_gpu"`
@@ -113,6 +153,54 @@ type ModelConfig struct {
 	PowerLimit           *int              `yaml:"power_limit"`
 	PowerLimits          map[int]int       `yaml:"power_limits"`
 	LogFile              string            `yaml:"log_file"`
+
+	// --- sleep mode / lifecycle / runner ---
+
+	// SleepMode enables vLLM's sleep/wake API in place of full process
+	// stop/start when this model is evicted or auto-suspended. Requires
+	// runtime: vllm. Default false (zero behavior change).
+	SleepMode bool `yaml:"sleep_mode"`
+	// SleepLevel selects the vLLM sleep depth. 1 = L1 (weights→CPU RAM,
+	// fastest wake). 2 = L2 (discard weights, requires disk reload on wake).
+	// 0 = use DefaultSleepLevel. Only meaningful when SleepMode is true.
+	SleepLevel int `yaml:"sleep_level"`
+	// WakeTimeout caps how long jukebox waits for /health to return 200
+	// after POSTing /wake_up. 0 = use DefaultWakeTimeout.
+	WakeTimeout Duration `yaml:"wake_timeout"`
+	// IdleTimeout: if > 0 and SleepMode is true and the model is not pinned,
+	// jukebox auto-sleeps the instance after this much idle time. 0 = never
+	// auto-suspend.
+	IdleTimeout Duration `yaml:"idle_timeout"`
+	// Lifecycle selects who owns the vLLM process. "managed" (default) =
+	// jukebox spawns it. "external" = jukebox only proxies + sleeps/wakes
+	// an already-running vLLM at Host:Port.
+	Lifecycle string `yaml:"lifecycle"`
+	// Host is the hostname/IP of the external vLLM service. Required when
+	// Lifecycle == "external"; defaults to "127.0.0.1" if unset.
+	Host string `yaml:"host"`
+	// Port is the listen port of the external vLLM service. Required when
+	// Lifecycle == "external".
+	Port int `yaml:"port"`
+
+	// --- admission control ---
+
+	// ExpectedVRAMMBPerGPU is the model's awake VRAM footprint, per GPU it
+	// occupies. When > 0, the admission controller uses this to track per-GPU
+	// budgets and may evict lower-priority peers to make room for a wake.
+	// Default 0 = no admission control for this model (legacy behavior:
+	// jukebox calls /wake_up directly and any OOM surfaces as 503).
+	ExpectedVRAMMBPerGPU int `yaml:"expected_vram_mb_per_gpu"`
+	// SleepL1ResidualMB is the VRAM that vLLM's cumem allocator keeps
+	// reserved after an L1 sleep (weights freed, but the pool is not
+	// returned to the driver until full process exit). Measured empirically
+	// via `nvidia-smi` before and after a sleep cycle. Used by admission to
+	// understand how much VRAM a "sleeping" model still costs on each GPU.
+	// Default 0 = assume sleep frees the full expected footprint.
+	SleepL1ResidualMB int `yaml:"sleep_l1_residual_mb"`
+	// Priority controls eviction order — one of "critical", "normal",
+	// "best-effort". Empty defaults to "normal". Pinned models are always
+	// treated as critical regardless of this field.
+	Priority string `yaml:"priority"`
 }
 
 func Load(data []byte) (*Config, error) {
@@ -188,6 +276,18 @@ func (c *Config) applyDefaults() {
 			c.Scheduler.MinInstanceUptime = &Duration{Duration: 30 * time.Second}
 		}
 	}
+
+	// Per-model defaults (sleep mode / lifecycle).
+	for name, model := range c.Models {
+		mutated := false
+		if model.Lifecycle == LifecycleExternal && model.Host == "" {
+			model.Host = "127.0.0.1"
+			mutated = true
+		}
+		if mutated {
+			c.Models[name] = model
+		}
+	}
 }
 
 func (c *Config) Validate() error {
@@ -226,7 +326,7 @@ func (c *Config) Validate() error {
 	}
 
 	for name, model := range c.Models {
-		if model.Alias == "" && model.Path == "" {
+		if model.Alias == "" && model.Path == "" && model.Lifecycle != LifecycleExternal {
 			return fmt.Errorf("model %q requires 'path' field", name)
 		}
 		if model.GPUMemoryUtilization != nil {
@@ -245,6 +345,59 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	if err := c.validateAdmission(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateAdmission checks the per-model admission control fields. Any
+// model with admission enabled (ExpectedVRAMMBPerGPU > 0) must:
+//   - run in scheduler mode (the legacy coordinator owns at most one
+//     instance, so admission has nothing to coordinate)
+//   - declare at least one GPU (admission tracks per-GPU budget) UNLESS
+//     it's an alias (aliases inherit their target's admission state)
+//   - have a Priority value within the allowed set (or empty for default)
+//   - have a non-negative SleepL1ResidualMB that doesn't exceed the
+//     awake footprint (a sleeping model can't reserve more than it took
+//     while awake)
+func (c *Config) validateAdmission() error {
+	for name, model := range c.Models {
+		switch model.Priority {
+		case "", PriorityCritical, PriorityNormal, PriorityBestEffort:
+			// ok
+		default:
+			return fmt.Errorf("model %q: unknown priority %q (must be one of: critical, normal, best-effort)", name, model.Priority)
+		}
+
+		if !model.AdmissionEnabled() {
+			continue
+		}
+
+		if model.ExpectedVRAMMBPerGPU < 0 {
+			return fmt.Errorf("model %q: expected_vram_mb_per_gpu must be >= 0", name)
+		}
+		if model.SleepL1ResidualMB < 0 {
+			return fmt.Errorf("model %q: sleep_l1_residual_mb must be >= 0", name)
+		}
+		if model.SleepL1ResidualMB > model.ExpectedVRAMMBPerGPU {
+			return fmt.Errorf("model %q: sleep_l1_residual_mb (%d) must not exceed expected_vram_mb_per_gpu (%d) — a sleeping model cannot hold more VRAM than it took while awake",
+				name, model.SleepL1ResidualMB, model.ExpectedVRAMMBPerGPU)
+		}
+		if model.Alias != "" {
+			// Aliases must NOT declare their own admission footprint —
+			// they share the target's state, and double-counting would
+			// break budget accounting.
+			return fmt.Errorf("model %q: aliases must not set expected_vram_mb_per_gpu (admission state is owned by the alias target)", name)
+		}
+		if c.Scheduler == nil {
+			return fmt.Errorf("model %q: expected_vram_mb_per_gpu requires scheduler mode (admission control is scheduler-only)", name)
+		}
+		if len(model.GPUs) == 0 {
+			return fmt.Errorf("model %q: expected_vram_mb_per_gpu requires 'gpus' to be set", name)
+		}
+	}
 	return nil
 }
 
@@ -257,6 +410,48 @@ func (c *Config) validateRuntimes() error {
 		default:
 			return fmt.Errorf("model %q: unknown runtime %q (must be one of: vllm, llama_cpp)", name, model.Runtime)
 		}
+		switch model.Runner {
+		case "", RunnerGenerate, RunnerPooling:
+			// ok
+		default:
+			return fmt.Errorf("model %q: unknown runner %q (must be one of: generate, pooling)", name, model.Runner)
+		}
+		if model.Runner == RunnerPooling && model.Runtime == RuntimeLlamaCpp {
+			return fmt.Errorf("model %q: runner: pooling is not supported with runtime: llama_cpp (vLLM-only)", name)
+		}
+
+		// Lifecycle: validate enum
+		switch model.Lifecycle {
+		case "", LifecycleManaged, LifecycleExternal:
+			// ok
+		default:
+			return fmt.Errorf("model %q: unknown lifecycle %q (must be one of: managed, external)", name, model.Lifecycle)
+		}
+
+		// SleepMode incompatibility
+		if model.SleepMode && model.Runtime == RuntimeLlamaCpp {
+			return fmt.Errorf("model %q: sleep_mode is not supported with runtime: llama_cpp (vLLM-only)", name)
+		}
+		if model.SleepLevel != 0 && model.SleepLevel != 1 && model.SleepLevel != 2 {
+			return fmt.Errorf("model %q: sleep_level must be 0 (default), 1, or 2; got %d", name, model.SleepLevel)
+		}
+
+		// LifecycleExternal constraints
+		if model.Lifecycle == LifecycleExternal {
+			if model.Alias != "" {
+				return fmt.Errorf("model %q: lifecycle: external is incompatible with alias", name)
+			}
+			if model.Runtime == RuntimeLlamaCpp {
+				return fmt.Errorf("model %q: lifecycle: external is not supported with runtime: llama_cpp (vLLM-only)", name)
+			}
+			if model.Port == 0 {
+				return fmt.Errorf("model %q: lifecycle: external requires 'port' to be set", name)
+			}
+			if c.Scheduler == nil {
+				return fmt.Errorf("model %q: lifecycle: external requires scheduler mode (the legacy single-instance coordinator cannot manage external instances)", name)
+			}
+		}
+
 		if model.Runtime == RuntimeLlamaCpp {
 			anyLlama = true
 			if c.Scheduler != nil {
@@ -297,6 +492,10 @@ func (c *Config) validateScheduler() error {
 		}
 	}
 
+	if err := c.validateNVLinkPairs(); err != nil {
+		return err
+	}
+
 	if _, ok := c.VLLM.DefaultEnv["CUDA_VISIBLE_DEVICES"]; ok {
 		return fmt.Errorf("vllm.default_env must not set CUDA_VISIBLE_DEVICES when scheduler is enabled")
 	}
@@ -330,9 +529,111 @@ func (c *Config) validateScheduler() error {
 		if model.MinFreeMemMBPerGPU == nil || *model.MinFreeMemMBPerGPU <= 0 {
 			return fmt.Errorf("model %q requires 'min_free_mem_mb_per_gpu' > 0 when scheduler is enabled", name)
 		}
+
+		warnNVLinkTopology(name, model.GPUs, c.Scheduler.NVLinkPairs)
 	}
 
 	return nil
+}
+
+// validateNVLinkPairs ensures the optional scheduler.nvlink_pairs config has a
+// sane shape: each pair is exactly two distinct non-negative GPU IDs, and no
+// GPU appears in more than one pair. When unset, validation is a no-op.
+func (c *Config) validateNVLinkPairs() error {
+	if c.Scheduler == nil || len(c.Scheduler.NVLinkPairs) == 0 {
+		return nil
+	}
+	seen := map[int]int{} // gpu → pair index
+	for i, pair := range c.Scheduler.NVLinkPairs {
+		if len(pair) != 2 {
+			return fmt.Errorf("scheduler.nvlink_pairs[%d]: each pair must have exactly 2 GPUs, got %d", i, len(pair))
+		}
+		if pair[0] == pair[1] {
+			return fmt.Errorf("scheduler.nvlink_pairs[%d]: pair must contain two distinct GPUs, got [%d,%d]", i, pair[0], pair[1])
+		}
+		for _, g := range pair {
+			if g < 0 {
+				return fmt.Errorf("scheduler.nvlink_pairs[%d]: gpu ids must be >= 0, got %d", i, g)
+			}
+			if prev, dup := seen[g]; dup {
+				return fmt.Errorf("scheduler.nvlink_pairs: gpu %d appears in pair %d and pair %d (each GPU may appear in at most one pair)", g, prev, i)
+			}
+			seen[g] = i
+		}
+	}
+	return nil
+}
+
+// warnNVLinkTopology emits a slog.Warn when a model's GPU layout looks
+// inefficient against the configured NVLink pairs. It never returns an error
+// — topology is operator advice, not a hard constraint.
+//
+// Heuristic:
+//   - 2-GPU models: warn if the pair isn't one of the configured nvlink_pairs
+//   - 4-GPU models: warn if the four GPUs aren't the union of exactly two
+//     configured pairs
+//   - Other model sizes (1, 3, 5+): no warning (NVLink topology doesn't apply
+//     to single-GPU models, and uncommon sizes have no canonical layout)
+func warnNVLinkTopology(modelName string, gpus []int, pairs [][]int) {
+	if len(pairs) == 0 {
+		return
+	}
+	switch len(gpus) {
+	case 2:
+		if !pairMatches(gpus, pairs) {
+			slog.Warn("model gpus do not match a configured NVLink pair — collective ops may cross slower interconnect",
+				"model", modelName,
+				"gpus", gpus,
+				"nvlink_pairs", pairs,
+			)
+		}
+	case 4:
+		if !fourGPUsMatchTwoPairs(gpus, pairs) {
+			slog.Warn("model gpus do not cleanly span two configured NVLink pairs — collective ops may cross slower interconnect",
+				"model", modelName,
+				"gpus", gpus,
+				"nvlink_pairs", pairs,
+				"hint", "for TP=2 PP=2 prefer arranging gpus as the union of two NVLink-bonded pairs",
+			)
+		}
+	}
+}
+
+// pairMatches returns true when {gpus[0], gpus[1]} equals one of the configured
+// pairs (order-independent within the pair).
+func pairMatches(gpus []int, pairs [][]int) bool {
+	if len(gpus) != 2 {
+		return false
+	}
+	for _, p := range pairs {
+		if (p[0] == gpus[0] && p[1] == gpus[1]) || (p[0] == gpus[1] && p[1] == gpus[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+// fourGPUsMatchTwoPairs returns true when the 4 GPUs are exactly the union of
+// two distinct configured pairs (order-independent).
+func fourGPUsMatchTwoPairs(gpus []int, pairs [][]int) bool {
+	if len(gpus) != 4 {
+		return false
+	}
+	gpuSet := map[int]bool{}
+	for _, g := range gpus {
+		gpuSet[g] = true
+	}
+	if len(gpuSet) != 4 {
+		return false
+	}
+	// Find pairs whose BOTH members are in the model's gpu set.
+	matched := 0
+	for _, p := range pairs {
+		if gpuSet[p[0]] && gpuSet[p[1]] {
+			matched++
+		}
+	}
+	return matched == 2
 }
 
 func (c *Config) validateAliases() error {
@@ -378,6 +679,63 @@ func validatePort(field string, port int) error {
 		return fmt.Errorf("%s must be between 1 and 65535", field)
 	}
 	return nil
+}
+
+// EffectiveLifecycle returns LifecycleManaged if Lifecycle is unset, otherwise
+// the configured value. Use this everywhere instead of comparing the raw field
+// so the default doesn't have to be repeated.
+func (m ModelConfig) EffectiveLifecycle() string {
+	if m.Lifecycle == "" {
+		return LifecycleManaged
+	}
+	return m.Lifecycle
+}
+
+// EffectiveSleepLevel returns the configured SleepLevel, or DefaultSleepLevel
+// if unset. Only meaningful when SleepMode is true.
+func (m ModelConfig) EffectiveSleepLevel() int {
+	if m.SleepLevel == 0 {
+		return DefaultSleepLevel
+	}
+	return m.SleepLevel
+}
+
+// EffectiveWakeTimeout returns the configured WakeTimeout, or
+// DefaultWakeTimeout if unset.
+func (m ModelConfig) EffectiveWakeTimeout() time.Duration {
+	if m.WakeTimeout.Duration <= 0 {
+		return DefaultWakeTimeout
+	}
+	return m.WakeTimeout.Duration
+}
+
+// EffectivePriority returns the configured Priority, defaulting to
+// DefaultPriority ("normal") when unset. Pinned models are forced to
+// "critical" by the admission controller regardless of this value.
+func (m ModelConfig) EffectivePriority() string {
+	if m.Priority == "" {
+		return DefaultPriority
+	}
+	return m.Priority
+}
+
+// AdmissionEnabled reports whether the admission controller should track
+// this model. A model with no declared VRAM footprint is invisible to
+// admission — its wake is unmediated and any peer's wake won't evict it.
+func (m ModelConfig) AdmissionEnabled() bool {
+	return m.ExpectedVRAMMBPerGPU > 0
+}
+
+// AdmissionEnabled at the config level reports whether ANY model has
+// admission enabled. When false the scheduler skips controller setup
+// entirely.
+func (c *Config) AdmissionEnabled() bool {
+	for _, m := range c.Models {
+		if m.AdmissionEnabled() {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) ResolveModel(name string) (resolvedName string, model ModelConfig, err error) {
