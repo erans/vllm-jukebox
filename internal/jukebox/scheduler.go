@@ -64,13 +64,25 @@ type Scheduler struct {
 	//     NotifyStartFailed / drift-risk paths run, i.e. immediately
 	//     before returning the err).
 	//   - Cleared by the same goroutine on success.
+	//   - Force-cleared by RedeployMember on success — the operator's
+	//     explicit redeploy is the canonical "I am resolving this"
+	//     signal; leaving a stale failure entry would gate a future
+	//     request-triggered KickColdLoad on an ancient failure that
+	//     the operator just resolved.
+	//   - Force-cleared by coldLoadStoppedMemberLocked when a cold-load
+	//     failure rollback could NOT re-wake a pinned peer (admission
+	//     is in a known-inconsistent state; the cooldown's "don't
+	//     wedge the GPU-set lock" purpose doesn't apply, and the
+	//     operator's escape via /admin/redeploy-member or a retry must
+	//     not be blocked by the cooldown).
 	//   - Consulted by KickColdLoad: if the most recent failure is
 	//     within coldLoadFailureCooldown, the kick is suppressed
 	//     (the model stays admissionStopped; a future request after
 	//     the cooldown will re-attempt). This is a per-model cooldown,
 	//     NOT a hard retry cap — once the cooldown expires the next
 	//     kick fires unconditionally. Operators can force-recover via
-	//     /admin/redeploy-member which bypasses this map entirely.
+	//     /admin/redeploy-member which both bypasses the gate AND
+	//     clears any prior failure record for the redeployed model.
 	//
 	// Guarded by mu.
 	coldLoadFailures map[string]coldLoadFailureRecord
