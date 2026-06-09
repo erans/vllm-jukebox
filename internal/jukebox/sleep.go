@@ -463,6 +463,24 @@ func (s *Scheduler) KickColdLoad(name string) bool {
 				"model", name,
 				"err", err,
 			)
+			// CRIT-1 (architect round-6): when the cold-load failed via
+			// the pinned-peer-wake-failed rollback path, the inner
+			// coldLoadStoppedMemberLocked has ALREADY force-cleared
+			// coldLoadFailures[name] for this model so the operator's
+			// next request can immediately retry against a known-
+			// inconsistent admission state (pinned default Sleeping +
+			// target Stopped). Re-recording the cooldown here would
+			// silently overwrite that clear and re-block the operator's
+			// escape hatch for 30s. Skip the record in that case;
+			// respect the rollback's deliberate clear.
+			//
+			// Other failure modes (docker start exit, container exited,
+			// health-check timeout, VRAM-drift cleanup) are the original
+			// "fast-fail loop" scenarios the cooldown was designed for —
+			// keep recording for those.
+			if errors.Is(err, ErrColdLoadPinnedWakeFailed) {
+				return
+			}
 			// BUG 2b: record failure timestamp so subsequent KickColdLoad
 			// invocations within coldLoadFailureCooldown short-circuit
 			// instead of re-firing a doomed docker start that wedges the
@@ -803,9 +821,17 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 					"runbook", "manual-reconcile",
 				)
 				LogLifecycleTransition(LifecycleEvent{
-					Action: LifecycleWake,
+					// HIGH-1 (architect round-6): emit Action=evict (NOT wake)
+					// for this event. The wake DID NOT happen — the rollback
+					// attempted it and failed. Tagging the audit row with
+					// LifecycleWake inflates wake-success dashboards and
+					// breaks any alert that filters on action=wake (because
+					// the model is in fact actively DOWN). Mirrors the
+					// "cleanup-stop-failed-vram-drift-risk" convention used
+					// for the cleanup-stop drift event below.
+					Action: LifecycleEvict,
 					Model:  peer,
-					Reason: "pinned_peer_wake_failed",
+					Reason: "pinned-wake-failed-admission-inconsistent",
 					GPUs:   s.gpusForModel(peer),
 				})
 				metrics.AdmissionPinnedWakeFailedTotal.WithLabelValues(peer).Inc()
@@ -845,6 +871,7 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 				"cleanup_err", cleanupErr,
 				"cleanup_output", string(cleanupOut),
 				"cold_load_err", err,
+				"pinned_restore_failed", pinnedRestoreFailed,
 				"runbook", "manual-reconcile-vram",
 			)
 			// Audit a drift-risk event distinct from the success-path
@@ -864,8 +891,28 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 			// outside automation's purview. Wraps ErrAdmissionVRAMDriftRisk
 			// so mapWakeError routes this to RejectAdminIntervention with
 			// NO Retry-After (vs. the default retry-loopy 503).
-			return fmt.Errorf("%w: cold load failed AND cleanup stop failed (container may still be running on GPUs %v): cold_load_err=%v cleanup_err=%v",
+			//
+			// HIGH-2 (architect round-6): if pinned-restore ALSO failed
+			// above (worst-case dual failure: cold-load failed → rollback
+			// couldn't re-wake pinned → cleanup-stop ALSO failed), the
+			// returned error must carry BOTH sentinels so:
+			//   (a) errors.Is(err, ErrColdLoadPinnedWakeFailed) tells the
+			//       operator pinned is down (manual redeploy needed), AND
+			//   (b) errors.Is(err, ErrAdmissionVRAMDriftRisk) tells them
+			//       the half-loaded container may still be on the GPUs.
+			// Pre-fix the cleanup-error early-return dropped the pinned-
+			// wake-failed signal entirely. errors.Join (Go 1.20+) joins
+			// both sentinels into one chain; mapWakeError's switch picks
+			// the more-specific ErrColdLoadPinnedWakeFailed when both
+			// match (see MED-1 reorder).
+			driftErr := fmt.Errorf("%w: cold load failed AND cleanup stop failed (container may still be running on GPUs %v): cold_load_err=%v cleanup_err=%v",
 				ErrAdmissionVRAMDriftRisk, s.gpusForModel(inst.model), err, cleanupErr)
+			if len(pinnedRestoreFailed) > 0 {
+				pinnedErr := fmt.Errorf("%w: pinned peers left Sleeping after cold-load failure (peers=%v)",
+					ErrColdLoadPinnedWakeFailed, pinnedRestoreFailed)
+				return errors.Join(driftErr, pinnedErr)
+			}
+			return driftErr
 		}
 		s.admission.NotifyStartFailed(inst.model)
 		LogLifecycleTransition(LifecycleEvent{
@@ -1564,22 +1611,27 @@ func mapWakeError(err error) error {
 			Reason:  RejectInsufficient,
 			Message: fmt.Sprintf("wake failed (infeasible): %v", err),
 		}
+	case errors.Is(err, ErrColdLoadPinnedWakeFailed):
+		// MED-1 (architect round-6): match the more-specific pinned-wake
+		// sentinel BEFORE ErrAdmissionVRAMDriftRisk. The HIGH-2 dual-
+		// failure path joins BOTH sentinels into one chain via
+		// errors.Join — naive ordering would let VRAMDriftRisk win and
+		// silently shadow the pinned-down operator signal in the
+		// returned message string. Both routes still go to
+		// RejectAdminIntervention, but the message-string difference
+		// matters: "pinned-peer wake rollback failed" tells the operator
+		// to manually redeploy the peer; "vram-drift-risk" tells them to
+		// reconcile the half-loaded container. Both are needed in the
+		// dual-failure case and the message itself enumerates both
+		// underlying errors when joined.
+		return &RejectError{
+			Reason:  RejectAdminIntervention,
+			Message: fmt.Sprintf("wake failed (pinned-peer wake rollback failed): %v", err),
+		}
 	case errors.Is(err, ErrAdmissionVRAMDriftRisk):
 		return &RejectError{
 			Reason:  RejectAdminIntervention,
 			Message: fmt.Sprintf("wake failed (vram-drift-risk): %v", err),
-		}
-	case errors.Is(err, ErrColdLoadPinnedWakeFailed):
-		// Cold-load failed AND rollback could not re-wake a pinned peer
-		// we slept. System is in a known-inconsistent state (pinned-
-		// default down + cold-load target Stopped). Surface as terminal/
-		// admin-intervention so retry-aware SDKs don't loop against an
-		// unrecoverable condition. The cold-load goroutine has already
-		// cleared the post-failure cooldown for the target so operator
-		// recovery via /admin/redeploy-member is unblocked.
-		return &RejectError{
-			Reason:  RejectAdminIntervention,
-			Message: fmt.Sprintf("wake failed (pinned-peer wake rollback failed): %v", err),
 		}
 	default:
 		return &RejectError{

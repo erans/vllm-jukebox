@@ -24,6 +24,7 @@ package jukebox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1081,23 +1082,25 @@ func TestIntegration_PinnedPeerSurvivesWedgedColdLoad(t *testing.T) {
 	}
 	defer stopHammerOnce()
 
-	// Give the hammer enough wall-clock to (a) attempt at least one
-	// real cold-load (which sleeps main, fast-fails on inspect,
-	// re-wakes main) AND (b) burn through at least one cooldown cycle
-	// so we can observe steady-state behaviour, not just the first
-	// kick. Each cold-load attempt costs ~2s of settleAfterSleep on
-	// main + ~50ms fast-fail + ~2s settle-after-wake on the rollback,
-	// so the loop turns over roughly every ~4-5s.
-	time.Sleep(6 * time.Second)
+	// Give the hammer enough wall-clock to (a) attempt at least TWO real
+	// cold-loads (which sleep main, fast-fail on inspect, re-wake main)
+	// AND (b) burn through at least two cooldown cycles so we observe
+	// the wedge-loop ITERATING — one start would be vacuously
+	// satisfied even if the BUG 2c lock-hold regression had snuck back
+	// in. Each cold-load attempt costs ~2s settleAfterSleep on main +
+	// ~50ms fast-fail + ~2s settle-after-wake on the rollback, so the
+	// loop turns over roughly every ~4-5s. 12s = ~2.5 cycles, leaving
+	// headroom for -race scheduler jitter.
+	time.Sleep(12 * time.Second)
 
-	// Prove the wedge actually wedged something: at least one docker
-	// start fired during the hammer window. If startCount==0, the
-	// test would pass even with NO cold-load happening (e.g. if the
-	// kick is always gated) — masking exactly the regression we're
-	// guarding against.
+	// Prove the wedge actually wedged something AND that the wedge LOOP
+	// iterated (not just one start that ran-and-released). Single-start
+	// passes vacuously — exactly the condition where BUG 2c would have
+	// snuck back in undetected (the FIRST start always fires; the
+	// regression is the SECOND never getting a turn at the lock).
 	gotStarts := startCount.Load()
-	if gotStarts < 1 {
-		t.Fatalf("BUG 2c regression: expected >= 1 docker start attempt during hammer window (proves a real cold-load ran AND the lock was released afterward), got %d", gotStarts)
+	if gotStarts < 2 {
+		t.Fatalf("BUG 2c regression: expected > 1 docker start attempt during hammer window (proves the wedge LOOP iterated — single start passes vacuously even with the lock-hold-time regression), got %d", gotStarts)
 	}
 
 	// Now: direct request to main (the pinned healthy peer). main may
@@ -1218,43 +1221,169 @@ func TestIntegration_ColdLoadPinnedWakeFailed_ClearsCooldown_BumpsMetric(t *test
 	// or earlier runs may have bumped these counters).
 	pinnedWakeFailedBefore := readCounterVecValue(t, metrics.AdmissionPinnedWakeFailedTotal, "main")
 
-	// Cold-load. Must return an error wrapping ErrColdLoadPinnedWakeFailed.
-	err := s.coldLoadStoppedMember(context.Background(), s.instances["moe"], s.cfg.Models["moe"])
-	if err == nil {
-		t.Fatalf("expected cold-load to fail (mock container exits), got nil")
+	// CRIT-1 (architect round-6): drive the cold-load through the REAL
+	// request-handler entrypoint KickColdLoad — NOT the prior round's
+	// direct call to s.coldLoadStoppedMember. KickColdLoad spawns a
+	// goroutine that, on cold-load failure, unconditionally re-records
+	// coldLoadFailures[name]; the prior fix to clear the cooldown inside
+	// coldLoadStoppedMemberLocked was silently overwritten ~2 lines
+	// later by that goroutine. The new errors.Is(...PinnedWakeFailed)
+	// guard in the goroutine SKIPS the re-record on this exact failure
+	// path so the rollback's clear stays cleared.
+	if !s.KickColdLoad("moe") {
+		t.Fatalf("KickColdLoad(moe) returned false; expected true (admissionStopped + no in-flight kick + no prior failure)")
 	}
-	if !errors.Is(err, ErrColdLoadPinnedWakeFailed) {
-		t.Errorf("expected wrapped ErrColdLoadPinnedWakeFailed (so mapWakeError routes to RejectAdminIntervention), got: %v", err)
-	}
-	// errors.Is chains must still surface the original cold-load cause.
-	if !errors.Is(err, ErrColdLoadContainerExited) {
-		t.Errorf("expected wrapped chain to still surface ErrColdLoadContainerExited, got: %v", err)
+
+	// Wait for the goroutine to finish (coldLoadKicks["moe"] cleared by
+	// the goroutine's defer). Generous budget — the cold-load fast-fails
+	// via exiting-container inspect within ~50ms but settleAfterSleep
+	// for main and the rollback re-wake attempt add ~2-4s.
+	if ok := waitForCondition(15*time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return !s.coldLoadKicks["moe"]
+	}); !ok {
+		t.Fatalf("KickColdLoad goroutine for moe did not finish within 15s — coldLoadKicks[moe] still set")
 	}
 
 	// CRITICAL: cooldown entry for moe (the cold-load target) MUST be
-	// cleared. Pre-fix the operator's next request was gated for 30s
-	// even though the system was already known-inconsistent.
+	// CLEARED AND STAY CLEARED through the goroutine's settle. Pre-fix
+	// the rollback cleared the cooldown but the goroutine's blanket
+	// re-record overwrote it 2 lines later, leaving the operator gated
+	// for 30s with no metric and no recovery handle short of restart.
 	s.mu.Lock()
 	_, gated := s.coldLoadFailures["moe"]
 	s.mu.Unlock()
 	if gated {
-		t.Errorf("coldLoadFailures[moe] still present after pinned-wake-failed rollback; operator's retry escape is blocked (CRITICAL regression)")
+		t.Errorf("coldLoadFailures[moe] still present after pinned-wake-failed rollback + goroutine settle; CRIT-1 regression — KickColdLoad goroutine re-recorded the cooldown the rollback cleared, blocking operator's retry escape for 30s")
+	}
+
+	// End-to-end architect-mandated assertion: a second KickColdLoad
+	// invocation within the 30s cooldown window MUST be admitted (NOT
+	// suppressed by the post-failure cooldown gate). The earlier
+	// in-flight kick has drained (coldLoadKicks check above), so the
+	// only thing that could suppress this kick is the cooldown entry —
+	// which the rollback's clear (preserved through the goroutine's
+	// settle by CRIT-1's errors.Is skip) should ensure is gone.
+	//
+	// The mock is still installed (defer unset hasn't fired), so the
+	// second kick will fast-fail through the same exiting-container
+	// path. We wait for it to drain before the deferred unset runs so
+	// no goroutine leaks real-docker calls into subsequent tests.
+	if !s.KickColdLoad("moe") {
+		t.Errorf("second KickColdLoad(moe) returned false — operator's retry was gated by stale cooldown (CRIT-1 regression: rollback's clear was overwritten by goroutine re-record)")
+	}
+	// Drain the second goroutine before deferred SetSleepDockerCmdForTest(nil)
+	// fires, so it doesn't bleed real-docker calls into the next test.
+	if ok := waitForCondition(15*time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return !s.coldLoadKicks["moe"]
+	}); !ok {
+		t.Fatalf("second KickColdLoad goroutine for moe did not drain within 15s — would leak real-docker calls into subsequent tests")
 	}
 
 	// Metric: AdmissionPinnedWakeFailedTotal{model=main} must have
-	// incremented by exactly 1 (one failed peer in this scenario).
+	// incremented at least once (the first cold-load failed and bumped
+	// it; the second cold-load also fails the same way and bumps again,
+	// so total delta is 2). Use >=1 to keep the assertion robust if
+	// future scheduling changes coalesce the second attempt.
 	pinnedWakeFailedAfter := readCounterVecValue(t, metrics.AdmissionPinnedWakeFailedTotal, "main")
-	if delta := pinnedWakeFailedAfter - pinnedWakeFailedBefore; delta != 1 {
-		t.Errorf("expected AdmissionPinnedWakeFailedTotal{model=main} +1, got +%v", delta)
+	if delta := pinnedWakeFailedAfter - pinnedWakeFailedBefore; delta < 1 {
+		t.Errorf("expected AdmissionPinnedWakeFailedTotal{model=main} >= +1 from the failed cold-load(s), got +%v", delta)
+	}
+}
+
+// TestIntegration_ColdLoadPinnedWakeFailed_AndCleanupStopFailed_DualWrap is
+// the HIGH-2 (architect round-6) regression test: the worst-case dual
+// failure where (a) the cold-load fails, (b) bestEffortRestorePinned
+// fails to re-wake the slept pinned peer, AND (c) the cleanup docker stop
+// of the half-loaded container also fails (daemon hiccup / network blip /
+// OOM during shutdown).
+//
+// Pre-fix the cleanup-error early-return at the dual-failure site
+// returned an error wrapping ONLY ErrAdmissionVRAMDriftRisk; the pinned-
+// peer-wake-failed signal was silently dropped. mapWakeError routed via
+// VRAMDriftRisk and the operator never learned the pinned default was
+// also down.
+//
+// Post-fix the returned error joins BOTH sentinels via errors.Join, AND
+// mapWakeError's switch matches the more-specific ErrColdLoadPinnedWakeFailed
+// FIRST (MED-1 reorder) so the user-facing reject message names the
+// pinned-peer condition.
+func TestIntegration_ColdLoadPinnedWakeFailed_AndCleanupStopFailed_DualWrap(t *testing.T) {
+	s, a, mgrs := makeStopOnEvictScheduler(t)
+	_ = a
+
+	oldPoll := SetColdLoadPollIntervalForTest(20 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+	oldCooldown := SetColdLoadFailureCooldownForTest(30 * time.Second)
+	defer SetColdLoadFailureCooldownForTest(oldCooldown)
+
+	flakyMgr := &flakyIsSleepingMgr{port: 8002}
+	flakyMgr.pid.Store(0)
+	s.mu.Lock()
+	s.instances["moe"].mgr = flakyMgr
+	s.mu.Unlock()
+
+	// Mock docker so:
+	//   - inspect (vllm-moe) → "exited" (drives cold-load fast-fail)
+	//   - stop (vllm-moe)    → non-zero exit (drives cleanup-stop failure)
+	// We compose by wrapping exitingContainerInspectMock and overriding
+	// stop responses via a custom hook that delegates inspect to the
+	// canned mock and fails stop.
+	innerHook, _, _ := exitingContainerInspectMock(t, "vllm-moe")
+	hook := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		// Match `docker stop <flags...> vllm-moe` and fail it.
+		if name == "docker" && len(args) >= 1 && args[0] == "stop" {
+			for _, arg := range args {
+				if arg == "vllm-moe" {
+					return []byte("Error response from daemon: simulated stop failure"),
+						fmt.Errorf("exit status 1: simulated cleanup stop failure")
+				}
+			}
+		}
+		return innerHook(ctx, name, args...)
+	}
+	SetSleepDockerCmdForTest(hook)
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Sabotage main's Wake so bestEffortRestorePinned fails.
+	mgrs["main"].wakeErr = errors.New("simulated daemon hiccup / wake-up 500")
+
+	// Drive directly through coldLoadStoppedMember so we can inspect the
+	// returned error chain (KickColdLoad's goroutine swallows the err
+	// after the slog.Error). The CRIT-1 test exercises the goroutine
+	// path; this test exercises the dual-wrap behaviour.
+	err := s.coldLoadStoppedMember(context.Background(), s.instances["moe"], s.cfg.Models["moe"])
+	if err == nil {
+		t.Fatalf("expected dual-failure cold-load to return an error, got nil")
 	}
 
-	// Sanity: KickColdLoad after the failure must NOT be gated (the
-	// CRITICAL fix cleared the cooldown). Returns false here ONLY
-	// because moe's goroutine is still draining via coldLoadKicks
-	// dedupe — but the gating reason should NOT be the cooldown. We
-	// assert by re-reading coldLoadFailures (already empty above).
-	// This also documents the operator-recovery contract: clearing the
-	// cooldown is necessary, dedupe-via-coldLoadKicks is independent.
+	// HIGH-2: the joined error chain MUST surface BOTH sentinels.
+	if !errors.Is(err, ErrAdmissionVRAMDriftRisk) {
+		t.Errorf("expected joined err to wrap ErrAdmissionVRAMDriftRisk (cleanup stop failed → container may still be on GPUs), got: %v", err)
+	}
+	if !errors.Is(err, ErrColdLoadPinnedWakeFailed) {
+		t.Errorf("expected joined err to ALSO wrap ErrColdLoadPinnedWakeFailed (pinned peer left Sleeping), got: %v — pre-HIGH-2 the cleanup-error early-return dropped this signal entirely", err)
+	}
+
+	// MED-1: mapWakeError's switch must pick the MORE-SPECIFIC
+	// ErrColdLoadPinnedWakeFailed branch first (re-ordered above
+	// ErrAdmissionVRAMDriftRisk) — both go to RejectAdminIntervention but
+	// the message string differs and the pinned-peer branch is the
+	// actionable one for the operator.
+	mapped := mapWakeError(err)
+	rej, ok := mapped.(*RejectError)
+	if !ok {
+		t.Fatalf("mapWakeError returned non-RejectError: %T %v", mapped, mapped)
+	}
+	if rej.Reason != RejectAdminIntervention {
+		t.Errorf("expected mapWakeError → RejectAdminIntervention, got Reason=%v", rej.Reason)
+	}
+	if !strings.Contains(rej.Message, "pinned-peer wake rollback failed") {
+		t.Errorf("expected mapWakeError message to name the pinned-peer-wake-rollback condition (more-specific sentinel wins after MED-1 reorder), got: %q", rej.Message)
+	}
 }
 
 // readCounterVecValue reads the current value of a CounterVec for the
