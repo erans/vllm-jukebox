@@ -810,11 +810,13 @@ func TestFault_ContextCancelled_Mid_ColdLoad(t *testing.T) {
 	}
 
 	// Wait for docker start to be in flight, then cancel inbound.
+	// Budget 5s — the BUG 1 fix evicts pinned main (sleepInstance) before
+	// docker start, and sleepInstance pays a hardcoded 2s settleAfterSleep.
 	select {
 	case <-startEntered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		releaseStart <- struct{}{}
-		t.Fatalf("docker start did not fire within 2s")
+		t.Fatalf("docker start did not fire within 5s")
 	}
 	inboundCancel() // cancel the original inbound
 
