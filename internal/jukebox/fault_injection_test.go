@@ -450,7 +450,7 @@ models:
 	a.mu.Lock()
 	switch admState {
 	case admissionAwake:
-		a.awakeByGPU[0] += a.models["moe"].ExpectedVRAMMB
+		a.awakeByGPU[0] += a.models["moe"].ExpectedOn(0)
 		a.models["moe"].State = admissionAwake
 	case admissionSleeping:
 		a.l1ResidualByGPU[0] += a.models["moe"].L1ResidualMB
@@ -1338,7 +1338,7 @@ models:
 	s.SeedInstanceForTest("moe", 8002, []int{0}, false, StateReady, mgr)
 
 	a.mu.Lock()
-	a.awakeByGPU[0] += a.models["moe"].ExpectedVRAMMB
+	a.awakeByGPU[0] += a.models["moe"].ExpectedOn(0)
 	a.models["moe"].State = admissionAwake
 	a.mu.Unlock()
 
@@ -1408,7 +1408,7 @@ func TestFault_WedgeRecovery_PreservesOriginalReason(t *testing.T) {
 	a.models["peer"] = &modelAdmissionState{
 		Name:           "peer",
 		GPUs:           []int{0},
-		ExpectedVRAMMB: 100,
+		ExpectedVRAMMB: map[int]int{0: 100},
 		L1ResidualMB:   0,
 		Priority:       config.PriorityNormal,
 		SwapGroup:      "g",

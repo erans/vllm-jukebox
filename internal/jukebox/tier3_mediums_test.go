@@ -213,7 +213,7 @@ models:
 		if m.State == admissionSleeping {
 			a.l1ResidualByGPU[0] -= m.L1ResidualMB
 		}
-		a.awakeByGPU[0] += m.ExpectedVRAMMB
+		a.awakeByGPU[0] += m.ExpectedOn(0)
 		m.State = admissionAwake
 	}
 	a.mu.Unlock()
@@ -373,7 +373,7 @@ func TestFix13_AdmissionMuNotHeldDuringEviction(t *testing.T) {
 
 	// Drive victim to Awake so it's evictable.
 	a.mu.Lock()
-	a.awakeByGPU[0] += a.models["victim"].ExpectedVRAMMB
+	a.awakeByGPU[0] += a.models["victim"].ExpectedOn(0)
 	a.models["victim"].State = admissionAwake
 	a.mu.Unlock()
 
