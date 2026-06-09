@@ -1,0 +1,20 @@
+.git
+.github
+.gitignore
+
+# Docs are not needed for the runtime image.
+*.md
+docs
+
+# Keep the build context small — tests + scripts aren't shipped.
+**/*_test.go
+scripts
+testdata
+
+# Review/handoff scratch files (present on some long-lived branches).
+.review-*.md
+
+# Local build artifacts.
+bin
+coverage.out
+coverage.html
