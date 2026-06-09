@@ -3,13 +3,10 @@
 #
 # Builder: alpine + Go cross-compiles a fully-static CGO-disabled binary using
 # BuildKit's automatic platform args (linux/amd64 + linux/arm64). Runtime:
-# nvidia/cuda:12.6.0-base-ubuntu24.04 — ships nvidia-smi + libnvidia-ml so
-# scheduler-mode admission control can query GPU VRAM without depending on
-# the host's nvidia container-toolkit injection (CDI / nvidia-runtime as
-# docker default). Adds ~170 MiB vs the prior distroless runtime — the
-# tradeoff buys us reliable GPU introspection on hosts that don't auto-
-# inject nvidia-smi. Jukebox itself doesn't need CUDA libs at runtime;
-# it shells out to Docker/`vllm`/`llama-server` for actual inference.
+# distroless static-debian12 (nonroot UID 65532) — minimal surface, no shell,
+# no package manager. Jukebox itself doesn't need CUDA — it shells out to
+# Docker/`vllm`/`llama-server` on the host; this image is the orchestrator,
+# not the inference runtime.
 
 FROM --platform=${BUILDPLATFORM} golang:1.25-alpine AS builder
 
@@ -29,32 +26,8 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/jukebox ./cmd/jukebox
 
-# Runtime: nvidia/cuda base. Ships nvidia-smi + libnvidia-ml. NVIDIA's
-# 12.6.0-base-ubuntu24.04 tag publishes both linux/amd64 and linux/arm64
-# variants (sbsa). We create our own non-root user (UID 65532, matching
-# the prior distroless nonroot UID) since the cuda base ships only root.
-FROM nvidia/cuda:12.6.0-base-ubuntu24.04
-
-# docker CLI for shell-out to host docker.sock — jukebox uses `docker stop`,
-# `docker start`, `docker inspect` for evict_action: stop / wake-from-Stopped
-# / redeploy-member flows (see internal/jukebox/sleep.go + redeploy.go).
-# Distroless predecessor never had docker CLI either, which silently broke
-# Phase 4 cold-load when the image switched to overnight-stage-j-* — the
-# error 'exec: "docker": executable file not found in $PATH' surfaced at
-# the first wake-from-Stopped request. docker.io package installs just
-# the CLI binary; the dockerd daemon doesn't auto-start (no systemd in
-# container), so this is CLI-only as desired.
-RUN apt-get update && apt-get install -y --no-install-recommends docker.io \
- && rm -rf /var/lib/apt/lists/*
-
-# Non-root jukebox user, UID/GID 65532 — matches the distroless `nonroot`
-# UID the prior image used, so any host bind-mount or NFS ACL keyed on
-# 65532 stays correct after the base swap. nologin shell, no home write,
-# no group additions.
-RUN groupadd --system --gid 65532 jukebox \
- && useradd  --system --uid 65532 --gid 65532 \
-             --no-create-home --home-dir /nonexistent \
-             --shell /usr/sbin/nologin jukebox
+# Runtime: distroless static. Nonroot user is UID 65532.
+FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /out/jukebox /jukebox
 
@@ -62,18 +35,7 @@ COPY --from=builder /out/jukebox /jukebox
 # real port comes from the YAML config passed via -config.
 EXPOSE 8080
 
-USER jukebox:jukebox
-
-# In-binary HEALTHCHECK — the nvidia/cuda base does have a shell, but
-# keeping the probe in the jukebox binary keeps the contract identical
-# across base-image swaps and avoids depending on any package the cuda
-# image happens to ship today. `jukebox health` probes 127.0.0.1:<port>/health
-# and exits 0 / 1. Port resolution: -port flag > JUKEBOX_HEALTHCHECK_PORT env >
-# JUKEBOX_CONFIG yaml's server.port > 8080 default.
-# start-period gives the daemon time to load its default model (cold-load
-# can take several minutes); retries soak transient swap/eviction blips.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
-  CMD ["/jukebox", "health"]
+USER nonroot:nonroot
 
 ENTRYPOINT ["/jukebox"]
 CMD []
