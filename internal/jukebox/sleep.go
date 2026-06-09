@@ -392,6 +392,12 @@ func (s *Scheduler) KickColdLoad(name string) bool {
 				Reason: "retry_suppressed_cooldown",
 				GPUs:   s.gpusForModel(name),
 			})
+			// HIGH-4: bump a per-model counter so dashboards can alert
+			// on "all my models stuck in cooldown" silent partial
+			// outages. Pairs with the slog.Warn line + Lifecycle audit
+			// above; the metric is the actionable signal — the log
+			// lines are operator-readable detail.
+			metrics.ColdLoadCooldownSuppressedTotal.WithLabelValues(name).Inc()
 			return false
 		}
 		// Cooldown expired — clear the stale record so future failures
@@ -578,6 +584,17 @@ func (s *Scheduler) evictPeersForColdLoadLocked(ctx context.Context, name string
 	// when it picks a pinned peer as a victim.
 	pinnedPeers := s.pinnedPeersInSwapGroup(name, modelCfg.SwapGroup)
 	for _, peer := range pinnedPeers {
+		// Bail cleanly on ctx cancel (shutdown / 10min cold-load wrapper
+		// timeout) BEFORE evicting more peers. Asymmetric with the
+		// stop-mode loop below — without this check, a ctx cancelled
+		// mid-pinned-loop keeps slept-listing peers that we'll then have
+		// to restore via bestEffortRestorePinned (which itself uses the
+		// same cancelled ctx and may fail to wake them). Net pre-fix:
+		// pinned peers left Sleeping on shutdown / timeout. Mirrors the
+		// ctx.Err check at the top of the stop-mode loop on line ~620.
+		if err := ctx.Err(); err != nil {
+			return slept, stopped
+		}
 		s.mu.RLock()
 		peerInst := s.instances[peer]
 		s.mu.RUnlock()
@@ -761,7 +778,48 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 		// evict_action: stop members and the async-503
 		// wake-from-Stopped path is the right shape (matches
 		// RedeployMember step h).
-		s.bestEffortRestorePinned(ctx, slept)
+		pinnedRestoreFailed := s.bestEffortRestorePinned(ctx, slept)
+		// CRITICAL — if the pinned-peer restore failed, the system is
+		// now in a strictly-worse state than before this cold-load was
+		// attempted: pinned default Sleeping + cold-load target Stopped
+		// + (without this clear) the 30s cooldown blocks the operator's
+		// next retry. The cooldown's purpose is "doomed cold-load,
+		// don't wedge the GPU-set lock"; it is NOT a lockout for known-
+		// inconsistent admission state.
+		//
+		// On restore failure: emit a high-severity audit + bump the
+		// pinned-wake-failed counter so dashboards alert, AND clear
+		// coldLoadFailures[target] so the operator's next request (or
+		// /admin/redeploy-member of the pinned peer) can fire
+		// immediately. Wrap the returned error with
+		// ErrColdLoadPinnedWakeFailed so mapWakeError routes it to
+		// RejectAdminIntervention at the request handler.
+		if len(pinnedRestoreFailed) > 0 {
+			for _, peer := range pinnedRestoreFailed {
+				slog.Error("pinned_peer_wake_failed_admission_inconsistent",
+					"model", inst.model,
+					"pinned_peer", peer,
+					"cold_load_err", err,
+					"runbook", "manual-reconcile",
+				)
+				LogLifecycleTransition(LifecycleEvent{
+					Action: LifecycleWake,
+					Model:  peer,
+					Reason: "pinned_peer_wake_failed",
+					GPUs:   s.gpusForModel(peer),
+				})
+				metrics.AdmissionPinnedWakeFailedTotal.WithLabelValues(peer).Inc()
+			}
+			// Clear the cooldown entry for the TARGET cold-load model so
+			// the operator's escape hatch (next request OR
+			// /admin/redeploy-member) isn't blocked by the post-failure
+			// cooldown gate while admission is in a known-inconsistent
+			// state. The cooldown only applies on "fast-fail loop"
+			// regressions, not on operator-recoverable inconsistency.
+			s.mu.Lock()
+			delete(s.coldLoadFailures, inst.model)
+			s.mu.Unlock()
+		}
 		// Best-effort cleanup: stop the half-loaded container so the
 		// admission-Stopped state and the actual container state stay
 		// consistent.
@@ -817,6 +875,19 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 			GPUs:     s.gpusForModel(inst.model),
 			Duration: s.now().Sub(coldLoadStart),
 		})
+		// CRITICAL — if the pinned-peer rollback failed above, wrap the
+		// cold-load error with ErrColdLoadPinnedWakeFailed so the caller
+		// (performWake → tryRouteFromSleep → mapWakeError) routes this
+		// to RejectAdminIntervention. Operators MUST be able to tell
+		// "cold-load failed cleanly, retry later" from "cold-load failed
+		// AND a pinned peer is now down". Use %w on BOTH wraps so
+		// errors.Is matches both ErrColdLoadPinnedWakeFailed AND the
+		// underlying cause (e.g. ErrColdLoadContainerExited) — callers
+		// classifying via errors.Is don't lose the inner sentinel.
+		if len(pinnedRestoreFailed) > 0 {
+			return fmt.Errorf("%w: pinned peers left Sleeping after cold-load failure (peers=%v): %w",
+				ErrColdLoadPinnedWakeFailed, pinnedRestoreFailed, err)
+		}
 		return err
 	}
 
@@ -871,6 +942,25 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 // failure re-kicked the cold-load — infinite OOM/retry loop holding
 // the GPU-set lock and starving Sparx.
 var ErrColdLoadContainerExited = errors.New("cold-load container exited")
+
+// ErrColdLoadPinnedWakeFailed is returned by coldLoadStoppedMemberLocked
+// when the cold-load failed AND the rollback step (re-waking pinned
+// peers we slept to free VRAM for the now-failed cold-load) also
+// failed. Distinct from a clean cold-load failure: clean failure
+// leaves the pinned peer Awake; THIS failure leaves the pinned peer
+// stuck Sleeping while the cold-load target is Stopped. The pinned-
+// default availability invariant is violated and operator intervention
+// is required to reconcile (manual /admin/redeploy-member of the
+// pinned peer is the standard recovery).
+//
+// mapWakeError routes this sentinel to RejectAdminIntervention so
+// retry-aware SDKs surface it as terminal rather than retry-loop a
+// known-inconsistent state. The cold-load goroutine ALSO clears the
+// post-failure cooldown for the target model when wrapping this error
+// (sleep.go) so the operator's next request — or a manual
+// /admin/redeploy-member — can immediately retry without waiting for
+// the 30s cooldown to expire.
+var ErrColdLoadPinnedWakeFailed = errors.New("cold-load pinned-peer wake failed; admission inconsistent")
 
 // containerState is the subset of `docker inspect` fields jukebox cares
 // about for the cold-load fast-fail probe. JSON unmarshaling drops
@@ -1478,6 +1568,18 @@ func mapWakeError(err error) error {
 		return &RejectError{
 			Reason:  RejectAdminIntervention,
 			Message: fmt.Sprintf("wake failed (vram-drift-risk): %v", err),
+		}
+	case errors.Is(err, ErrColdLoadPinnedWakeFailed):
+		// Cold-load failed AND rollback could not re-wake a pinned peer
+		// we slept. System is in a known-inconsistent state (pinned-
+		// default down + cold-load target Stopped). Surface as terminal/
+		// admin-intervention so retry-aware SDKs don't loop against an
+		// unrecoverable condition. The cold-load goroutine has already
+		// cleared the post-failure cooldown for the target so operator
+		// recovery via /admin/redeploy-member is unblocked.
+		return &RejectError{
+			Reason:  RejectAdminIntervention,
+			Message: fmt.Sprintf("wake failed (pinned-peer wake rollback failed): %v", err),
 		}
 	default:
 		return &RejectError{
