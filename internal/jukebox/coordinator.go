@@ -287,7 +287,7 @@ func (c *Coordinator) Status() Status {
 }
 
 func (c *Coordinator) handleEnsure(req ensureReq) {
-	resolvedName, _, err := c.cfg.ResolveModel(req.requestedModel)
+	resolvedName, _, err := liveResolveModel(c.cfg, req.requestedModel)
 	if err != nil {
 		req.resp <- ensureReply{err: err}
 		return
@@ -457,7 +457,7 @@ func (c *Coordinator) performSwap(fromModel, model, requestID string, done chan<
 }
 
 func (c *Coordinator) doSwap(model, requestID string) error {
-	_, modelCfg, err := c.cfg.ResolveModel(model)
+	_, modelCfg, err := liveResolveModel(c.cfg, model)
 	if err != nil {
 		return err
 	}

@@ -74,8 +74,38 @@ func main() {
 	// Start the active.yaml hot-reload watcher. Failures here log loud
 	// but are NOT fatal — the existing parse-crash safety net (operator
 	// fixes the file + restarts the container) still works.
+	//
+	// onReload is set AFTER subsystem construction below, so this
+	// closure dispatches into a (later-populated) reloadSubscribers
+	// slice. Until subsystems register, the watcher just records the
+	// metric — the atomic Current() pointer swap already happened
+	// inside config.Watch's doReload.
+	var (
+		reloadMu          sync.Mutex
+		reloadSubscribers []func(*config.Config)
+	)
+	subscribeReload := func(fn func(*config.Config)) {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		reloadSubscribers = append(reloadSubscribers, fn)
+	}
+	dispatchReload := func() {
+		reloadMu.Lock()
+		fns := append([]func(*config.Config){}, reloadSubscribers...)
+		reloadMu.Unlock()
+		live := config.Current()
+		if live == nil {
+			return
+		}
+		for _, fn := range fns {
+			fn(live)
+		}
+	}
 	if err := config.Watch(ctx, configPath, func(result config.ReloadResult, _ error) {
 		metrics.ConfigReloadsTotal.WithLabelValues(string(result)).Inc()
+		if result == config.ReloadSuccess {
+			dispatchReload()
+		}
 	}); err != nil {
 		slog.Warn("active.yaml hot-reload watcher disabled", "err", err, "path", configPath)
 	} else {
@@ -260,6 +290,11 @@ func main() {
 			os.Exit(1)
 		}
 		go sched.IdleMonitor(ctx)
+
+		// Subscribe the scheduler to active.yaml hot-reloads so its
+		// admission controller picks up per-model field edits without
+		// requiring a process restart.
+		subscribeReload(sched.OnConfigReloaded)
 
 		stopOnce := sync.Once{}
 		stop = func() {
