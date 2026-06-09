@@ -49,65 +49,6 @@ type Scheduler struct {
 	// by the goroutine on exit. Guarded by mu.
 	coldLoadKicks map[string]bool
 
-	// coldLoadFailures records the most recent cold-load failure per
-	// model name, used by KickColdLoad to back off re-kicks within a
-	// short window. Without this, a member-container that exits(1) on
-	// startup (e.g. OOM at worker init) gets re-kicked instantly on
-	// every inbound request — each kick re-acquires the GPU-set
-	// cold-load lock and re-runs a doomed docker start. Live-observed
-	// blast radius (2026-06-09): an infinite OOM/retry loop on moe
-	// holding coldLoadMu so requests to the healthy pinned 27B
-	// (Sparx) blocked until they timed out.
-	//
-	// Semantics:
-	//   - Updated by the async cold-load goroutine on failure (after
-	//     NotifyStartFailed / drift-risk paths run, i.e. immediately
-	//     before returning the err).
-	//   - Cleared by the same goroutine on success.
-	//   - Force-cleared by RedeployMember on success — the operator's
-	//     explicit redeploy is the canonical "I am resolving this"
-	//     signal; leaving a stale failure entry would gate a future
-	//     request-triggered KickColdLoad on an ancient failure that
-	//     the operator just resolved.
-	//   - Force-cleared by coldLoadStoppedMemberLocked when a cold-load
-	//     failure rollback could NOT re-wake a pinned peer (admission
-	//     is in a known-inconsistent state; the cooldown's "don't
-	//     wedge the GPU-set lock" purpose doesn't apply, and the
-	//     operator's escape via /admin/redeploy-member or a retry must
-	//     not be blocked by the cooldown).
-	//   - Consulted by KickColdLoad: if the most recent failure is
-	//     within coldLoadFailureCooldown, the kick is suppressed
-	//     (the model stays admissionStopped; a future request after
-	//     the cooldown will re-attempt). This is a per-model cooldown,
-	//     NOT a hard retry cap — once the cooldown expires the next
-	//     kick fires unconditionally. Operators can force-recover via
-	//     /admin/redeploy-member which both bypasses the gate AND
-	//     clears any prior failure record for the redeployed model.
-	//
-	// Guarded by mu.
-	coldLoadFailures map[string]coldLoadFailureRecord
-
-	// coldLoadEvictionMu + coldLoadEviction track models that are
-	// currently mid-eviction as part of an in-flight peer cold-load.
-	// Populated synchronously at coldLoadStoppedMember's WithColdLoadLock
-	// entry (target + every potential peer in the same swap group),
-	// cleared on exit. The handler-side fast-fail gate consults this map
-	// via IsInColdLoadEviction to close the gap between "cold-load
-	// started" and "admission state flipped" — a gap observed live
-	// 2026-06-10 as a 600s hang because admission state remained
-	// admissionAwake throughout sleepInstance's StateReady → Stopping →
-	// Sleeping walk, so the IsModelColdLoading gate (which checks for
-	// admissionStopped) missed the request and it blocked downstream on
-	// coldLoadMu inside performWake. See router.ColdLoadAware docstring.
-	//
-	// Mutex is separate from `mu` (the scheduler's main lock) because
-	// the hot path (handler-side IsInColdLoadEviction) takes RLock once
-	// per request and we don't want it to contend with scheduler
-	// state writes. Read-mostly; writes only fire on cold-load entry +
-	// exit (rare relative to request rate).
-	coldLoadEvictionMu sync.RWMutex
-	coldLoadEviction   map[string]struct{}
-
 	total inflight.Tracker
 }
 
@@ -192,8 +133,7 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		instances:     map[string]*schedInstance{},
 		waiters:       map[string]bool{},
 		wakeOps:       map[string]*wakeOp{},
-		coldLoadKicks:    map[string]bool{},
-		coldLoadFailures: map[string]coldLoadFailureRecord{},
+		coldLoadKicks: map[string]bool{},
 	}
 	s.total.OnChange = func(count int64) {
 		metrics.InFlightRequests.Set(float64(count))
@@ -715,7 +655,7 @@ func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstanc
 	// (port, power limits, GPU allocation all retained — wake will
 	// restore the instance without re-scheduling). On failure, fall
 	// through to the hard-stop path.
-	modelCfg, modelOk := liveModelCfg(s.cfg, inst.model)
+	modelCfg, modelOk := s.cfg.Models[inst.model]
 	if modelOk {
 		// Pinned + non-evicted = graceful shutdown of a model the operator
 		// declared as always-on. Leave it alone. Without this guard,

@@ -102,7 +102,7 @@ func (s *Scheduler) gpusForModel(modelName string) []int {
 	if s == nil || s.cfg == nil || modelName == "" {
 		return nil
 	}
-	mc, ok := liveModelCfg(s.cfg, modelName)
+	mc, ok := s.cfg.Models[modelName]
 	if !ok {
 		return nil
 	}

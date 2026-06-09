@@ -191,7 +191,7 @@ func TestStress_ConcurrentRequestWakes(t *testing.T) {
 	for _, m := range a.models {
 		switch m.State {
 		case admissionAwake:
-			expectedAwakeMB += m.ExpectedOn(0)
+			expectedAwakeMB += m.ExpectedVRAMMB
 		case admissionSleeping:
 			expectedResidualMB += m.L1ResidualMB
 		}
@@ -571,7 +571,7 @@ func TestStress_RandomOpsRace(t *testing.T) {
 	for _, m := range a.models {
 		switch m.State {
 		case admissionAwake:
-			expectedAwake += m.ExpectedOn(0)
+			expectedAwake += m.ExpectedVRAMMB
 		case admissionSleeping:
 			expectedResidual += m.L1ResidualMB
 		}

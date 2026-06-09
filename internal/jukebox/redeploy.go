@@ -165,7 +165,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 	if s.admission == nil {
 		return RedeployResult{}, fmt.Errorf("admission controller not configured; redeploy-member requires admission")
 	}
-	modelCfg, ok := liveModelCfg(s.cfg, name)
+	modelCfg, ok := s.cfg.Models[name]
 	if !ok {
 		return RedeployResult{}, ErrRedeployUnknownModel
 	}
@@ -223,7 +223,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 				// Already not awake (sleeping/stopped/etc.) — nothing to pause.
 				continue
 			}
-			peerCfg, ok := liveModelCfg(s.cfg, peer)
+			peerCfg, ok := s.cfg.Models[peer]
 			if !ok {
 				continue
 			}
@@ -306,7 +306,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 				// Already stopped — nothing to reclaim, nothing to do.
 				continue
 			}
-			peerCfg, ok := liveModelCfg(s.cfg, peer)
+			peerCfg, ok := s.cfg.Models[peer]
 			if !ok {
 				continue
 			}
@@ -539,21 +539,6 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 		// (f) Flip admission Stopped → Sleeping (residual back on books).
 		s.admission.NotifyStarted(name)
 
-		// HIGH-2: clear any prior cold-load failure cooldown for this
-		// model. The /admin/redeploy-member contract is "operator
-		// escape hatch — bypasses the cold-load failure cooldown". The
-		// REQUEST-PATH gate is already bypassed (RedeployMember never
-		// calls KickColdLoad), but if we leave the stale record in
-		// coldLoadFailures and the redeployed model later transitions
-		// Sleeping → Stopped (e.g. via stop-eviction) inside the
-		// original 30s cooldown window, the next request-triggered
-		// KickColdLoad would gate on a now-stale failure that the
-		// operator just resolved. Delete the entry on success so the
-		// post-redeploy state is fully clean.
-		s.mu.Lock()
-		delete(s.coldLoadFailures, name)
-		s.mu.Unlock()
-
 		// Mirror the post-cold-load state in the instance: the container
 		// is up and reporting is_sleeping=true, so flip the instance to
 		// StateSleeping so the next consumer request takes the wake path.
@@ -595,7 +580,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 				slog.Warn("redeploy_restore_pinned_peer_skipped", "peer", peer, "reason", "no instance")
 				continue
 			}
-			peerCfg, ok := liveModelCfg(s.cfg, peer)
+			peerCfg, ok := s.cfg.Models[peer]
 			if !ok {
 				continue
 			}
@@ -719,22 +704,15 @@ func (s *Scheduler) pinnedPeersInSwapGroup(name, swapGroup string) []string {
 
 // bestEffortRestorePinned wakes a list of previously-paused pinned
 // peers on a failure rollback path. Logs failures but does not return
-// them as errors — the caller is already reporting a different error.
-// Used so we don't leave pinned peers wedged Sleeping after we paused
-// them but failed the redeploy itself.
-//
-// Returns the list of peers we FAILED to re-wake. Callers that need to
-// surface this as a structural failure (e.g. the cold-load goroutine —
-// see ErrColdLoadPinnedWakeFailed in sleep.go) can act on the slice;
-// callers that already own their own error path (e.g. RedeployMember's
-// rollbacks) ignore it. Sorted-input order preserved.
+// them — the caller is already reporting a different error. Used so
+// we don't leave pinned peers wedged Sleeping after we paused them but
+// failed the redeploy itself.
 //
 // LOCK CONTRACT: this is called from inside RedeployMember's
 // WithColdLoadLock callback, so it MUST use performWakeFromInsideColdLoadLock —
 // the lock-aware wake variant — to avoid a coldLoadMu reentrancy
 // deadlock if a peer happens to be admissionStopped.
-func (s *Scheduler) bestEffortRestorePinned(ctx context.Context, paused []string) []string {
-	var failed []string
+func (s *Scheduler) bestEffortRestorePinned(ctx context.Context, paused []string) {
 	for _, peer := range paused {
 		s.mu.RLock()
 		peerInst := s.instances[peer]
@@ -742,16 +720,14 @@ func (s *Scheduler) bestEffortRestorePinned(ctx context.Context, paused []string
 		if peerInst == nil {
 			continue
 		}
-		peerCfg, ok := liveModelCfg(s.cfg, peer)
+		peerCfg, ok := s.cfg.Models[peer]
 		if !ok {
 			continue
 		}
 		if err := s.performWakeFromInsideColdLoadLock(ctx, peerInst, peerCfg, "redeploy-member-rollback"); err != nil {
 			slog.Warn("redeploy_rollback_restore_pinned_failed", "peer", peer, "err", err)
-			failed = append(failed, peer)
 		}
 	}
-	return failed
 }
 
 // drainInstance waits for in-flight requests on the instance to settle

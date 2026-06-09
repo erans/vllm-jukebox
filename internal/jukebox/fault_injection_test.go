@@ -450,29 +450,11 @@ models:
 	a.mu.Lock()
 	switch admState {
 	case admissionAwake:
-		// Snapshot BookedExpectedVRAMMB to match the awake booking so
-		// later markSleepingLocked / markStoppedLocked correctly reverse
-		// it. Mirrors the snapshot discipline that the production
-		// RequestWake awake-commit path uses.
-		m := a.models["moe"]
-		m.State = admissionAwake
-		booked := make(map[int]int, len(m.GPUs))
-		for _, g := range m.GPUs {
-			v := m.ExpectedOn(g)
-			a.awakeByGPU[g] += v
-			booked[g] = v
-		}
-		m.BookedExpectedVRAMMB = booked
+		a.awakeByGPU[0] += a.models["moe"].ExpectedVRAMMB
+		a.models["moe"].State = admissionAwake
 	case admissionSleeping:
-		m := a.models["moe"]
-		m.State = admissionSleeping
-		if m.L1ResidualMB > 0 {
-			for _, g := range m.GPUs {
-				a.l1ResidualByGPU[g] += m.L1ResidualMB
-			}
-			m.BookedL1ResidualMB = m.L1ResidualMB
-			m.BookedL1ResidualGPUs = append([]int(nil), m.GPUs...)
-		}
+		a.l1ResidualByGPU[0] += a.models["moe"].L1ResidualMB
+		a.models["moe"].State = admissionSleeping
 	}
 	a.mu.Unlock()
 
@@ -828,13 +810,11 @@ func TestFault_ContextCancelled_Mid_ColdLoad(t *testing.T) {
 	}
 
 	// Wait for docker start to be in flight, then cancel inbound.
-	// Budget 5s — the BUG 1 fix evicts pinned main (sleepInstance) before
-	// docker start, and sleepInstance pays a hardcoded 2s settleAfterSleep.
 	select {
 	case <-startEntered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		releaseStart <- struct{}{}
-		t.Fatalf("docker start did not fire within 5s")
+		t.Fatalf("docker start did not fire within 2s")
 	}
 	inboundCancel() // cancel the original inbound
 
@@ -1356,7 +1336,7 @@ models:
 	s.SeedInstanceForTest("moe", 8002, []int{0}, false, StateReady, mgr)
 
 	a.mu.Lock()
-	a.awakeByGPU[0] += a.models["moe"].ExpectedOn(0)
+	a.awakeByGPU[0] += a.models["moe"].ExpectedVRAMMB
 	a.models["moe"].State = admissionAwake
 	a.mu.Unlock()
 
@@ -1426,7 +1406,7 @@ func TestFault_WedgeRecovery_PreservesOriginalReason(t *testing.T) {
 	a.models["peer"] = &modelAdmissionState{
 		Name:           "peer",
 		GPUs:           []int{0},
-		ExpectedVRAMMB: map[int]int{0: 100},
+		ExpectedVRAMMB: 100,
 		L1ResidualMB:   0,
 		Priority:       config.PriorityNormal,
 		SwapGroup:      "g",
