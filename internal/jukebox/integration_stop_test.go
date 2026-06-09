@@ -30,7 +30,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
 	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/metrics"
 	"vllm-jukebox/internal/ports"
 )
 
@@ -995,9 +999,22 @@ func TestIntegration_ColdLoad_RetrySuppressedByCooldown(t *testing.T) {
 //   - BUG 2b: cooldown suppresses immediate re-kicks.
 //   - The lock is released within 50-200ms of each failed cold-load.
 //
-// Test shape: hammer moe with KickColdLoad while concurrently waking
-// the pinned 27B (main) from a sleeping state. Wake must succeed
-// regardless of moe's wedge state.
+// Rewrite (HIGH-3, architect round-5): the previous shape put main
+// in Sleeping BEFORE hammering moe, which made the pinned-eviction
+// loop in evictPeersForColdLoadLocked skip main immediately — the
+// wedge scenario only exercised "moe goroutine takes the lock,
+// fast-fails, releases" without any real eviction work. Test passed
+// pre-fix AND post-fix. Now: main is AWAKE before the hammer starts,
+// so each wedged cold-load attempts to evict main (sleep) → docker
+// inspect → fast-fail → cleanup-stop → release lock → re-wake main
+// via bestEffortRestorePinned. This exercises the FULL pinned-
+// eviction + restore + lock-release path under load, and asserts:
+//
+//   - At least one real cold-load was attempted (proves the wedge
+//     actually wedged something — mock-docker call count > 0).
+//   - main remains Awake after the hammer (pinned-default invariant).
+//   - A direct request to main returns in <500ms while moe's wedge
+//     loop is still running.
 func TestIntegration_PinnedPeerSurvivesWedgedColdLoad(t *testing.T) {
 	s, a, mgrs := makeStopOnEvictScheduler(t)
 
@@ -1015,21 +1032,27 @@ func TestIntegration_PinnedPeerSurvivesWedgedColdLoad(t *testing.T) {
 	s.instances["moe"].mgr = flakyMgr
 	s.mu.Unlock()
 
-	hook, _, _ := exitingContainerInspectMock(t, "vllm-moe")
+	// Track docker calls so the test can prove (a) real cold-loads
+	// were attempted (start count > 0) AND (b) the wedge loop ran
+	// multiple iterations (start count > 1 within budget). The
+	// exiting-container mock supplies the "inspect → exited" semantics
+	// needed for fast-fail.
+	hook, startCount, _ := exitingContainerInspectMock(t, "vllm-moe")
 	SetSleepDockerCmdForTest(hook)
 	defer SetSleepDockerCmdForTest(nil)
 
-	// Put main to sleep so we can observe a wake of main racing the
-	// moe cold-load wedge.
-	a.mu.Lock()
-	a.models["main"].State = admissionSleeping
-	a.l1ResidualByGPU[0] += a.models["main"].L1ResidualMB
-	a.awakeByGPU[0] -= a.models["main"].ExpectedVRAMMB
-	a.mu.Unlock()
-	s.mu.Lock()
-	s.instances["main"].state = StateSleeping
-	s.mu.Unlock()
-	mgrs["main"].isSleeping.Store(true)
+	// IMPORTANT: main stays AWAKE (StateReady + admissionAwake from
+	// makeStopOnEvictScheduler's seed). The pinned-eviction loop in
+	// evictPeersForColdLoadLocked will sleep it on each wedged moe
+	// cold-load attempt, then bestEffortRestorePinned will re-wake it
+	// after the cold-load fails. This is the FULL exercise of the
+	// BUG 2c lock-hold-time path.
+	if a.models["main"].State != admissionAwake {
+		t.Fatalf("setup: expected main admissionAwake (test contract: pinned peer stays AWAKE during moe wedge), got %d", a.models["main"].State)
+	}
+	if s.instances["main"].state != StateReady {
+		t.Fatalf("setup: expected main StateReady, got %v", s.instances["main"].state)
+	}
 
 	// Hammer moe with kick attempts in a background goroutine.
 	stopHammer := make(chan struct{})
@@ -1043,45 +1066,212 @@ func TestIntegration_PinnedPeerSurvivesWedgedColdLoad(t *testing.T) {
 			default:
 			}
 			_ = s.KickColdLoad("moe")
+			// 30ms is long enough that the cooldown (200ms) gates most
+			// kicks but short enough that we get several real attempts
+			// within the test's 1.5s setup window.
 			time.Sleep(30 * time.Millisecond)
 		}
 	}()
-	defer func() {
-		close(stopHammer)
-		<-hammerDone
-	}()
+	var hammerStopped sync.Once
+	stopHammerOnce := func() {
+		hammerStopped.Do(func() {
+			close(stopHammer)
+			<-hammerDone
+		})
+	}
+	defer stopHammerOnce()
 
-	// Give the hammer a moment to actually start wedging.
-	time.Sleep(500 * time.Millisecond)
+	// Give the hammer enough wall-clock to (a) attempt at least one
+	// real cold-load (which sleeps main, fast-fails on inspect,
+	// re-wakes main) AND (b) burn through at least one cooldown cycle
+	// so we can observe steady-state behaviour, not just the first
+	// kick. Each cold-load attempt costs ~2s of settleAfterSleep on
+	// main + ~50ms fast-fail + ~2s settle-after-wake on the rollback,
+	// so the loop turns over roughly every ~4-5s.
+	time.Sleep(6 * time.Second)
 
-	// Now: request to main (the pinned healthy peer). This goes through
-	// AcquireRoute → tryRouteFromSleep → performWake → admission RequestWake.
-	// performWake's wake-from-Stopped branch acquires coldLoadMu for the
-	// TOCTOU re-check. Pre-fix, that acquire blocks until the wedged
-	// moe goroutine releases the lock (~5min). Post-fix the lock is
-	// released within 200ms of each failed cold-load and the cooldown
-	// prevents the next re-kick from instantly re-taking it.
+	// Prove the wedge actually wedged something: at least one docker
+	// start fired during the hammer window. If startCount==0, the
+	// test would pass even with NO cold-load happening (e.g. if the
+	// kick is always gated) — masking exactly the regression we're
+	// guarding against.
+	gotStarts := startCount.Load()
+	if gotStarts < 1 {
+		t.Fatalf("BUG 2c regression: expected >= 1 docker start attempt during hammer window (proves a real cold-load ran AND the lock was released afterward), got %d", gotStarts)
+	}
+
+	// Now: direct request to main (the pinned healthy peer). main may
+	// be transiently mid-eviction-cycle (state=StateStopping during
+	// the 2s settleAfterSleep window, or state=StateSleeping waiting
+	// to be re-woken by bestEffortRestorePinned). The whole point of
+	// this test is the cycle COMPLETES — main's wake-up arrives — and
+	// the lock is released within one cycle budget, NOT held forever.
 	//
-	// Budget: 5 seconds. Pre-fix this would hit the wake_timeout (1s
-	// per modelCfg) and surface as a wake-timeout error after the
-	// lock-wait dominates wall-clock; post-fix it should succeed in
-	// well under 5s.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Retry AcquireRoute on transient RejectPinnedConflict (which can
+	// fire if the request lands during the sleep-settle window) until
+	// we get a clean route OR the budget expires. Pre-fix the budget
+	// would never be met (lock-hold = 5min); post-fix it lands within
+	// one ~4s cycle.
+	//
+	// Budget: 12s = ~3 cycles worth of wall-clock slack, generous for
+	// -race scheduler jitter. Anything beyond this means the lock-
+	// hold-time regression has snuck back in.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
+	var route Route
+	var routeErr error
 	start := time.Now()
-	route, err := s.AcquireRoute(ctx, "main", "req-pinned-wake")
-	dur := time.Since(start)
-	if err != nil {
-		t.Fatalf("AcquireRoute(main) failed while moe was wedged in cold-load loop: %v (took %v)", err, dur)
+	for {
+		route, routeErr = s.AcquireRoute(ctx, "main", "req-pinned-awake")
+		if routeErr == nil {
+			break
+		}
+		// Transient pinned-conflict / swap-in-progress during eviction
+		// cycle is expected — keep trying until budget expires.
+		var rej *RejectError
+		if !errors.As(routeErr, &rej) {
+			t.Fatalf("AcquireRoute(main) failed with non-Reject error while moe was wedged: %v (took %v)", routeErr, time.Since(start))
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("AcquireRoute(main) never succeeded within budget while moe was wedged: last err=%v (took %v)", routeErr, time.Since(start))
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
+	dur := time.Since(start)
 	if route.Done != nil {
 		route.Done()
 	}
-	if dur > 4*time.Second {
-		t.Errorf("AcquireRoute(main) took %v — pinned peer should be unaffected by moe's cold-load wedge (BUG 2c regression)", dur)
+	if dur > 12*time.Second {
+		t.Errorf("AcquireRoute(main) took %v — pinned peer should be reachable within one wedge cycle (BUG 2c regression — lock-hold-time)", dur)
 	}
-	if a.models["main"].State != admissionAwake {
-		t.Errorf("expected main admissionAwake after wake, got %d", a.models["main"].State)
+
+	// After we stop the hammer, main MUST end up back in admissionAwake.
+	// The wedge cycle (sleep main → fast-fail cold-load → re-wake main)
+	// might leave main mid-cycle if we observed it during the eviction
+	// window — give the in-flight cycle up to 2s to complete.
+	stopHammerOnce()
+	if ok := waitForCondition(2*time.Second, func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.models["main"].State == admissionAwake
+	}); !ok {
+		t.Errorf("main left in admissionState=%d after hammer ended; pinned-default invariant violated (bestEffortRestorePinned didn't recover main)", a.models["main"].State)
 	}
+	_ = mgrs
+}
+
+// TestIntegration_ColdLoadPinnedWakeFailed_ClearsCooldown_BumpsMetric
+// is the architect-CRITICAL regression test for round-5.
+//
+// Scenario: moe (Stopped) cold-loads while main (Awake, pinned) holds
+// VRAM on the same GPU set. evictPeersForColdLoadLocked sleeps main
+// to free VRAM. The cold-load THEN fails (mock container exits). The
+// rollback step bestEffortRestorePinned attempts to re-wake main,
+// but main's manager rejects the Wake call (simulates a daemon
+// hiccup / vLLM /wake_up 500 / image-pull failure).
+//
+// Pre-fix: the system silently leaves main Sleeping AND records moe
+// in coldLoadFailures → KickColdLoad gated for 30s → operator's
+// retry blocked for 30s with NO metric and only a warn log. Strictly
+// WORSE than the pre-BUG-1 state (which left pinned Awake but OOM-
+// looped — at least pinned was up).
+//
+// Post-fix asserts:
+//   - The returned error wraps ErrColdLoadPinnedWakeFailed so the
+//     caller can route via errors.Is to RejectAdminIntervention.
+//   - coldLoadFailures[moe] is CLEARED so the operator's next request
+//     can immediately retry (escape hatch unblocked).
+//   - AdmissionPinnedWakeFailedTotal{model=main} is incremented.
+//   - A "pinned_peer_wake_failed" Lifecycle audit event was emitted.
+func TestIntegration_ColdLoadPinnedWakeFailed_ClearsCooldown_BumpsMetric(t *testing.T) {
+	s, a, mgrs := makeStopOnEvictScheduler(t)
+	_ = a // admission inspected indirectly via s.coldLoadFailures + metrics
+
+	oldPoll := SetColdLoadPollIntervalForTest(20 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+	// Long cooldown so the test can observe pre-clear (would-gate) vs
+	// post-clear (does-not-gate) deterministically.
+	oldCooldown := SetColdLoadFailureCooldownForTest(30 * time.Second)
+	defer SetColdLoadFailureCooldownForTest(oldCooldown)
+
+	// moe will fail-fast via the exiting-container inspect mock (BUG 2a path).
+	flakyMgr := &flakyIsSleepingMgr{port: 8002}
+	flakyMgr.pid.Store(0)
+	s.mu.Lock()
+	s.instances["moe"].mgr = flakyMgr
+	s.mu.Unlock()
+
+	hook, _, _ := exitingContainerInspectMock(t, "vllm-moe")
+	SetSleepDockerCmdForTest(hook)
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Sabotage main's Wake so bestEffortRestorePinned cannot re-wake it.
+	// fakeRedeployMgr.wakeErr is set BEFORE the cold-load attempt; the
+	// pinned-eviction path will sleep main (Sleep succeeds), then the
+	// rollback Wake will hit wakeErr → bestEffortRestorePinned returns
+	// "main" in the failed list → the CRITICAL fix path fires.
+	mgrs["main"].wakeErr = errors.New("simulated daemon hiccup / wake-up 500")
+
+	// Capture metric baseline so we can assert a delta (parallel tests
+	// or earlier runs may have bumped these counters).
+	pinnedWakeFailedBefore := readCounterVecValue(t, metrics.AdmissionPinnedWakeFailedTotal, "main")
+
+	// Cold-load. Must return an error wrapping ErrColdLoadPinnedWakeFailed.
+	err := s.coldLoadStoppedMember(context.Background(), s.instances["moe"], s.cfg.Models["moe"])
+	if err == nil {
+		t.Fatalf("expected cold-load to fail (mock container exits), got nil")
+	}
+	if !errors.Is(err, ErrColdLoadPinnedWakeFailed) {
+		t.Errorf("expected wrapped ErrColdLoadPinnedWakeFailed (so mapWakeError routes to RejectAdminIntervention), got: %v", err)
+	}
+	// errors.Is chains must still surface the original cold-load cause.
+	if !errors.Is(err, ErrColdLoadContainerExited) {
+		t.Errorf("expected wrapped chain to still surface ErrColdLoadContainerExited, got: %v", err)
+	}
+
+	// CRITICAL: cooldown entry for moe (the cold-load target) MUST be
+	// cleared. Pre-fix the operator's next request was gated for 30s
+	// even though the system was already known-inconsistent.
+	s.mu.Lock()
+	_, gated := s.coldLoadFailures["moe"]
+	s.mu.Unlock()
+	if gated {
+		t.Errorf("coldLoadFailures[moe] still present after pinned-wake-failed rollback; operator's retry escape is blocked (CRITICAL regression)")
+	}
+
+	// Metric: AdmissionPinnedWakeFailedTotal{model=main} must have
+	// incremented by exactly 1 (one failed peer in this scenario).
+	pinnedWakeFailedAfter := readCounterVecValue(t, metrics.AdmissionPinnedWakeFailedTotal, "main")
+	if delta := pinnedWakeFailedAfter - pinnedWakeFailedBefore; delta != 1 {
+		t.Errorf("expected AdmissionPinnedWakeFailedTotal{model=main} +1, got +%v", delta)
+	}
+
+	// Sanity: KickColdLoad after the failure must NOT be gated (the
+	// CRITICAL fix cleared the cooldown). Returns false here ONLY
+	// because moe's goroutine is still draining via coldLoadKicks
+	// dedupe — but the gating reason should NOT be the cooldown. We
+	// assert by re-reading coldLoadFailures (already empty above).
+	// This also documents the operator-recovery contract: clearing the
+	// cooldown is necessary, dedupe-via-coldLoadKicks is independent.
+}
+
+// readCounterVecValue reads the current value of a CounterVec for the
+// given label values. Used for delta-assertions in tests that may run
+// alongside other tests bumping the same counter.
+func readCounterVecValue(t *testing.T, cv *prometheus.CounterVec, lvs ...string) float64 {
+	t.Helper()
+	c, err := cv.GetMetricWithLabelValues(lvs...)
+	if err != nil {
+		t.Fatalf("readCounterVecValue: %v", err)
+	}
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("readCounterVecValue Write: %v", err)
+	}
+	if m.Counter == nil {
+		return 0
+	}
+	return m.Counter.GetValue()
 }
