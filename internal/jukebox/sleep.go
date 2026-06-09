@@ -1,7 +1,9 @@
 package jukebox
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -364,6 +366,38 @@ func (s *Scheduler) KickColdLoad(name string) bool {
 		s.mu.Unlock()
 		return false
 	}
+	// Cooldown gate (BUG 2b): if the most recent cold-load failure for
+	// this model is within coldLoadFailureCooldown, suppress this kick.
+	// Without this, a member-container that exits(1) at worker init
+	// (e.g. OOM) gets re-kicked instantly on every inbound request —
+	// the kick re-acquires the GPU-set lock, re-runs the doomed docker
+	// start, and the loop wedges the lock so healthy peers can't be
+	// woken. The cooldown is per-model and self-clearing: once the
+	// window elapses, the next kick fires unconditionally. Operators
+	// can force-recover via /admin/redeploy-member which does not
+	// consult this map.
+	if rec, ok := s.coldLoadFailures[name]; ok {
+		cooldown := coldLoadFailureCooldownDuration()
+		if s.now().Sub(rec.at) < cooldown {
+			s.mu.Unlock()
+			slog.Warn("async_cold_load_suppressed_cooldown",
+				"model", name,
+				"last_failure_age_ms", s.now().Sub(rec.at).Milliseconds(),
+				"cooldown_ms", cooldown.Milliseconds(),
+				"last_err", rec.err,
+			)
+			LogLifecycleTransition(LifecycleEvent{
+				Action: LifecycleColdLoad,
+				Model:  name,
+				Reason: "retry_suppressed_cooldown",
+				GPUs:   s.gpusForModel(name),
+			})
+			return false
+		}
+		// Cooldown expired — clear the stale record so future failures
+		// don't compare against ancient timestamps.
+		delete(s.coldLoadFailures, name)
+	}
 	s.coldLoadKicks[name] = true
 	s.mu.Unlock()
 
@@ -423,6 +457,23 @@ func (s *Scheduler) KickColdLoad(name string) bool {
 				"model", name,
 				"err", err,
 			)
+			// BUG 2b: record failure timestamp so subsequent KickColdLoad
+			// invocations within coldLoadFailureCooldown short-circuit
+			// instead of re-firing a doomed docker start that wedges the
+			// GPU-set lock. Cleared in the success path (just below the
+			// defer above is too early — the cold-load may not have
+			// completed yet; we use the success branch in
+			// coldLoadStoppedMemberLocked instead. The asymmetry is
+			// fine: failure-record is set here; success-record is the
+			// absence of an entry. coldLoadStoppedMemberLocked deletes
+			// any stale failure entry on success so the model is
+			// immediately re-kickable if it stops again later.)
+			s.mu.Lock()
+			s.coldLoadFailures[name] = coldLoadFailureRecord{
+				at:  s.now(),
+				err: err.Error(),
+			}
+			s.mu.Unlock()
 		}
 	}()
 	return true
@@ -483,6 +534,175 @@ func (s *Scheduler) coldLoadStoppedMember(ctx context.Context, inst *schedInstan
 	return coldLoadErr
 }
 
+// evictPeersForColdLoadLocked is the cold-load equivalent of
+// RedeployMember steps (a) + (a2): before docker-starting the target
+// member, sleep any awake pinned peer in the same swap_group and stop
+// any overlapping evict_action:stop peer. Without this step, a
+// request-triggered cold-load would race for VRAM with the resident
+// peer that holds the GPUs and OOM at worker init.
+//
+// Live-observed (2026-06-09): request to STOPPED vllm-moe arrived
+// while pinned vllm-main (27B) held the GPUs awake. `docker start
+// vllm-moe` returned 0, but vLLM hit:
+//
+//	ValueError: Free memory on device cuda:2 (5.31/23.56 GiB) on
+//	startup is less than desired GPU memory utilization (0.8, 18.85 GiB)
+//
+// and the container exited(1). The fix is to evict the resident peer
+// FIRST so the cold-load sees the free VRAM it needs.
+//
+// LOCK CONTRACT: caller MUST hold coldLoadMu (we're already inside
+// coldLoadStoppedMemberLocked's WithColdLoadLock callback). The
+// per-peer sleepInstance call internally uses sleepInstance's own
+// state machine — it does NOT acquire coldLoadMu, so this is safe.
+//
+// Returns:
+//   - slept: pinned peers we just slept (caller stores for telemetry)
+//   - stopped: stop-mode peers we just stopped (caller stores for telemetry)
+//   - err: non-nil if a step failed in a way that should abort the
+//     cold-load. Best-effort failures (e.g. a peer's sleep flaked) are
+//     logged but do NOT return an error — the doColdLoad call will
+//     surface the VRAM-shortage failure cleanly if we couldn't free
+//     enough.
+//
+// Symmetric with RedeployMember (which evicts on operator request);
+// the redeploy path keeps its own inline implementation for now to
+// preserve its existing rollback semantics (restoring pinned peers
+// on mid-sequence failure, populating RedeployResult, etc.). Both
+// paths share evictStopPeersInSwapGroupOverlapping +
+// pinnedPeersInSwapGroup for peer selection.
+func (s *Scheduler) evictPeersForColdLoadLocked(ctx context.Context, name string, modelCfg config.ModelConfig) (slept, stopped []string) {
+	// (a) Sleep awake pinned peers in the same swap_group. Pinned peers
+	// use evict_action: sleep by contract (validator enforces this),
+	// so we use sleepInstance — same path the admission evictor uses
+	// when it picks a pinned peer as a victim.
+	pinnedPeers := s.pinnedPeersInSwapGroup(name, modelCfg.SwapGroup)
+	for _, peer := range pinnedPeers {
+		s.mu.RLock()
+		peerInst := s.instances[peer]
+		s.mu.RUnlock()
+		if peerInst == nil {
+			continue
+		}
+		if peerInst.state != StateReady {
+			// Already not awake — nothing to evict here.
+			continue
+		}
+		peerCfg, ok := s.cfg.Models[peer]
+		if !ok {
+			continue
+		}
+		slog.Info("cold_load_evicting_pinned_peer",
+			"target", name, "peer", peer, "container", peerCfg.Host,
+		)
+		// Reason "cold-load-host" mirrors redeploy's "redeploy-member-host".
+		// Does NOT trigger admission's auto-restore (that's reason="idle").
+		if err := s.sleepInstance(ctx, peerInst, peerCfg.EffectiveSleepLevel(), "cold-load-host"); err != nil {
+			// Best-effort: log and continue. The subsequent docker start
+			// will OOM cleanly if we couldn't free enough VRAM; better
+			// to surface that as the cold-load failure (which routes
+			// through the existing rollback path) than to fail here and
+			// leave admission with a half-evicted peer.
+			slog.Warn("cold_load_evict_pinned_peer_failed",
+				"target", name, "peer", peer, "err", err,
+			)
+			continue
+		}
+		slept = append(slept, peer)
+	}
+
+	// (a2) Stop overlapping evict_action: stop peers. Slept-L1 peers
+	// leave ~1.5-2.2 GiB resident per GPU; on a tight 24 GiB GPU, a
+	// stack of those is enough to OOM the cold-load. Mirrors the
+	// equivalent loop in RedeployMember.
+	stopPeers := s.evictStopPeersInSwapGroupOverlapping(name, modelCfg)
+	for _, peer := range stopPeers {
+		if err := ctx.Err(); err != nil {
+			return slept, stopped
+		}
+		s.mu.RLock()
+		peerInst := s.instances[peer]
+		var peerState State
+		if peerInst != nil {
+			peerState = peerInst.state
+		}
+		s.mu.RUnlock()
+		if peerInst == nil {
+			continue
+		}
+		if peerState == StateStopped {
+			// Already stopped — nothing to reclaim.
+			continue
+		}
+		peerCfg, ok := s.cfg.Models[peer]
+		if !ok {
+			continue
+		}
+		if peerCfg.Host == "" {
+			continue
+		}
+		// Skip slept-L1 peers that contribute zero residual — stopping
+		// them would free nothing and only add wall-clock + a docker
+		// stop call. This narrows the cold-load's eviction footprint
+		// to peers that are ACTUALLY holding VRAM (either awake or
+		// slept-with-non-zero residual). Live-observed (2026-06-09)
+		// the OOM was driven by 27B awake (~12GB), not by zero-residual
+		// siblings. Belt-and-suspenders against a runaway eviction
+		// cascade in swap-groups whose members all configure
+		// sleep_l1_residual_mb: 0.
+		if peerState == StateSleeping && peerCfg.SleepL1ResidualMB == 0 {
+			slog.Info("cold_load_skip_zero_residual_peer",
+				"target", name, "peer", peer, "peer_state", peerState,
+			)
+			continue
+		}
+		slog.Info("cold_load_stopping_evict_peer",
+			"target", name, "peer", peer, "container", peerCfg.Host,
+			"peer_state", peerState,
+		)
+		// Drain in-flight on the peer (best-effort, bounded) so SIGTERM
+		// doesn't abort live generation.
+		s.drainInstance(ctx, peerInst)
+		// docker stop FIRST, then mutate admission/state on success
+		// (mirrors redeploy's MEDIUM-#4 ordering — see redeploy.go
+		// comment "TOCTOU sub-window fix" for the rationale).
+		peerStopCtx, peerStopCancel := context.WithTimeout(ctx, 90*time.Second)
+		peerStopOut, peerStopErr := runSleepDocker(peerStopCtx, "docker", "stop", "-t", "60", peerCfg.Host)
+		peerStopCancel()
+		s.mu.Lock()
+		peerInst.draining = false
+		s.mu.Unlock()
+		if peerStopErr != nil {
+			slog.Error("cold_load_evict_peer_stop_failed",
+				"target", name, "peer", peer, "container", peerCfg.Host,
+				"err", peerStopErr, "output", string(peerStopOut),
+			)
+			LogLifecycleTransition(LifecycleEvent{
+				Action: LifecycleEvict,
+				Model:  peer,
+				Reason: "stop-failed-vram-drift-risk",
+				GPUs:   s.gpusForModel(peer),
+			})
+			metrics.AdmissionVRAMDriftRiskTotal.WithLabelValues(peer).Inc()
+			continue
+		}
+		// docker stop succeeded — flip admission + state in one short
+		// critical section.
+		s.admission.NotifyStopped(peer)
+		s.mu.Lock()
+		peerInst.state = StateStopped
+		s.mu.Unlock()
+		LogLifecycleTransition(LifecycleEvent{
+			Action: LifecycleEvict,
+			Model:  peer,
+			Reason: "cold-load-peer-stop",
+			GPUs:   s.gpusForModel(peer),
+		})
+		stopped = append(stopped, peer)
+	}
+	return slept, stopped
+}
+
 // coldLoadStoppedMemberLocked is the lock-free body of
 // coldLoadStoppedMember: it runs the TOCTOU re-check + docker start +
 // /is_sleeping poll + best-effort cleanup, but assumes the global
@@ -510,7 +730,38 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 		"container", container,
 		"timeout", startPeriod,
 	)
+	// BUG 1: evict swap-group peers BEFORE starting the new member.
+	// Without this, the request-triggered cold-load races for VRAM
+	// with the resident pinned peer (live-observed 2026-06-09: moe
+	// OOM'd at worker init because main held the GPUs awake). The
+	// redeploy-member CLI verb already does this; the request-
+	// triggered cold-load path was missing it.
+	//
+	// sleepInstance settles internally (settleAfterSleep) per peer
+	// sleep, so we don't need to add another settle here. The docker-
+	// stop path doesn't settle, but `docker stop -t 60` already gives
+	// vLLM up to 60s of SIGTERM grace before SIGKILL — long enough
+	// for the CUDA context to fully tear down before we proceed.
+	slept, stopped := s.evictPeersForColdLoadLocked(ctx, inst.model, modelCfg)
+	if len(slept) > 0 || len(stopped) > 0 {
+		slog.Info("cold_load_peer_eviction_complete",
+			"model", inst.model,
+			"slept_pinned", slept,
+			"stopped_peers", stopped,
+		)
+	}
 	if err := s.doColdLoad(ctx, inst, container, startPeriod); err != nil {
+		// BUG 1 rollback: any pinned peers we slept to free VRAM for
+		// the (now-failed) cold-load must be re-woken so we don't
+		// leave the operator with the pinned default down. We're
+		// inside WithColdLoadLock — bestEffortRestorePinned uses
+		// performWakeFromInsideColdLoadLock internally so coldLoadMu
+		// reentrancy is avoided. Stop-mode peers we stopped are
+		// intentionally LEFT stopped: they were rarely-woken
+		// evict_action: stop members and the async-503
+		// wake-from-Stopped path is the right shape (matches
+		// RedeployMember step h).
+		s.bestEffortRestorePinned(ctx, slept)
 		// Best-effort cleanup: stop the half-loaded container so the
 		// admission-Stopped state and the actual container state stay
 		// consistent.
@@ -584,6 +835,9 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 	// flip in RedeployMember step (f).
 	s.mu.Lock()
 	inst.state = StateSleeping
+	// BUG 2b: clear any stale failure record so a future Stop → Kick
+	// cycle is not gated by an ancient failure timestamp.
+	delete(s.coldLoadFailures, inst.model)
 	s.mu.Unlock()
 	dur := s.now().Sub(coldLoadStart)
 	slog.Info("cold_load_succeeded",
@@ -599,6 +853,67 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 		Duration: dur,
 	})
 	return nil
+}
+
+// ErrColdLoadContainerExited is returned by doColdLoad when the
+// member container's docker state is "exited" or "dead" during the
+// post-start poll. Surfaces a fast failure instead of waiting the
+// full cold_load_timeout for /is_sleeping to return — the HTTP probe
+// against a non-running container hits docker-DNS NXDOMAIN (only
+// running containers resolve), and the HTTP client cannot distinguish
+// "DNS not ready yet" from "container is gone" so it retries up to
+// its full timeout. The inspect probe gives us authoritative truth
+// from the docker daemon in ~50ms regardless of DNS state.
+//
+// Live-observed (2026-06-09): moe container OOM'd at worker init and
+// exited(1). /is_sleeping HTTP probes got DNS NXDOMAIN; doColdLoad
+// waited the full 5min cold-load timeout before failing, and the
+// failure re-kicked the cold-load — infinite OOM/retry loop holding
+// the GPU-set lock and starving Sparx.
+var ErrColdLoadContainerExited = errors.New("cold-load container exited")
+
+// containerState is the subset of `docker inspect` fields jukebox cares
+// about for the cold-load fast-fail probe. JSON unmarshaling drops
+// every other field. Stored as a struct (not just a string) so future
+// signals (ExitCode, OOMKilled, RestartCount) are easy to add.
+type containerState struct {
+	Status     string // "created" | "running" | "paused" | "restarting" | "removing" | "exited" | "dead"
+	ExitCode   int
+	OOMKilled  bool
+	Error      string
+	StartedAt  string
+	FinishedAt string
+}
+
+// inspectContainerState returns the docker-daemon-reported state of
+// `container`. Used by doColdLoad's poll loop (BUG 2a) to fast-fail
+// when the member container has exited rather than waiting the full
+// cold-load timeout on an HTTP probe that cannot succeed.
+//
+// Implementation: shells out via runSleepDocker (same hook the rest
+// of sleep.go uses — tests inject a fake). Uses `docker inspect -f
+// '{{json .State}}'` so the parse target is narrow and stable across
+// docker versions.
+//
+// Returns (state, nil) on success. Returns (_, err) wrapping the
+// underlying docker error on failure (container missing, daemon
+// unreachable, malformed JSON). Callers in the cold-load path should
+// log the error and continue polling — a transient docker daemon
+// hiccup is not a reason to fail the cold-load.
+func inspectContainerState(ctx context.Context, container string) (containerState, error) {
+	out, err := runSleepDocker(ctx, "docker", "inspect", "-f", "{{json .State}}", container)
+	if err != nil {
+		return containerState{}, fmt.Errorf("docker inspect %q: %w (output: %s)", container, err, string(out))
+	}
+	var st containerState
+	// Trim trailing newline that docker inspect emits — json.Unmarshal
+	// tolerates it but doing the trim explicitly keeps the parse
+	// failure messages clean.
+	trimmed := bytes.TrimSpace(out)
+	if err := json.Unmarshal(trimmed, &st); err != nil {
+		return containerState{}, fmt.Errorf("docker inspect %q: parse state: %w (output: %s)", container, err, string(trimmed))
+	}
+	return st, nil
 }
 
 // doColdLoad runs `docker start <container>` (re-using the existing
@@ -646,6 +961,47 @@ func (s *Scheduler) doColdLoad(ctx context.Context, inst *schedInstance, contain
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(pollInterval):
+		}
+		// BUG 2a: fast-fail probe — before issuing the /is_sleeping HTTP
+		// request (which goes through docker's embedded DNS and cannot
+		// distinguish "container not running yet" from "container exited
+		// permanently"), ask the docker daemon directly. If the container
+		// is exited/dead, return ErrColdLoadContainerExited immediately
+		// instead of waiting the full cold-load timeout on a doomed
+		// HTTP poll. Avoids the live-observed 5-minute wedge that held
+		// the GPU-set cold-load lock and starved Sparx (2026-06-09).
+		//
+		// Inspect failures are logged but non-fatal — we fall through to
+		// the HTTP poll. A transient docker daemon hiccup shouldn't
+		// abort an otherwise-healthy cold-load.
+		inspectCtx, inspectCancel := context.WithTimeout(ctx, 3*time.Second)
+		st, inspectErr := inspectContainerState(inspectCtx, container)
+		inspectCancel()
+		if inspectErr == nil {
+			switch st.Status {
+			case "exited", "dead":
+				slog.Error("cold_load_container_exited_fast_fail",
+					"model", inst.model,
+					"container", container,
+					"status", st.Status,
+					"exit_code", st.ExitCode,
+					"oom_killed", st.OOMKilled,
+					"docker_error", st.Error,
+					"started_at", st.StartedAt,
+					"finished_at", st.FinishedAt,
+				)
+				return fmt.Errorf("%w: container %q is in state %q (exit_code=%d oom_killed=%v): %s",
+					ErrColdLoadContainerExited, container, st.Status, st.ExitCode, st.OOMKilled, st.Error)
+			}
+			// "created", "running", "paused", "restarting", "removing" —
+			// all valid in-flight states; fall through to the /is_sleeping
+			// probe to determine model-load progress.
+		} else {
+			slog.Warn("cold_load_inspect_probe_failed_continuing",
+				"model", inst.model,
+				"container", container,
+				"err", inspectErr,
+			)
 		}
 		probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
 		isSleeping, err := sc.IsSleeping(probeCtx)
