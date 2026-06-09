@@ -142,7 +142,7 @@ func (s *Scheduler) SetAdmission(a *AdmissionController) {
 				slog.Warn("swap_group_auto_restore_skipped", "model", name, "reason", "no instance registered")
 				return
 			}
-			modelCfg, ok := s.cfg.Models[name]
+			modelCfg, ok := liveModelCfg(s.cfg, name)
 			if !ok {
 				slog.Warn("swap_group_auto_restore_skipped", "model", name, "reason", "no model config")
 				return
@@ -174,7 +174,7 @@ func (e *SchedulerEvictor) SleepForEviction(ctx context.Context, victim, reason 
 	if inst == nil {
 		return fmt.Errorf("scheduler evictor: victim %q not registered", victim)
 	}
-	modelCfg, ok := e.S.cfg.Models[victim]
+	modelCfg, ok := liveModelCfg(e.S.cfg, victim)
 	if !ok {
 		return fmt.Errorf("scheduler evictor: victim %q config missing", victim)
 	}
@@ -223,7 +223,7 @@ func (e *SchedulerEvictor) StopForEviction(ctx context.Context, victim, reason s
 	if inst == nil {
 		return fmt.Errorf("scheduler evictor: victim %q not registered", victim)
 	}
-	modelCfg, ok := e.S.cfg.Models[victim]
+	modelCfg, ok := liveModelCfg(e.S.cfg, victim)
 	if !ok {
 		return fmt.Errorf("scheduler evictor: victim %q config missing", victim)
 	}
@@ -353,7 +353,7 @@ func (s *Scheduler) KickColdLoad(name string) bool {
 	if !a.IsStopped(name) {
 		return false
 	}
-	modelCfg, ok := s.cfg.Models[name]
+	modelCfg, ok := liveModelCfg(s.cfg, name)
 	if !ok {
 		return false
 	}
@@ -623,7 +623,7 @@ func (s *Scheduler) evictPeersForColdLoadLocked(ctx context.Context, name string
 			// Already not awake — nothing to evict here.
 			continue
 		}
-		peerCfg, ok := s.cfg.Models[peer]
+		peerCfg, ok := liveModelCfg(s.cfg, peer)
 		if !ok {
 			continue
 		}
@@ -669,7 +669,7 @@ func (s *Scheduler) evictPeersForColdLoadLocked(ctx context.Context, name string
 			// Already stopped — nothing to reclaim.
 			continue
 		}
-		peerCfg, ok := s.cfg.Models[peer]
+		peerCfg, ok := liveModelCfg(s.cfg, peer)
 		if !ok {
 			continue
 		}
@@ -1660,7 +1660,7 @@ func (s *Scheduler) bestEffortRestoreVictims(ctx context.Context, victims []stri
 	}
 	for _, v := range victims {
 		victim := v
-		victimCfg, ok := s.cfg.Models[victim]
+		victimCfg, ok := liveModelCfg(s.cfg, victim)
 		if !ok {
 			slog.Warn("wake_rollback_victim_no_config", "victim", victim, "target", targetModel)
 			continue
@@ -1822,7 +1822,7 @@ func (s *Scheduler) RegisterExternalInstances(ctx context.Context) error {
 			// endpoint exists at all).
 			var sleeping bool
 			var sleepProbeOK bool
-			modelCfg, hasCfg := s.cfg.Models[p.name]
+			modelCfg, hasCfg := liveModelCfg(s.cfg, p.name)
 			if hasCfg && modelCfg.SleepMode {
 				inner.Add(1)
 				go func() {
@@ -2043,7 +2043,7 @@ func (s *Scheduler) checkIdle(ctx context.Context) {
 	s.mu.RUnlock()
 
 	for _, inst := range candidates {
-		modelCfg, ok := s.cfg.Models[inst.model]
+		modelCfg, ok := liveModelCfg(s.cfg, inst.model)
 		if !ok || !modelCfg.SleepMode {
 			continue
 		}
@@ -2157,7 +2157,7 @@ func (c *Coordinator) performWake(ctx context.Context, requestID string, done ch
 	current := c.currentModel
 	c.mu.Unlock()
 
-	_, modelCfg, err := c.cfg.ResolveModel(current)
+	_, modelCfg, err := liveResolveModel(c.cfg, current)
 	if err != nil {
 		select {
 		case done <- err:
@@ -2245,7 +2245,7 @@ func (c *Coordinator) checkIdle(ctx context.Context) {
 	if c.tr != nil && c.tr.Count() > 0 {
 		return
 	}
-	modelCfg, ok := c.cfg.Models[current]
+	modelCfg, ok := liveModelCfg(c.cfg, current)
 	if !ok || !modelCfg.SleepMode || modelCfg.IdleTimeout.Duration <= 0 {
 		return
 	}

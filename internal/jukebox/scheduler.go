@@ -694,7 +694,7 @@ func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstanc
 	// (port, power limits, GPU allocation all retained — wake will
 	// restore the instance without re-scheduling). On failure, fall
 	// through to the hard-stop path.
-	modelCfg, modelOk := s.cfg.Models[inst.model]
+	modelCfg, modelOk := liveModelCfg(s.cfg, inst.model)
 	if modelOk {
 		// Pinned + non-evicted = graceful shutdown of a model the operator
 		// declared as always-on. Leave it alone. Without this guard,
