@@ -10,6 +10,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/jukebox"
 	"vllm-jukebox/internal/proxy"
 )
@@ -31,7 +32,13 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		c.Locals(requestedModelLocal, modelName)
 
 		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
-		_, _, err = opts.Config.ResolveModel(modelName)
+		// Resolve against the live config so a mid-flight active.yaml
+		// reload that adds / removes a model is reflected immediately.
+		liveCfg := config.Current()
+		if liveCfg == nil {
+			liveCfg = opts.Config
+		}
+		_, _, err = liveCfg.ResolveModel(modelName)
 		if err != nil {
 			return writeOpenAIError(
 				c,

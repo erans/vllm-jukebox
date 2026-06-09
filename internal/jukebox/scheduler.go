@@ -180,6 +180,32 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 	return s
 }
 
+// OnConfigReloaded is wired into the active.yaml hot-reload observer
+// (main.go's config.Watch callback). It propagates the new config
+// view to subsystems that hold per-construction caches the fsnotify
+// atomic pointer swap alone cannot reach — today that is exclusively
+// the AdmissionController's per-model state map.
+//
+// Most per-model fields (cold_load_timeout, evict_action, pinned,
+// swap_group, ...) are read via liveModelCfg() at decision time and
+// pick up changes automatically; only the AdmissionController carries
+// a pre-built per-model record that must be reconciled when the
+// operator adds/removes a model or flips its pinned/group membership.
+//
+// Safe to call concurrently with admission decisions; the controller
+// re-acquires its own mutex.
+func (s *Scheduler) OnConfigReloaded(cfg *config.Config) {
+	if s == nil || cfg == nil {
+		return
+	}
+	s.mu.RLock()
+	a := s.admission
+	s.mu.RUnlock()
+	if a != nil {
+		a.RefreshConfig(cfg)
+	}
+}
+
 func (s *Scheduler) Status() Status {
 	now := s.now()
 	s.mu.RLock()
@@ -284,7 +310,7 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 		return Route{}, fmt.Errorf("scheduler not configured")
 	}
 
-	resolvedName, modelCfg, err := s.cfg.ResolveModel(requestedModel)
+	resolvedName, modelCfg, err := liveResolveModel(s.cfg, requestedModel)
 	if err != nil {
 		return Route{}, err
 	}
@@ -668,7 +694,7 @@ func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstanc
 	// (port, power limits, GPU allocation all retained — wake will
 	// restore the instance without re-scheduling). On failure, fall
 	// through to the hard-stop path.
-	modelCfg, modelOk := s.cfg.Models[inst.model]
+	modelCfg, modelOk := liveModelCfg(s.cfg, inst.model)
 	if modelOk {
 		// Pinned + non-evicted = graceful shutdown of a model the operator
 		// declared as always-on. Leave it alone. Without this guard,
