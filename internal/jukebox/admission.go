@@ -179,9 +179,14 @@ type AdmissionStopper interface {
 
 // admissionModelState is the controller's view of one model.
 type modelAdmissionState struct {
-	Name            string
-	GPUs            []int
-	ExpectedVRAMMB  int
+	Name string
+	GPUs []int
+	// ExpectedVRAMMB is the model's awake VRAM footprint, keyed by GPU.
+	// Populated from ModelConfig.EffectiveExpectedVRAMMB(gpu) at controller
+	// construction so downstream bookkeeping never has to know whether the
+	// source was a flat scalar or a per-GPU map. Every GPU in `GPUs` has
+	// an entry.
+	ExpectedVRAMMB  map[int]int
 	L1ResidualMB    int
 	Priority        string
 	Pinned          bool
@@ -189,6 +194,17 @@ type modelAdmissionState struct {
 	EvictAction     string // config.EvictActionSleep | config.EvictActionStop
 	State           admissionModelState
 	LastRequestTime time.Time
+}
+
+// ExpectedOn returns the model's awake VRAM footprint on the given GPU.
+// Defensive default of 0 when the GPU isn't in the model's map (which the
+// config validator prevents in production but keeps tests that hand-craft
+// states from panicking).
+func (m *modelAdmissionState) ExpectedOn(gpu int) int {
+	if v, ok := m.ExpectedVRAMMB[gpu]; ok {
+		return v
+	}
+	return 0
 }
 
 type admissionModelState int
@@ -225,6 +241,108 @@ func (a *AdmissionController) SetEvictor(evictor AdmissionEvictor) {
 	a.evictor = evictor
 }
 
+// RefreshConfig reconciles the controller's per-model state records
+// against a freshly-loaded config (e.g. after an fsnotify hot-reload
+// of active.yaml). Used by Scheduler.OnConfigReloaded to keep per-model
+// admission decisions in sync with the operator-edited config without
+// requiring a process restart.
+//
+// Grandfathering — IMPORTANT: live per-GPU bookkeeping (awakeByGPU,
+// l1ResidualByGPU, pinnedByGPU) is NOT recomputed against the new
+// config. A model that was already awake stays booked at its
+// ORIGINAL ExpectedVRAMMB on the per-GPU maps; the NEW
+// ExpectedVRAMMB applies only to the next admission decision involving
+// this model (e.g. a future wake after a sleep/stop). Same for
+// SleepL1ResidualMB. This avoids retroactively rewriting bookkeeping
+// for in-flight states (which would risk negative balances and
+// inconsistent eviction math mid-decision).
+//
+// Adding a model that wasn't admission-tracked before: registered with
+// zero current bookkeeping; it is admissionUnknown until the next
+// scheduler-observed lifecycle event (wake / sleep / stop).
+// Removing a model that WAS tracked: dropped from the controller's
+// view; any stale bookings on the per-GPU maps are NOT clawed back
+// (would risk a negative balance on a GPU shared with another
+// tracked peer). The next time that GPU's awake set is rebuilt from
+// scratch (process restart) the stale entry is gone.
+//
+// Field-by-field per-model refresh:
+//   - GPUs               replaced
+//   - ExpectedVRAMMB     replaced (grandfathered booking)
+//   - L1ResidualMB       replaced (grandfathered booking)
+//   - Priority           replaced (Pinned still forces critical)
+//   - Pinned             replaced
+//   - SwapGroup          replaced
+//   - EvictAction        replaced
+//
+// State / LastRequestTime are preserved across refresh.
+func (a *AdmissionController) RefreshConfig(cfg *config.Config) {
+	if a == nil || cfg == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	seen := map[string]bool{}
+	for name, m := range cfg.Models {
+		if !m.AdmissionEnabled() {
+			continue
+		}
+		seen[name] = true
+		existing, ok := a.models[name]
+		if !ok {
+			// Newly-admission-tracked model. Register with zero
+			// bookkeeping; lifecycle observers (NotifyStarted /
+			// NotifySleep / NotifyStopped) will transition it.
+			expected := make(map[int]int, len(m.GPUs))
+			for _, g := range m.GPUs {
+				expected[g] = m.EffectiveExpectedVRAMMB(g)
+			}
+			st := &modelAdmissionState{
+				Name:           name,
+				GPUs:           append([]int(nil), m.GPUs...),
+				ExpectedVRAMMB: expected,
+				L1ResidualMB:   m.SleepL1ResidualMB,
+				Priority:       m.EffectivePriority(),
+				Pinned:         m.Pinned != nil && *m.Pinned,
+				SwapGroup:      m.SwapGroup,
+				EvictAction:    m.EffectiveEvictAction(),
+				State:          admissionUnknown,
+			}
+			if st.Pinned {
+				st.Priority = config.PriorityCritical
+			}
+			a.models[name] = st
+			continue
+		}
+		// In-place field update; State + LastRequestTime preserved.
+		existing.GPUs = append(existing.GPUs[:0], m.GPUs...)
+		newExpected := make(map[int]int, len(m.GPUs))
+		for _, g := range m.GPUs {
+			newExpected[g] = m.EffectiveExpectedVRAMMB(g)
+		}
+		existing.ExpectedVRAMMB = newExpected
+		existing.L1ResidualMB = m.SleepL1ResidualMB
+		existing.Pinned = m.Pinned != nil && *m.Pinned
+		existing.SwapGroup = m.SwapGroup
+		existing.EvictAction = m.EffectiveEvictAction()
+		if existing.Pinned {
+			existing.Priority = config.PriorityCritical
+		} else {
+			existing.Priority = m.EffectivePriority()
+		}
+	}
+	// Drop models that disappeared from the config. We do NOT claw back
+	// their per-GPU bookings — that would risk going negative on a GPU
+	// shared with a still-tracked peer. The next process restart
+	// rebuilds the books from scratch.
+	for name := range a.models {
+		if !seen[name] {
+			delete(a.models, name)
+		}
+	}
+}
+
 func NewAdmissionController(cfg *config.Config, totalsByGPU map[int]int, evictor AdmissionEvictor) *AdmissionController {
 	a := &AdmissionController{
 		evictor:         evictor,
@@ -241,10 +359,14 @@ func NewAdmissionController(cfg *config.Config, totalsByGPU map[int]int, evictor
 		if !m.AdmissionEnabled() {
 			continue
 		}
+		expected := make(map[int]int, len(m.GPUs))
+		for _, g := range m.GPUs {
+			expected[g] = m.EffectiveExpectedVRAMMB(g)
+		}
 		st := &modelAdmissionState{
 			Name:           name,
 			GPUs:           append([]int(nil), m.GPUs...),
-			ExpectedVRAMMB: m.ExpectedVRAMMBPerGPU,
+			ExpectedVRAMMB: expected,
 			L1ResidualMB:   m.SleepL1ResidualMB,
 			Priority:       m.EffectivePriority(),
 			Pinned:         m.Pinned != nil && *m.Pinned,
@@ -265,11 +387,11 @@ func NewAdmissionController(cfg *config.Config, totalsByGPU map[int]int, evictor
 			st.State = admissionAwake
 			if st.SwapGroup == "" {
 				for _, g := range st.GPUs {
-					a.pinnedByGPU[g] += st.ExpectedVRAMMB
+					a.pinnedByGPU[g] += st.ExpectedOn(g)
 				}
 			} else {
 				for _, g := range st.GPUs {
-					a.awakeByGPU[g] += st.ExpectedVRAMMB
+					a.awakeByGPU[g] += st.ExpectedOn(g)
 				}
 			}
 		}
@@ -370,9 +492,17 @@ func (a *AdmissionController) RequestWake(ctx context.Context, name string) ([]s
 	// it touches. So the "additional VRAM needed" on each GPU is the
 	// delta. For an unknown-state model (first wake ever), the full
 	// ExpectedVRAMMB is needed.
-	needed := m.ExpectedVRAMMB
-	if m.State == admissionSleeping {
-		needed = m.ExpectedVRAMMB - m.L1ResidualMB
+	//
+	// `needed` is per-GPU because ExpectedVRAMMB can differ across GPUs
+	// (vLLM pipeline-parallel rank asymmetry: e.g. rank 1 carries
+	// embeddings + lm_head + sampler, +1-2 GiB heavier than rank 0).
+	needed := make(map[int]int, len(m.GPUs))
+	for _, g := range m.GPUs {
+		n := m.ExpectedOn(g)
+		if m.State == admissionSleeping {
+			n -= m.L1ResidualMB
+		}
+		needed[g] = n
 	}
 
 	victims, err := a.pickVictims(m, needed)
@@ -386,7 +516,7 @@ func (a *AdmissionController) RequestWake(ctx context.Context, name string) ([]s
 		slog.Info("admission_evicting",
 			"model", name,
 			"victims", victimNames(victims),
-			"needed_mb_per_gpu", needed,
+			"needed_mb_by_gpu", needed,
 			"gpus", m.GPUs,
 		)
 	}
@@ -465,11 +595,12 @@ func (a *AdmissionController) RequestWake(ctx context.Context, name string) ([]s
 	// Re-check fit after evictions — a defensive sanity check against
 	// arithmetic errors in pickVictims.
 	for _, g := range m.GPUs {
-		if avail := a.availableMB(g); avail < needed {
+		n := needed[g]
+		if avail := a.availableMB(g); avail < n {
 			metrics.AdmissionRejectionsTotal.WithLabelValues(name, "evict_insufficient").Inc()
 			a.mu.Unlock()
 			return victimNames(victims), fmt.Errorf("%w: admission for %q: GPU %d still short %dMB after evicting %d peers (need %d, have %d)",
-				ErrAdmissionInfeasible, name, g, needed-avail, len(victims), needed, avail)
+				ErrAdmissionInfeasible, name, g, n-avail, len(victims), n, avail)
 		}
 	}
 
@@ -481,7 +612,7 @@ func (a *AdmissionController) RequestWake(ctx context.Context, name string) ([]s
 		}
 	}
 	for _, g := range m.GPUs {
-		a.awakeByGPU[g] += m.ExpectedVRAMMB
+		a.awakeByGPU[g] += m.ExpectedOn(g)
 	}
 	m.State = admissionAwake
 	m.LastRequestTime = time.Now()
@@ -678,7 +809,7 @@ func (a *AdmissionController) markSleepingLocked(m *modelAdmissionState) {
 		return
 	}
 	for _, g := range m.GPUs {
-		a.awakeByGPU[g] -= m.ExpectedVRAMMB
+		a.awakeByGPU[g] -= m.ExpectedOn(g)
 		a.l1ResidualByGPU[g] += m.L1ResidualMB
 	}
 	m.State = admissionSleeping
@@ -700,7 +831,7 @@ func (a *AdmissionController) markStoppedLocked(m *modelAdmissionState) {
 	}
 	if m.State == admissionAwake {
 		for _, g := range m.GPUs {
-			a.awakeByGPU[g] -= m.ExpectedVRAMMB
+			a.awakeByGPU[g] -= m.ExpectedOn(g)
 		}
 	}
 	if m.State == admissionSleeping {
@@ -780,8 +911,13 @@ func (a *AdmissionController) availableMB(gpu int) int {
 // model is structurally too large for the pinned-adjusted budget on
 // some GPU).
 //
+// `needed` is per-GPU because per-GPU expected footprints can differ
+// (vLLM PP rank asymmetry). Likewise, a victim's `freed` contribution
+// is per-GPU because the victim itself may have asymmetric per-GPU
+// footprints.
+//
 // Algorithm (greedy):
-//  1. For each target GPU, compute the SHORTFALL = needed - available.
+//  1. For each target GPU, compute the SHORTFALL = needed[g] - available[g].
 //  2. Build the candidate pool: awake non-pinned non-critical models
 //     that share ≥1 GPU with `m`. PLUS: if `m` has a non-empty
 //     SwapGroup, awake peers in the same swap_group are eligible
@@ -792,8 +928,8 @@ func (a *AdmissionController) availableMB(gpu int) int {
 //     (operator declared the swap), but it's still more disruptive than
 //     evicting a normal peer; prefer non-group when both fit the shortfall.
 //  4. Walk the sorted candidates, picking each one if it reduces
-//     shortfall on any still-short GPU. Subtract its freed VRAM on
-//     every GPU it occupies. Stop when all target GPUs have
+//     shortfall on any still-short GPU. Subtract its per-GPU freed VRAM
+//     on every GPU it occupies. Stop when all target GPUs have
 //     shortfall ≤ 0.
 //  5. If shortfall remains after exhausting candidates → return error.
 //
@@ -802,10 +938,10 @@ func (a *AdmissionController) availableMB(gpu int) int {
 // negligible and the greedy is far easier to reason about.
 //
 // Caller must hold a.mu.
-func (a *AdmissionController) pickVictims(m *modelAdmissionState, needed int) ([]*modelAdmissionState, error) {
+func (a *AdmissionController) pickVictims(m *modelAdmissionState, needed map[int]int) ([]*modelAdmissionState, error) {
 	shortfall := map[int]int{}
 	for _, g := range m.GPUs {
-		short := needed - a.availableMB(g)
+		short := needed[g] - a.availableMB(g)
 		if short > 0 {
 			shortfall[g] = short
 		}
@@ -894,19 +1030,20 @@ func (a *AdmissionController) pickVictims(m *modelAdmissionState, needed int) ([
 		if !helps {
 			continue
 		}
-		// Pick it — freed VRAM depends on EvictAction:
-		//   sleep: leaves L1 residual on the books (= Expected - Residual)
-		//   stop:  full reclaim (= Expected; container exit drops residual too)
-		freed := c.ExpectedVRAMMB - c.L1ResidualMB
-		if c.EvictAction == config.EvictActionStop {
-			freed = c.ExpectedVRAMMB
-		}
+		// Pick it — freed VRAM is per-GPU and depends on EvictAction:
+		//   sleep: leaves L1 residual on the books (= ExpectedOn(g) - Residual)
+		//   stop:  full reclaim (= ExpectedOn(g); container exit drops residual too)
 		for _, g := range c.GPUs {
-			if shortfall[g] > 0 {
-				shortfall[g] -= freed
-				if shortfall[g] < 0 {
-					shortfall[g] = 0
-				}
+			if shortfall[g] <= 0 {
+				continue
+			}
+			freed := c.ExpectedOn(g) - c.L1ResidualMB
+			if c.EvictAction == config.EvictActionStop {
+				freed = c.ExpectedOn(g)
+			}
+			shortfall[g] -= freed
+			if shortfall[g] < 0 {
+				shortfall[g] = 0
 			}
 		}
 		picked = append(picked, c)
