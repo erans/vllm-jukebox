@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vllm-jukebox/internal/config"
@@ -48,7 +49,65 @@ type Scheduler struct {
 	// by the goroutine on exit. Guarded by mu.
 	coldLoadKicks map[string]bool
 
+	// coldLoadFailures records the most recent cold-load failure per
+	// model name, used by KickColdLoad to back off re-kicks within a
+	// short window. Without this, a member-container that exits(1) on
+	// startup (e.g. OOM at worker init) gets re-kicked instantly on
+	// every inbound request — each kick re-acquires the GPU-set
+	// cold-load lock and re-runs a doomed docker start. Live-observed
+	// blast radius (2026-06-09): an infinite OOM/retry loop on moe
+	// holding coldLoadMu so requests to the healthy pinned 27B
+	// (Sparx) blocked until they timed out.
+	//
+	// Semantics:
+	//   - Updated by the async cold-load goroutine on failure (after
+	//     NotifyStartFailed / drift-risk paths run, i.e. immediately
+	//     before returning the err).
+	//   - Cleared by the same goroutine on success.
+	//   - Consulted by KickColdLoad: if the most recent failure is
+	//     within coldLoadFailureCooldown, the kick is suppressed
+	//     (the model stays admissionStopped; a future request after
+	//     the cooldown will re-attempt). This is a per-model cooldown,
+	//     NOT a hard retry cap — once the cooldown expires the next
+	//     kick fires unconditionally. Operators can force-recover via
+	//     /admin/redeploy-member which bypasses this map entirely.
+	//
+	// Guarded by mu.
+	coldLoadFailures map[string]coldLoadFailureRecord
+
 	total inflight.Tracker
+}
+
+// coldLoadFailureRecord captures the last cold-load failure for a model
+// so KickColdLoad can suppress immediate re-kicks. Stored by value in
+// the coldLoadFailures map.
+type coldLoadFailureRecord struct {
+	at  time.Time
+	err string
+}
+
+// coldLoadFailureCooldown is the minimum gap between an async cold-load
+// failure and the next eligible re-kick for the same model. Set to 30s
+// to balance two requirements:
+//   - Long enough to prevent a doomed cold-load (e.g. OOM at worker
+//     init) from re-firing on every inbound request, which would wedge
+//     the GPU-set lock and starve healthy peers.
+//   - Short enough that a TRANSIENT failure (docker daemon hiccup,
+//     transient network blip) recovers within an operator-acceptable
+//     window without manual intervention.
+//
+// Test-overridable via SetColdLoadFailureCooldownForTest (see
+// sleep_export_test.go).
+var coldLoadFailureCooldown atomic.Int64
+
+func init() {
+	coldLoadFailureCooldown.Store(int64(30 * time.Second))
+}
+
+// coldLoadFailureCooldownDuration returns the current cooldown as a
+// time.Duration, masking the atomic.Int64-of-nanoseconds storage shape.
+func coldLoadFailureCooldownDuration() time.Duration {
+	return time.Duration(coldLoadFailureCooldown.Load())
 }
 
 type schedInstance struct {
@@ -100,7 +159,8 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		instances:     map[string]*schedInstance{},
 		waiters:       map[string]bool{},
 		wakeOps:       map[string]*wakeOp{},
-		coldLoadKicks: map[string]bool{},
+		coldLoadKicks:    map[string]bool{},
+		coldLoadFailures: map[string]coldLoadFailureRecord{},
 	}
 	s.total.OnChange = func(count int64) {
 		metrics.InFlightRequests.Set(float64(count))

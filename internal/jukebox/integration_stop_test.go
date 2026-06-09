@@ -199,13 +199,21 @@ func TestIntegration_StopOnEvict_WakeFromStopped_Roundtrip(t *testing.T) {
 	if startCalls != 1 {
 		t.Errorf("expected exactly 1 `docker start vllm-moe`, got %d (calls: %v)", startCalls, dockerCalls)
 	}
-	// Admission state: moe should be Sleeping (post-NotifyStarted), main
-	// still Awake.
+	// Admission state: moe should be Sleeping (post-NotifyStarted). main
+	// is the resident pinned peer on GPU 0; cold-loading moe must FIRST
+	// evict main (BUG 1 fix — without the eviction, the moe cold-load
+	// would race main for VRAM and OOM at worker init). Verify main was
+	// slept by the cold-load path.
 	if a.models["moe"].State != admissionSleeping {
 		t.Errorf("expected moe admissionSleeping after cold-load, got %d", a.models["moe"].State)
 	}
-	if a.models["main"].State != admissionAwake {
-		t.Errorf("expected main still admissionAwake, got %d", a.models["main"].State)
+	if a.models["main"].State != admissionSleeping {
+		t.Errorf("expected main admissionSleeping (evicted by cold-load BUG 1 fix), got %d", a.models["main"].State)
+	}
+	// main.Sleep must have been called exactly once during the
+	// cold-load's peer-eviction step.
+	if got := mgrs["main"].sleepCalls.Load(); got != 1 {
+		t.Errorf("expected main.Sleep=1 (cold-load peer eviction), got %d", got)
 	}
 	// Wait for the goroutine to remove itself from coldLoadKicks (no leak).
 	if ok := waitForCondition(2*time.Second, func() bool {
@@ -327,11 +335,14 @@ func TestIntegration_ConcurrentRetries_DuringColdLoad(t *testing.T) {
 	}
 
 	// Wait for the first start to enter the mock, then release it.
+	// Budget 5s — the BUG 1 fix evicts pinned main (sleepInstance) before
+	// docker start, and sleepInstance pays a hardcoded 2s settleAfterSleep
+	// after Sleep returns. Pre-fix this was tight at 2s.
 	select {
 	case <-startEntered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		releaseStart <- struct{}{} // unblock if test is going to fail
-		t.Fatalf("first docker start never entered the mock within 2s")
+		t.Fatalf("first docker start never entered the mock within 5s")
 	}
 	close(releaseStart)
 
@@ -620,5 +631,457 @@ func TestIntegration_RedeployMember_DockerStartFailureRestoresPinned(t *testing.
 	// admission must reflect moe Stopped (NotifyStartFailed in redeploy.go).
 	if !a.IsStopped("moe") {
 		t.Errorf("expected moe Stopped after docker start failure, got state %d", a.models["moe"].State)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4/regression — BUG 1 + BUG 2 from 2026-06-09 fleet-bot live-smoke
+// (request-triggered cold-load missing peer-eviction; dead-container loop
+// wedging the GPU-set lock and starving the pinned co-tenant).
+// ---------------------------------------------------------------------------
+
+// TestIntegration_ColdLoad_EvictsPinnedPeerOnRequest is BUG 1's
+// happy-path regression: a request for a STOPPED swap-group member
+// must trigger the cold-load path, which must FIRST evict the
+// awake pinned peer (sleep it), THEN docker start the target. Without
+// the eviction, the cold-load races for VRAM with the resident
+// pinned peer and OOMs at worker init (live-observed 2026-06-09:
+// vllm-moe boot exited(1) with "Free memory on device cuda:2
+// (5.31/23.56 GiB) on startup is less than desired GPU memory
+// utilization (0.8, 18.85 GiB)" because pinned vllm-main held the
+// GPUs awake).
+//
+// Asserts the docker call sequence (no docker stop for main — it's
+// evict_action: sleep — but exactly one docker start for moe) AND
+// the admission state machine (main Awake → Sleeping, moe Stopped
+// → Sleeping with NotifyStarted).
+func TestIntegration_ColdLoad_EvictsPinnedPeerOnRequest(t *testing.T) {
+	s, a, mgrs := makeStopOnEvictScheduler(t)
+
+	// Track docker calls so we can assert the exact sequence.
+	var dockerMu sync.Mutex
+	var dockerCalls []string
+	SetSleepDockerCmdForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		dockerMu.Lock()
+		dockerCalls = append(dockerCalls, name+" "+strings.Join(args, " "))
+		dockerMu.Unlock()
+		return []byte("ok"), nil
+	})
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Setup sanity: main awake (pinned, evict_action: sleep), moe Stopped.
+	if a.models["main"].State != admissionAwake {
+		t.Fatalf("setup: expected main admissionAwake, got %d", a.models["main"].State)
+	}
+	if !a.IsStopped("moe") {
+		t.Fatalf("setup: expected moe Stopped")
+	}
+	// main.Sleep should be called by the cold-load eviction step.
+	preMainSleeps := mgrs["main"].sleepCalls.Load()
+
+	// Kick the cold-load and wait for it to land.
+	if !s.KickColdLoad("moe") {
+		t.Fatalf("KickColdLoad(moe) returned false; expected true (moe is Stopped)")
+	}
+	if ok := waitForCondition(8*time.Second, func() bool {
+		return !a.IsStopped("moe")
+	}); !ok {
+		t.Fatalf("cold-load did not finish within 8s; moe still Stopped")
+	}
+
+	// Critical: main must have been evicted (slept) by the cold-load
+	// path's peer-eviction step. Pre-fix, this assertion fails because
+	// main is left Awake.
+	if got := mgrs["main"].sleepCalls.Load(); got != preMainSleeps+1 {
+		t.Errorf("expected main.Sleep=%d (cold-load peer eviction), got %d",
+			preMainSleeps+1, got)
+	}
+	if a.models["main"].State != admissionSleeping {
+		t.Errorf("expected main admissionSleeping after cold-load eviction, got %d",
+			a.models["main"].State)
+	}
+
+	// moe must have advanced Stopped → Sleeping.
+	if a.models["moe"].State != admissionSleeping {
+		t.Errorf("expected moe admissionSleeping after cold-load, got %d",
+			a.models["moe"].State)
+	}
+
+	// Exactly one docker start for moe (main is sleep-mode — no docker
+	// stop for it, just sc.Sleep via fakeRedeployMgr).
+	dockerMu.Lock()
+	var startCalls, stopCalls int
+	for _, c := range dockerCalls {
+		if strings.Contains(c, "start") && strings.Contains(c, "vllm-moe") {
+			startCalls++
+		}
+		if strings.Contains(c, "stop") && strings.Contains(c, "vllm-main") {
+			stopCalls++
+		}
+	}
+	dockerMu.Unlock()
+	if startCalls != 1 {
+		t.Errorf("expected exactly 1 `docker start vllm-moe`, got %d (calls: %v)",
+			startCalls, dockerCalls)
+	}
+	if stopCalls != 0 {
+		t.Errorf("expected zero `docker stop vllm-main` calls (main is evict_action: sleep), got %d",
+			stopCalls)
+	}
+
+	// Goroutine kick map cleared (no leak).
+	if ok := waitForCondition(2*time.Second, func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return !s.coldLoadKicks["moe"]
+	}); !ok {
+		t.Errorf("coldLoadKicks[moe] still set after cold-load completed (goroutine leaked)")
+	}
+
+	// Now AcquireRoute(moe) → wake fast path. Eviction is a no-op (main
+	// already Sleeping). moe should reach admissionAwake.
+	mgrs["moe"].pid.Store(int64(7000 + 8002))
+	mgrs["moe"].isSleeping.Store(true)
+	route, err := s.AcquireRoute(context.Background(), "moe", "req-1")
+	if err != nil {
+		t.Fatalf("AcquireRoute(moe): %v", err)
+	}
+	if route.Done != nil {
+		route.Done()
+	}
+	if a.models["moe"].State != admissionAwake {
+		t.Errorf("expected moe admissionAwake after wake, got %d", a.models["moe"].State)
+	}
+}
+
+// exitingContainerInspectMock returns a SetSleepDockerCmdForTest hook
+// that:
+//   - succeeds `docker start <container>` (the daemon accepted the start)
+//   - reports `exited` for `docker inspect <container>` (simulating a
+//     container that exited(1) immediately at worker init — e.g. OOM)
+//   - succeeds any other docker call (stop cleanup, etc.)
+//
+// `started` and `stopped` atomic counters track the live call shape so
+// tests can assert exact counts. `started` is set to true after the
+// first docker start fires (only relevant for tests that need to
+// distinguish pre-start from post-start probes).
+func exitingContainerInspectMock(t *testing.T, container string) (func(context.Context, string, ...string) ([]byte, error), *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+	var startCount, stopCount atomic.Int32
+	hook := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) == 0 {
+			return []byte("ok"), nil
+		}
+		switch args[0] {
+		case "start":
+			startCount.Add(1)
+			return []byte("ok"), nil
+		case "stop":
+			stopCount.Add(1)
+			return []byte("ok"), nil
+		case "inspect":
+			// `docker inspect -f '{{json .State}}' <container>`
+			// Find container arg (after the -f format arg).
+			var target string
+			for i := 0; i < len(args)-1; i++ {
+				if args[i] == "-f" {
+					if i+2 < len(args) {
+						target = args[i+2]
+					}
+					break
+				}
+			}
+			if target != container {
+				// Other container — pretend it's running.
+				return []byte(`{"Status":"running","ExitCode":0,"OOMKilled":false}`), nil
+			}
+			// Target container: simulate exit(1) (the live-observed OOM).
+			return []byte(`{"Status":"exited","ExitCode":1,"OOMKilled":false,"Error":"simulated OOM at worker init","StartedAt":"2026-06-09T19:25:00Z","FinishedAt":"2026-06-09T19:25:02Z"}`), nil
+		}
+		return []byte("ok"), nil
+	}
+	return hook, &startCount, &stopCount
+}
+
+// TestIntegration_ColdLoad_FailFastOnExitedContainer is BUG 2a:
+// when the member container exits immediately after `docker start`
+// (e.g. OOM at worker init), the cold-load poll loop must detect
+// the exit via `docker inspect` and fail fast — NOT wait the full
+// cold_load_timeout on a `/is_sleeping` HTTP probe that will never
+// succeed (the embedded docker DNS doesn't resolve dead container
+// names).
+//
+// Asserts the cold-load returns within a couple of poll intervals
+// (not the full ~10min default timeout) AND the error wraps
+// ErrColdLoadContainerExited so callers can classify it.
+func TestIntegration_ColdLoad_FailFastOnExitedContainer(t *testing.T) {
+	s, a, _ := makeStopOnEvictScheduler(t)
+
+	// Drop poll interval to 50ms so the test finishes fast.
+	oldPoll := SetColdLoadPollIntervalForTest(50 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	// Make moe's IsSleeping always error (simulates DNS NXDOMAIN against
+	// a dead container — the HTTP client can't tell "not ready yet" from
+	// "gone forever", so it would normally retry until cold_load_timeout).
+	flakyMgr := &flakyIsSleepingMgr{port: 8002}
+	flakyMgr.pid.Store(0)
+	s.mu.Lock()
+	s.instances["moe"].mgr = flakyMgr
+	s.mu.Unlock()
+
+	// Mock docker: start succeeds, inspect reports exited (BUG 2a's
+	// fast-fail trigger).
+	hook, startCount, _ := exitingContainerInspectMock(t, "vllm-moe")
+	SetSleepDockerCmdForTest(hook)
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Disable the cooldown so the test exercises the inner fail-fast,
+	// not the outer cooldown gate.
+	oldCooldown := SetColdLoadFailureCooldownForTest(0)
+	defer SetColdLoadFailureCooldownForTest(oldCooldown)
+
+	// Cold-load. Should fail fast (within a few poll intervals + the
+	// initial docker start + eviction settle), NOT the full 10min
+	// default timeout. Budget 8s = 2s settle + 6s slack.
+	start := time.Now()
+	err := s.coldLoadStoppedMember(context.Background(), s.instances["moe"], s.cfg.Models["moe"])
+	dur := time.Since(start)
+	if err == nil {
+		t.Fatalf("expected cold-load to fail, got nil")
+	}
+	if !errors.Is(err, ErrColdLoadContainerExited) {
+		t.Errorf("expected ErrColdLoadContainerExited, got: %v", err)
+	}
+	// Hard cap: must NOT wait the full cold-load timeout. 8s = generous
+	// upper bound (eviction settle is 2s; inspect probe at 50ms intervals
+	// should trigger within the first 1-2 polls).
+	if dur > 8*time.Second {
+		t.Errorf("cold-load took %v — expected fast-fail within 8s (BUG 2a regression: container-exit detection broken)", dur)
+	}
+
+	// Cleanup path should have run docker start exactly once + a cleanup
+	// stop (best-effort). Admission must reflect Stopped.
+	if got := startCount.Load(); got != 1 {
+		t.Errorf("expected exactly 1 docker start, got %d", got)
+	}
+	if !a.IsStopped("moe") {
+		t.Errorf("expected moe still Stopped after fast-fail, got state %d", a.models["moe"].State)
+	}
+}
+
+// TestIntegration_ColdLoad_RetrySuppressedByCooldown is BUG 2b: after
+// a cold-load failure, the next N KickColdLoad calls within the
+// cooldown window must be suppressed (no second docker start fires).
+// Without the cooldown, a doomed cold-load (OOM at worker init) would
+// re-fire on every inbound request — each kick re-acquires the GPU-set
+// cold-load lock and re-runs the doomed start — wedging the lock and
+// starving healthy peers (live-observed 2026-06-09: pinned 27B
+// inaccessible until jukebox restart).
+//
+// Asserts:
+//  1. First KickColdLoad → goroutine runs, fails (container exits).
+//  2. Subsequent KickColdLoad calls inside the cooldown window
+//     return false WITHOUT firing a new goroutine (no new docker start).
+//  3. After the cooldown expires, KickColdLoad fires again.
+func TestIntegration_ColdLoad_RetrySuppressedByCooldown(t *testing.T) {
+	s, a, _ := makeStopOnEvictScheduler(t)
+
+	oldPoll := SetColdLoadPollIntervalForTest(20 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	// 1.5s cooldown — long enough to make the suppression visible against
+	// the test's 1-2s poll waits, short enough to verify expiry.
+	oldCooldown := SetColdLoadFailureCooldownForTest(1500 * time.Millisecond)
+	defer SetColdLoadFailureCooldownForTest(oldCooldown)
+
+	// Flaky IsSleeping (DNS-NXDOMAIN-equivalent) for moe.
+	flakyMgr := &flakyIsSleepingMgr{port: 8002}
+	flakyMgr.pid.Store(0)
+	s.mu.Lock()
+	s.instances["moe"].mgr = flakyMgr
+	s.mu.Unlock()
+
+	hook, startCount, _ := exitingContainerInspectMock(t, "vllm-moe")
+	SetSleepDockerCmdForTest(hook)
+	defer SetSleepDockerCmdForTest(nil)
+
+	// 1. First kick: cold-load runs and fails.
+	if !s.KickColdLoad("moe") {
+		t.Fatalf("first KickColdLoad(moe) returned false; expected true")
+	}
+	// Wait for goroutine to finish (coldLoadKicks cleared on defer +
+	// coldLoadFailures populated on failure).
+	if ok := waitForCondition(8*time.Second, func() bool {
+		s.mu.RLock()
+		_, hasFailure := s.coldLoadFailures["moe"]
+		kickedNow := s.coldLoadKicks["moe"]
+		s.mu.RUnlock()
+		return !kickedNow && hasFailure
+	}); !ok {
+		t.Fatalf("first cold-load did not complete with a failure record within 8s")
+	}
+	if got := startCount.Load(); got != 1 {
+		t.Errorf("expected 1 docker start from first kick, got %d", got)
+	}
+	// admission still Stopped (NotifyStartFailed).
+	if !a.IsStopped("moe") {
+		t.Errorf("expected moe still Stopped after first failure, got state %d", a.models["moe"].State)
+	}
+
+	// 2. Subsequent kicks within cooldown must return false AND fire no
+	// new docker start (which would wedge the GPU-set lock).
+	const cooldownKicks = 5
+	for i := 0; i < cooldownKicks; i++ {
+		if s.KickColdLoad("moe") {
+			t.Errorf("KickColdLoad #%d within cooldown returned true; expected false (suppressed)", i+2)
+		}
+	}
+	// No new docker start should have fired.
+	if got := startCount.Load(); got != 1 {
+		t.Errorf("expected docker start count to stay at 1 within cooldown, got %d (re-fires would wedge the lock — BUG 2b regression)", got)
+	}
+
+	// 3. Wait for cooldown to expire, then verify a new kick fires.
+	time.Sleep(2 * time.Second) // > 1500ms cooldown
+
+	// Heal the container so the next kick succeeds — swap the manager
+	// back to a healthy fake AND switch the docker mock to a non-exit
+	// inspect.
+	healthy := &fakeRedeployMgr{port: 8002}
+	healthy.pid.Store(0)
+	healthy.isSleeping.Store(true)
+	s.mu.Lock()
+	s.instances["moe"].mgr = healthy
+	s.mu.Unlock()
+	SetSleepDockerCmdForTest(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "start" {
+			startCount.Add(1)
+		}
+		if len(args) > 0 && args[0] == "inspect" {
+			return []byte(`{"Status":"running","ExitCode":0,"OOMKilled":false}`), nil
+		}
+		return []byte("ok"), nil
+	})
+
+	if !s.KickColdLoad("moe") {
+		t.Fatalf("KickColdLoad after cooldown returned false; expected true (cooldown should have expired)")
+	}
+	if ok := waitForCondition(10*time.Second, func() bool {
+		return !a.IsStopped("moe")
+	}); !ok {
+		t.Fatalf("recovery cold-load did not complete within 10s")
+	}
+	if a.models["moe"].State != admissionSleeping {
+		t.Errorf("expected moe admissionSleeping after recovery, got %d", a.models["moe"].State)
+	}
+}
+
+// TestIntegration_PinnedPeerSurvivesWedgedColdLoad is BUG 2c, the
+// regression test fleet-bot explicitly requested. While a stopped
+// member is wedged in a cold-load failure loop (mock simulates an
+// exited container forever), requests to the PINNED healthy peer
+// must continue to succeed.
+//
+// Pre-fix, the cold-load held coldLoadMu for the full 5min timeout,
+// then immediately re-kicked, infinitely wedging the lock. Any
+// request that touched performWake on the pinned peer (e.g. after
+// any sleep-then-wake cycle) would block behind the lock and time
+// out — live-observed: live Sparx was effectively DOWN until jukebox
+// was restarted.
+//
+// Post-fix:
+//   - BUG 2a: fast-fail detects the exited container in milliseconds.
+//   - BUG 2b: cooldown suppresses immediate re-kicks.
+//   - The lock is released within 50-200ms of each failed cold-load.
+//
+// Test shape: hammer moe with KickColdLoad while concurrently waking
+// the pinned 27B (main) from a sleeping state. Wake must succeed
+// regardless of moe's wedge state.
+func TestIntegration_PinnedPeerSurvivesWedgedColdLoad(t *testing.T) {
+	s, a, mgrs := makeStopOnEvictScheduler(t)
+
+	oldPoll := SetColdLoadPollIntervalForTest(20 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+	// Short cooldown so the test can observe multiple kick attempts
+	// in a reasonable wall-clock window.
+	oldCooldown := SetColdLoadFailureCooldownForTest(200 * time.Millisecond)
+	defer SetColdLoadFailureCooldownForTest(oldCooldown)
+
+	// moe's container is permanently broken (exits on every start).
+	flakyMgr := &flakyIsSleepingMgr{port: 8002}
+	flakyMgr.pid.Store(0)
+	s.mu.Lock()
+	s.instances["moe"].mgr = flakyMgr
+	s.mu.Unlock()
+
+	hook, _, _ := exitingContainerInspectMock(t, "vllm-moe")
+	SetSleepDockerCmdForTest(hook)
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Put main to sleep so we can observe a wake of main racing the
+	// moe cold-load wedge.
+	a.mu.Lock()
+	a.models["main"].State = admissionSleeping
+	a.l1ResidualByGPU[0] += a.models["main"].L1ResidualMB
+	a.awakeByGPU[0] -= a.models["main"].ExpectedVRAMMB
+	a.mu.Unlock()
+	s.mu.Lock()
+	s.instances["main"].state = StateSleeping
+	s.mu.Unlock()
+	mgrs["main"].isSleeping.Store(true)
+
+	// Hammer moe with kick attempts in a background goroutine.
+	stopHammer := make(chan struct{})
+	hammerDone := make(chan struct{})
+	go func() {
+		defer close(hammerDone)
+		for {
+			select {
+			case <-stopHammer:
+				return
+			default:
+			}
+			_ = s.KickColdLoad("moe")
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+	defer func() {
+		close(stopHammer)
+		<-hammerDone
+	}()
+
+	// Give the hammer a moment to actually start wedging.
+	time.Sleep(500 * time.Millisecond)
+
+	// Now: request to main (the pinned healthy peer). This goes through
+	// AcquireRoute → tryRouteFromSleep → performWake → admission RequestWake.
+	// performWake's wake-from-Stopped branch acquires coldLoadMu for the
+	// TOCTOU re-check. Pre-fix, that acquire blocks until the wedged
+	// moe goroutine releases the lock (~5min). Post-fix the lock is
+	// released within 200ms of each failed cold-load and the cooldown
+	// prevents the next re-kick from instantly re-taking it.
+	//
+	// Budget: 5 seconds. Pre-fix this would hit the wake_timeout (1s
+	// per modelCfg) and surface as a wake-timeout error after the
+	// lock-wait dominates wall-clock; post-fix it should succeed in
+	// well under 5s.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	route, err := s.AcquireRoute(ctx, "main", "req-pinned-wake")
+	dur := time.Since(start)
+	if err != nil {
+		t.Fatalf("AcquireRoute(main) failed while moe was wedged in cold-load loop: %v (took %v)", err, dur)
+	}
+	if route.Done != nil {
+		route.Done()
+	}
+	if dur > 4*time.Second {
+		t.Errorf("AcquireRoute(main) took %v — pinned peer should be unaffected by moe's cold-load wedge (BUG 2c regression)", dur)
+	}
+	if a.models["main"].State != admissionAwake {
+		t.Errorf("expected main admissionAwake after wake, got %d", a.models["main"].State)
 	}
 }
