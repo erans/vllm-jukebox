@@ -92,6 +92,28 @@ func SetColdLoadPollIntervalForTest(d time.Duration) time.Duration {
 	return old
 }
 
+// SetColdLoadFailureCooldownForTest overrides the cold-load failure
+// cooldown that KickColdLoad consults to suppress immediate re-kicks
+// after a failure (production default: 30s). Returns the previous value
+// so tests can defer a restore. Used by tests that need to exercise
+// the cooldown gate without paying 30s wall-clock OR to disable the
+// cooldown entirely (set to 0) when the test wants to fire repeated
+// kicks back-to-back.
+//
+// Backed by atomic.Int64 (nanoseconds) so concurrent reads from
+// production code under test and writes from a parallel test goroutine
+// are race-detector clean.
+//
+// Usage:
+//
+//	old := SetColdLoadFailureCooldownForTest(50 * time.Millisecond)
+//	defer SetColdLoadFailureCooldownForTest(old)
+func SetColdLoadFailureCooldownForTest(d time.Duration) time.Duration {
+	old := time.Duration(coldLoadFailureCooldown.Load())
+	coldLoadFailureCooldown.Store(int64(d))
+	return old
+}
+
 // SetLifecycleAuditSinkForTest installs a hook that observes every
 // LifecycleEvent emitted by LogLifecycleTransition. Returns the
 // previous hook (or nil) so tests can defer-restore. nil clears any
