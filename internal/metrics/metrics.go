@@ -227,6 +227,37 @@ var (
 		[]string{"model"},
 	)
 
+	// AdmissionPinnedWakeFailedTotal bumps when a cold-load failure
+	// rollback could not re-wake a previously-slept pinned peer.
+	// Symptom: pinned-default model is left Sleeping despite operator
+	// expectation that "pinned ⇒ always Awake". Critical alertable —
+	// any non-zero rate means a pinned model is silently down and the
+	// admission cooldown was force-cleared so the operator's next
+	// request OR /admin/redeploy-member can retry. See runbook
+	// "manual-reconcile".
+	AdmissionPinnedWakeFailedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_admission_pinned_wake_failed_total",
+			Help: "Cold-load rollback could not re-wake a previously-slept pinned peer (pinned-default availability invariant violated).",
+		},
+		[]string{"model"},
+	)
+
+	// ColdLoadCooldownSuppressedTotal bumps when KickColdLoad short-
+	// circuits a kick because the model's last cold-load failure is
+	// still inside the coldLoadFailureCooldown window. Without this
+	// counter the only signal is a slog.Warn line + a lifecycle audit
+	// event — dashboards can't track "all my models are stuck in
+	// cooldown" as a silent partial outage. Per-model labeled so
+	// alerts can fire on a single wedged model.
+	ColdLoadCooldownSuppressedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_cold_load_cooldown_suppressed_total",
+			Help: "KickColdLoad invocations suppressed because the model is within the post-failure cooldown window.",
+		},
+		[]string{"model"},
+	)
+
 	// Histogram: admission wait time (decision + eviction wall-clock)
 	AdmissionWaitSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -311,6 +342,8 @@ func init() {
 		AdmissionEvictsTotal,
 		AdmissionRejectionsTotal,
 		AdmissionVRAMDriftRiskTotal,
+		AdmissionPinnedWakeFailedTotal,
+		ColdLoadCooldownSuppressedTotal,
 		AdmissionWaitSeconds,
 		GPUBudgetAwakeMB,
 		GPUBudgetAvailableMB,
