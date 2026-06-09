@@ -114,7 +114,7 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	}
 	m.mu.Unlock()
 
-	resolvedName, modelCfg, err := m.cfg.ResolveModel(modelName)
+	resolvedName, modelCfg, err := liveCfg(m.cfg).ResolveModel(modelName)
 	if err != nil {
 		return 0, err
 	}
@@ -383,7 +383,7 @@ func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 		return err
 	}
 
-	_, modelCfg, err := m.cfg.ResolveModel(expectedModel)
+	_, modelCfg, err := liveCfg(m.cfg).ResolveModel(expectedModel)
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,10 @@ import (
 
 func statusHandler(cfg *config.Config, coord StatusProvider) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		live := config.Current()
+		if live == nil {
+			live = cfg
+		}
 		st := jukebox.Status{State: jukebox.StateIdle}
 		if coord != nil {
 			st = coord.Status()
@@ -24,15 +28,17 @@ func statusHandler(cfg *config.Config, coord StatusProvider) fiber.Handler {
 		}
 
 		var available []string
-		if cfg != nil {
-			available = make([]string, 0, len(cfg.Models))
-			for name := range cfg.Models {
+		if live != nil {
+			available = make([]string, 0, len(live.Models))
+			for name := range live.Models {
 				available = append(available, name)
 			}
 			sort.Strings(available)
 		}
 
 		var cooldownRemaining int64
+		// vllm.swap_cooldown is a top-level field captured at boot —
+		// keep using cfg here (NOT live) per the hot-reload matrix.
 		if cfg != nil && cfg.VLLM.SwapCooldown.Duration > 0 && !st.LastSwapAt.IsZero() {
 			next := st.LastSwapAt.Add(cfg.VLLM.SwapCooldown.Duration)
 			remaining := time.Until(next)

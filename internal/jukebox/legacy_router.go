@@ -38,7 +38,7 @@ func (r *LegacyRouter) AcquireRoute(ctx context.Context, requestedModel, request
 		done = r.tr.Track(ctx)
 	}
 
-	_, modelCfg, err := r.cfg.ResolveModel(requestedModel)
+	_, modelCfg, err := liveResolveModel(r.cfg, requestedModel)
 	if err != nil {
 		return Route{}, err
 	}

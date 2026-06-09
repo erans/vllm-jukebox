@@ -8,6 +8,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/jukebox"
 	"vllm-jukebox/internal/proxy"
 )
@@ -28,7 +29,11 @@ func anthropicProxyHandler(opts Options) fiber.Handler {
 
 		c.Locals(requestedModelLocal, modelName)
 
-		_, _, err = opts.Config.ResolveModel(modelName)
+		liveCfg := config.Current()
+		if liveCfg == nil {
+			liveCfg = opts.Config
+		}
+		_, _, err = liveCfg.ResolveModel(modelName)
 		if err != nil {
 			return writeAnthropicError(
 				c,
