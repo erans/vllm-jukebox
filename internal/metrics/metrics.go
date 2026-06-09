@@ -227,37 +227,6 @@ var (
 		[]string{"model"},
 	)
 
-	// AdmissionPinnedWakeFailedTotal bumps when a cold-load failure
-	// rollback could not re-wake a previously-slept pinned peer.
-	// Symptom: pinned-default model is left Sleeping despite operator
-	// expectation that "pinned ⇒ always Awake". Critical alertable —
-	// any non-zero rate means a pinned model is silently down and the
-	// admission cooldown was force-cleared so the operator's next
-	// request OR /admin/redeploy-member can retry. See runbook
-	// "manual-reconcile".
-	AdmissionPinnedWakeFailedTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "jukebox_admission_pinned_wake_failed_total",
-			Help: "Cold-load rollback could not re-wake a previously-slept pinned peer (pinned-default availability invariant violated).",
-		},
-		[]string{"model"},
-	)
-
-	// ColdLoadCooldownSuppressedTotal bumps when KickColdLoad short-
-	// circuits a kick because the model's last cold-load failure is
-	// still inside the coldLoadFailureCooldown window. Without this
-	// counter the only signal is a slog.Warn line + a lifecycle audit
-	// event — dashboards can't track "all my models are stuck in
-	// cooldown" as a silent partial outage. Per-model labeled so
-	// alerts can fire on a single wedged model.
-	ColdLoadCooldownSuppressedTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "jukebox_cold_load_cooldown_suppressed_total",
-			Help: "KickColdLoad invocations suppressed because the model is within the post-failure cooldown window.",
-		},
-		[]string{"model"},
-	)
-
 	// Histogram: admission wait time (decision + eviction wall-clock)
 	AdmissionWaitSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -316,37 +285,6 @@ var (
 		},
 		[]string{"result"},
 	)
-
-	// --- content-aware routing (Stage J overnight build, 2026-06-10) ---
-
-	// ContentRoutingDecisionsTotal counts classifier decisions per inbound
-	// chat-completions request. Labels:
-	//   - decision: forward / reroute_image / reroute_overflow /
-	//     reject_no_vision / reject_too_long
-	//   - from: requested served-name
-	//   - to:   target served-name (when reroute*; empty otherwise)
-	// Designed so a single panel shows reroute volume, kill-switch state,
-	// and reject rate without joining multiple counters.
-	ContentRoutingDecisionsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "jukebox_content_routing_decisions_total",
-			Help: "Content-classifier routing decisions on POST /v1/chat/completions, labeled by decision + source/target served-name.",
-		},
-		[]string{"decision", "from", "to"},
-	)
-
-	// ContentRoutingEstTokensHistogram captures the byte-length-derived
-	// token estimate distribution. Useful for tuning
-	// LengthOverflowThresholdTokens — if the bulk of traffic sits at 100K
-	// and the threshold is 256K, the threshold is set right; if traffic
-	// piles up just under 256K, the threshold may be too tight.
-	ContentRoutingEstTokensHistogram = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "jukebox_content_routing_est_tokens",
-			Help:    "Estimated inbound prompt tokens (bytes / chars-per-token) on POST /v1/chat/completions when content routing is enabled.",
-			Buckets: []float64{1024, 4096, 16384, 65536, 131072, 196608, 262144, 393216, 524288},
-		},
-	)
 )
 
 func init() {
@@ -373,15 +311,11 @@ func init() {
 		AdmissionEvictsTotal,
 		AdmissionRejectionsTotal,
 		AdmissionVRAMDriftRiskTotal,
-		AdmissionPinnedWakeFailedTotal,
-		ColdLoadCooldownSuppressedTotal,
 		AdmissionWaitSeconds,
 		GPUBudgetAwakeMB,
 		GPUBudgetAvailableMB,
 		LifecycleTransitionsTotal,
 		ConfigReloadsTotal,
-		ContentRoutingDecisionsTotal,
-		ContentRoutingEstTokensHistogram,
 	)
 }
 

@@ -89,38 +89,8 @@ func main() {
 	// Start the active.yaml hot-reload watcher. Failures here log loud
 	// but are NOT fatal — the existing parse-crash safety net (operator
 	// fixes the file + restarts the container) still works.
-	//
-	// onReload is set AFTER subsystem construction below, so this
-	// closure dispatches into a (later-populated) reloadSubscribers
-	// slice. Until subsystems register, the watcher just records the
-	// metric — the atomic Current() pointer swap already happened
-	// inside config.Watch's doReload.
-	var (
-		reloadMu          sync.Mutex
-		reloadSubscribers []func(*config.Config)
-	)
-	subscribeReload := func(fn func(*config.Config)) {
-		reloadMu.Lock()
-		defer reloadMu.Unlock()
-		reloadSubscribers = append(reloadSubscribers, fn)
-	}
-	dispatchReload := func() {
-		reloadMu.Lock()
-		fns := append([]func(*config.Config){}, reloadSubscribers...)
-		reloadMu.Unlock()
-		live := config.Current()
-		if live == nil {
-			return
-		}
-		for _, fn := range fns {
-			fn(live)
-		}
-	}
 	if err := config.Watch(ctx, configPath, func(result config.ReloadResult, _ error) {
 		metrics.ConfigReloadsTotal.WithLabelValues(string(result)).Inc()
-		if result == config.ReloadSuccess {
-			dispatchReload()
-		}
 	}); err != nil {
 		slog.Warn("active.yaml hot-reload watcher disabled", "err", err, "path", configPath)
 	} else {
@@ -258,22 +228,17 @@ func main() {
 				for _, g := range gpus {
 					exists[g.Index] = true
 				}
-				for name, model := range cfg.Models {
-					if model.Alias != "" {
-						continue
-					}
-					// External-lifecycle instances may declare GPUs that live on
-					// a different host (jukebox doesn't own the process). Skip
-					// the local nvidia-smi check for them — the gpus field on an
-					// external model is informational.
-					if model.EffectiveLifecycle() == config.LifecycleExternal {
-						continue
-					}
-					for _, id := range model.GPUs {
-						if !exists[id] {
-							slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
-							os.Exit(1)
-						}
+				// External-lifecycle instances may declare GPUs that live on
+				// a different host (jukebox doesn't own the process). Skip
+				// the local nvidia-smi check for them — the gpus field on an
+				// external model is informational.
+				if model.EffectiveLifecycle() == config.LifecycleExternal {
+					continue
+				}
+				for _, id := range model.GPUs {
+					if !exists[id] {
+						slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
+						os.Exit(1)
 					}
 				}
 			}
@@ -319,11 +284,6 @@ func main() {
 			os.Exit(1)
 		}
 		go sched.IdleMonitor(ctx)
-
-		// Subscribe the scheduler to active.yaml hot-reloads so its
-		// admission controller picks up per-model field edits without
-		// requiring a process restart.
-		subscribeReload(sched.OnConfigReloaded)
 
 		stopOnce := sync.Once{}
 		stop = func() {

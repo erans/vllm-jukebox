@@ -1123,28 +1123,6 @@ func TestMapWakeError_VRAMDriftRisk_NoRetryAfter(t *testing.T) {
 	}
 }
 
-// TestMapWakeError_PinnedWakeFailed_NoRetryAfter pins the round-5
-// CRITICAL contract: an ErrColdLoadPinnedWakeFailed wrap must route to
-// RejectAdminIntervention with NO Retry-After so SDKs surface the
-// state-inconsistent condition as terminal rather than retry-loop.
-// Pairs with the HTTP-layer mapping in handlers_proxy.go +
-// handlers_anthropic.go which already render RejectAdminIntervention
-// as 503 + body code "admin_intervention_required".
-func TestMapWakeError_PinnedWakeFailed_NoRetryAfter(t *testing.T) {
-	wrapped := fmt.Errorf("%w: pinned peers left Sleeping after cold-load failure", ErrColdLoadPinnedWakeFailed)
-	mapped := mapWakeError(wrapped)
-	rej, ok := mapped.(*RejectError)
-	if !ok {
-		t.Fatalf("expected *RejectError, got %T: %v", mapped, mapped)
-	}
-	if rej.Reason != RejectAdminIntervention {
-		t.Errorf("expected Reason=%s (so HTTP handlers render 503 + admin_intervention_required), got %s", RejectAdminIntervention, rej.Reason)
-	}
-	if rej.RetryAfter != 0 {
-		t.Errorf("expected RetryAfter=0 (no retry on pinned-wake-failed), got %s", rej.RetryAfter)
-	}
-}
-
 func TestMapWakeError_GenericSwapConflict_RetryableWith10s(t *testing.T) {
 	mapped := mapWakeError(errors.New("transient evictor error"))
 	rej, ok := mapped.(*RejectError)
@@ -1374,7 +1352,7 @@ func TestRedeployMember_PeerStop_CtxCancelMidExec_NoAdmissionDrift(t *testing.T)
 	for _, g := range moeState.GPUs {
 		// drop the residual that was added by the constructor
 		a.l1ResidualByGPU[g] -= moeState.L1ResidualMB
-		a.awakeByGPU[g] += moeState.ExpectedOn(g)
+		a.awakeByGPU[g] += moeState.ExpectedVRAMMB
 	}
 	a.mu.Unlock()
 
@@ -1442,58 +1420,5 @@ func TestRedeployMember_PeerStop_CtxCancelMidExec_NoAdmissionDrift(t *testing.T)
 		if p == "moe" {
 			t.Errorf("StoppedPeers should NOT include 'moe' (docker stop failed), got %v", out.r.StoppedPeers)
 		}
-	}
-}
-
-// TestRedeployMember_ClearsColdLoadFailureCooldown is the architect
-// round-5 HIGH-2 regression test. RedeployMember's docstring claims
-// the operator escape hatch "bypasses the cold-load failure cooldown
-// entirely" — pre-fix the REQUEST-PATH gate was bypassed (RedeployMember
-// never calls KickColdLoad) but the stale failure record was NEVER
-// cleared. If the redeployed model later went Sleeping → Stopped via
-// stop-eviction inside the original 30s cooldown window, a subsequent
-// request-triggered KickColdLoad gated on a failure the operator just
-// resolved.
-//
-// Asserts: on RedeployMember success, coldLoadFailures[target] is
-// absent post-call, regardless of whether a prior cooldown was active.
-func TestRedeployMember_ClearsColdLoadFailureCooldown(t *testing.T) {
-	s, _, mgrs := makeRedeployScheduler(t, redeployHappyConfig,
-		map[string]State{"main": StateReady, "moe": StateReady},
-		map[int]int{0: 10000, 1: 10000},
-	)
-
-	// Seed a stale cold-load failure cooldown for moe (the redeploy
-	// target) — simulates a prior async cold-load that failed within
-	// the cooldown window.
-	s.mu.Lock()
-	s.coldLoadFailures["moe"] = coldLoadFailureRecord{
-		at:  time.Now(),
-		err: "simulated prior cold-load failure",
-	}
-	s.mu.Unlock()
-
-	SetDockerCmdForTest(func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		// pollUntilSleeping needs is_sleeping=true after start.
-		if len(args) >= 2 && args[0] == "start" {
-			for _, m := range mgrs {
-				m.isSleeping.Store(true)
-			}
-		}
-		return []byte("ok"), nil
-	})
-	defer SetDockerCmdForTest(nil)
-
-	_, err := s.RedeployMember(context.Background(), "moe")
-	if err != nil {
-		t.Fatalf("RedeployMember: %v", err)
-	}
-
-	// HIGH-2 assertion: stale cooldown record must be cleared on success.
-	s.mu.Lock()
-	_, gated := s.coldLoadFailures["moe"]
-	s.mu.Unlock()
-	if gated {
-		t.Errorf("coldLoadFailures[moe] still present after successful RedeployMember; operator escape hatch contract is violated (HIGH-2 regression)")
 	}
 }
