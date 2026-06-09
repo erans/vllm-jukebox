@@ -796,3 +796,190 @@ func TestLoad_QwenLlamaCppExampleParses(t *testing.T) {
 		t.Fatalf("expected example to parse, got: %v", err)
 	}
 }
+
+func TestValidate_RunnerPoolingParses(t *testing.T) {
+	cfg, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  bge:
+    path: "BAAI/bge-m3"
+    runner: pooling
+`)
+	if err != nil {
+		t.Fatalf("expected runner: pooling to parse, got: %v", err)
+	}
+	if cfg.Models["bge"].Runner != "pooling" {
+		t.Fatalf("expected runner=pooling, got %q", cfg.Models["bge"].Runner)
+	}
+}
+
+func TestValidate_RunnerGenerateParses(t *testing.T) {
+	if _, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    runner: generate
+`); err != nil {
+		t.Fatalf("expected runner: generate to parse, got: %v", err)
+	}
+}
+
+func TestValidate_RunnerUnknownRejected(t *testing.T) {
+	_, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    runner: classify
+`)
+	if err == nil {
+		t.Fatalf("expected unknown runner to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runner") {
+		t.Fatalf("expected error to mention runner, got: %v", err)
+	}
+}
+
+func TestValidate_RunnerPoolingWithLlamaCppRejected(t *testing.T) {
+	_, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+  binary: "vllm"
+llama_cpp:
+  binary: "llama-server"
+models:
+  m:
+    runtime: llama_cpp
+    runner: pooling
+    path: "/models/m.gguf"
+`)
+	if err == nil {
+		t.Fatalf("expected runner: pooling + runtime: llama_cpp to be rejected")
+	}
+	if !strings.Contains(err.Error(), "pooling") || !strings.Contains(err.Error(), "llama_cpp") {
+		t.Fatalf("expected error to mention pooling + llama_cpp, got: %v", err)
+	}
+}
+
+// --- cold_load_timeout_seconds (per-model cold-load wait) ---
+
+func TestEffectiveColdLoadTimeout_DefaultWhenUnset(t *testing.T) {
+	m := config.ModelConfig{} // ColdLoadTimeoutSeconds == 0
+	got := m.EffectiveColdLoadTimeout()
+	if got != config.DefaultColdLoadTimeout {
+		t.Fatalf("expected default %s when unset, got %s", config.DefaultColdLoadTimeout, got)
+	}
+	// Sanity: the new default must be at least the old hardcoded 5 min;
+	// the whole point of this change is to give big-context FP8-KV
+	// models room to finish cudagraph capture.
+	if got < 5*time.Minute {
+		t.Fatalf("default cold-load timeout regressed below historical 5m floor: %s", got)
+	}
+}
+
+func TestEffectiveColdLoadTimeout_ReadsPerModelValue(t *testing.T) {
+	cfg, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  longctx:
+    path: "/models/longctx"
+    cold_load_timeout_seconds: 720
+`)
+	if err != nil {
+		t.Fatalf("expected valid config, got: %v", err)
+	}
+	got := cfg.Models["longctx"].EffectiveColdLoadTimeout()
+	want := 720 * time.Second
+	if got != want {
+		t.Fatalf("expected per-model cold-load timeout %s, got %s", want, got)
+	}
+}
+
+func TestValidate_ColdLoadTimeoutSeconds_Negative(t *testing.T) {
+	_, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    cold_load_timeout_seconds: -1
+`)
+	if err == nil {
+		t.Fatalf("expected negative cold_load_timeout_seconds to be rejected")
+	}
+	if !strings.Contains(err.Error(), "cold_load_timeout_seconds") {
+		t.Fatalf("expected error to mention cold_load_timeout_seconds, got: %v", err)
+	}
+}
+
+func TestValidate_ColdLoadTimeoutSeconds_TooShort(t *testing.T) {
+	_, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    cold_load_timeout_seconds: 10
+`)
+	if err == nil {
+		t.Fatalf("expected cold_load_timeout_seconds=10 (below 30s floor) to be rejected")
+	}
+	if !strings.Contains(err.Error(), "cold_load_timeout_seconds") || !strings.Contains(err.Error(), "minimum") {
+		t.Fatalf("expected error to mention floor violation, got: %v", err)
+	}
+}
+
+func TestValidate_ColdLoadTimeoutSeconds_TooLong(t *testing.T) {
+	_, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    cold_load_timeout_seconds: 3600
+`)
+	if err == nil {
+		t.Fatalf("expected cold_load_timeout_seconds=3600 (above 30m ceiling) to be rejected")
+	}
+	if !strings.Contains(err.Error(), "cold_load_timeout_seconds") || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("expected error to mention ceiling violation, got: %v", err)
+	}
+}
+
+func TestValidate_ColdLoadTimeoutSeconds_BoundaryValuesAccepted(t *testing.T) {
+	// 30s floor exactly
+	cfg, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    cold_load_timeout_seconds: 30
+`)
+	if err != nil {
+		t.Fatalf("expected 30s (floor) to be accepted, got: %v", err)
+	}
+	if got := cfg.Models["m"].EffectiveColdLoadTimeout(); got != 30*time.Second {
+		t.Fatalf("expected 30s, got %s", got)
+	}
+	// 1800s ceiling exactly (30 min)
+	cfg, err = loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    cold_load_timeout_seconds: 1800
+`)
+	if err != nil {
+		t.Fatalf("expected 1800s (ceiling) to be accepted, got: %v", err)
+	}
+	if got := cfg.Models["m"].EffectiveColdLoadTimeout(); got != 30*time.Minute {
+		t.Fatalf("expected 30m, got %s", got)
+	}
+}

@@ -17,6 +17,7 @@ import (
 
 	"vllm-jukebox/internal/config"
 	rt "vllm-jukebox/internal/runtime"
+	"vllm-jukebox/internal/vllmcli"
 )
 
 type Manager struct {
@@ -26,19 +27,19 @@ type Manager struct {
 	// extraEnv is applied after default and model env, overriding on conflict.
 	extraEnv map[string]string
 
-	mu            sync.Mutex
-	cmd           *exec.Cmd
-	pid           int
-	waitCh        chan error
-	exitCh        chan struct{}
-	exitInfo      *processExitInfo
-	stopRequested bool
-	currentModel  string
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	pid            int
+	waitCh         chan error
+	exitCh         chan struct{}
+	exitInfo       *processExitInfo
+	stopRequested  bool
+	currentModel   string
 	currentRuntime string
-	startedAt     time.Time
-	stderrTail    *tailBuffer
-	stdoutTail    *tailBuffer
-	logWriter     *RotatingFileWriter
+	startedAt      time.Time
+	stderrTail     *tailBuffer
+	stdoutTail     *tailBuffer
+	logWriter      *RotatingFileWriter
 }
 
 type processExitInfo struct {
@@ -131,7 +132,16 @@ func (m *Manager) Start(ctx context.Context, modelName string) (int, error) {
 	bin, binArgs := wrapBinaryArgs(runtimeImpl.Binary(m.cfg), args)
 	cmd := exec.Command(bin, binArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = BuildEnv(os.Environ(), m.cfg.VLLM.DefaultEnv, mergeEnv(modelCfg.Env, m.extraEnv))
+
+	// If the model uses sleep_mode, vLLM requires VLLM_SERVER_DEV_MODE=1 to
+	// expose the /sleep, /wake_up, /is_sleeping endpoints. Inject it as the
+	// default — operator overrides via model.env or vllm.default_env still
+	// win because the model/extraEnv layers are applied last.
+	defaultEnv := m.cfg.VLLM.DefaultEnv
+	if modelCfg.SleepMode {
+		defaultEnv = mergeEnv(defaultEnv, map[string]string{"VLLM_SERVER_DEV_MODE": "1"})
+	}
+	cmd.Env = BuildEnv(os.Environ(), defaultEnv, mergeEnv(modelCfg.Env, m.extraEnv))
 	stdoutTail := newTailBuffer(16 * 1024)
 	stderrTail := newTailBuffer(16 * 1024)
 
@@ -384,6 +394,24 @@ func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 	}
 
 	return runtimeImpl.VerifyModelLoaded(ctx, base, expectedModel, modelCfg.Path)
+}
+
+// Sleep asks vLLM to enter sleep mode at the given level. See
+// vllmcli.Sleep for level semantics. Requires the vLLM process to have
+// been started with --enable-sleep-mode and VLLM_SERVER_DEV_MODE=1.
+func (m *Manager) Sleep(ctx context.Context, level int) error {
+	return vllmcli.Sleep(ctx, m.BaseURL(), level)
+}
+
+// Wake asks vLLM to wake from sleep mode and polls /health until it
+// returns 200 OK or timeout elapses.
+func (m *Manager) Wake(ctx context.Context, timeout time.Duration) error {
+	return vllmcli.Wake(ctx, m.BaseURL(), timeout)
+}
+
+// IsSleeping reports whether the vLLM instance is currently sleeping.
+func (m *Manager) IsSleeping(ctx context.Context) (bool, error) {
+	return vllmcli.IsSleeping(ctx, m.BaseURL())
 }
 
 type tailBuffer struct {
