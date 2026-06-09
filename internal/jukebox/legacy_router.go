@@ -49,3 +49,12 @@ func (r *LegacyRouter) AcquireRoute(ctx context.Context, requestedModel, request
 		Done:          done,
 	}, nil
 }
+
+// LegacyRouter intentionally does NOT implement the optional
+// ColdLoadAware interface. Swap mode has no admissionStopped concept
+// (the single-instance coordinator does not stop containers; it only
+// swaps processes), so the async-503 + KickColdLoad path is structurally
+// inapplicable. HTTP handlers type-assert at the callsite — when the
+// assertion fails the handler skips the async-503 branch and falls
+// through to AcquireRoute, which is exactly the behavior swap mode
+// needs (and exactly what the no-op stubs used to fake).

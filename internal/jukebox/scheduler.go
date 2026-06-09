@@ -3,6 +3,7 @@ package jukebox
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,12 +26,27 @@ type Scheduler struct {
 	now      func() time.Time
 	new      InstanceFactory
 
+	// admission is the optional VRAM-budget-aware wake coordinator.
+	// nil = legacy behavior (jukebox calls /wake_up unmediated and
+	// any OOM surfaces as a 503 to the client). Set via SetAdmission
+	// after construction.
+	admission *AdmissionController
+
 	// sched is a semaphore (size 1) that serializes scheduling operations.
 	sched chan struct{}
 
 	mu        sync.RWMutex
 	instances map[string]*schedInstance // keyed by resolved model name
 	waiters   map[string]bool           // at most one waiter per resolved model
+	wakeOps   map[string]*wakeOp        // in-flight wake per resolved model (fan-out)
+
+	// coldLoadKicks tracks which models have an in-flight async
+	// cold-load goroutine kicked by KickColdLoad. Used purely to
+	// dedupe goroutine spawns (defense-in-depth — coldLoadStoppedMember
+	// also TOCTOU-rechecks inside the global cold-load lock, so even
+	// without this map only one cold-load would actually run). Cleared
+	// by the goroutine on exit. Guarded by mu.
+	coldLoadKicks map[string]bool
 
 	total inflight.Tracker
 }
@@ -74,15 +90,17 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		}
 	}
 	s := &Scheduler{
-		cfg:       cfg,
-		inv:       inv,
-		ports:     portPool,
-		powerMgr:  powerMgr,
-		now:       now,
-		new:       factory,
-		sched:     make(chan struct{}, 1),
-		instances: map[string]*schedInstance{},
-		waiters:   map[string]bool{},
+		cfg:           cfg,
+		inv:           inv,
+		ports:         portPool,
+		powerMgr:      powerMgr,
+		now:           now,
+		new:           factory,
+		sched:         make(chan struct{}, 1),
+		instances:     map[string]*schedInstance{},
+		waiters:       map[string]bool{},
+		wakeOps:       map[string]*wakeOp{},
+		coldLoadKicks: map[string]bool{},
 	}
 	s.total.OnChange = func(count int64) {
 		metrics.InFlightRequests.Set(float64(count))
@@ -125,16 +143,39 @@ func (s *Scheduler) Status() Status {
 	busy := len(s.sched) == cap(s.sched) // held if channel full
 
 	accepting := false
+	anySleeping := false
+	anyStopped := false
 	for _, inst := range s.instances {
 		if inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
 			accepting = true
 			break
+		}
+		if inst.state == StateSleeping {
+			anySleeping = true
+		}
+		if inst.state == StateStopped {
+			anyStopped = true
 		}
 	}
 
 	state := StateIdle
 	if accepting {
 		state = StateReady
+	} else if anySleeping {
+		// Slept instances can be woken on demand, so jukebox is still
+		// effectively accepting work — just at higher latency for the
+		// first request. Report StateSleeping rather than StateIdle so
+		// /health and metrics make this state visible.
+		state = StateSleeping
+	} else if anyStopped {
+		// Stopped instances are warm-on-demand via the async-503 +
+		// KickColdLoad cold-load path (~5min). Report StateStopped so
+		// /health and /status promote accepting_requests=true (the LB
+		// should keep routing traffic so the cold-load recovery loop
+		// can complete on a real consumer request — draining traffic
+		// here would cut off the recovery loop). Mirrors the StateSleeping
+		// branch above for the warm-on-demand category.
+		state = StateStopped
 	} else if busy {
 		state = StateStarting
 	}
@@ -178,6 +219,20 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 
 	if route, ok := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); ok {
 		return route, nil
+	}
+
+	// Sleep-mode fast path: if there's already a slept instance for this
+	// model, wake it rather than building a new one. Multiple concurrent
+	// requests share a single wakeOp — none get 503'd during wake.
+	if route, handled, err := s.tryRouteFromSleep(ctx, resolvedName, modelCfg); handled {
+		if err != nil {
+			return Route{}, err
+		}
+		if route.BaseURL != "" {
+			return route, nil
+		}
+		// Wake "handled" the path but instance state shifted (e.g. auto-suspend
+		// re-slept it). Fall through to full scheduling.
 	}
 
 	// Scheduling required.
@@ -534,6 +589,55 @@ func (s *Scheduler) evictConflicts(ctx context.Context, targetGPUs []int) error 
 func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstance, evicted bool) error {
 	if inst == nil {
 		return nil
+	}
+
+	// Sleep-mode branch: if the model opts into sleep, try to sleep
+	// instead of stopping. On success, KEEP the instance in the map
+	// (port, power limits, GPU allocation all retained — wake will
+	// restore the instance without re-scheduling). On failure, fall
+	// through to the hard-stop path.
+	modelCfg, modelOk := s.cfg.Models[inst.model]
+	if modelOk {
+		// Pinned + non-evicted = graceful shutdown of a model the operator
+		// declared as always-on. Leave it alone. Without this guard,
+		// StopAll (called when jukebox SIGTERMs) would sleep every pinned
+		// instance, leaving them asleep across an unrelated jukebox
+		// restart — operationally surprising and adds a wake latency
+		// hit to the next request that should not have happened.
+		// Eviction is different: an explicit decision to free GPU memory.
+		if inst.pinned && !evicted {
+			slog.Info("skip sleep on shutdown for pinned instance",
+				"model", inst.model,
+				"hint", "pinned models stay awake across jukebox restarts; explicit eviction still slept",
+			)
+			return nil
+		}
+		// External-lifecycle instances are never hard-stopped by jukebox.
+		if modelCfg.EffectiveLifecycle() == config.LifecycleExternal {
+			if modelCfg.SleepMode {
+				reason := "evict"
+				if !evicted {
+					reason = "manual"
+				}
+				return s.sleepInstance(ctx, inst, modelCfg.EffectiveSleepLevel(), reason)
+			}
+			slog.Warn("cannot drain external instance without sleep_mode (no-op)",
+				"model", inst.model,
+				"hint", "set sleep_mode: true to enable jukebox eviction of external instances",
+			)
+			return nil
+		}
+		// Managed-lifecycle with sleep_mode: try sleep first, fall back to stop.
+		if modelCfg.SleepMode {
+			reason := "evict"
+			if !evicted {
+				reason = "manual"
+			}
+			if err := s.sleepInstance(ctx, inst, modelCfg.EffectiveSleepLevel(), reason); err == nil {
+				return nil
+			}
+			slog.Warn("sleep failed; falling back to hard stop", "model", inst.model)
+		}
 	}
 
 	s.mu.Lock()
