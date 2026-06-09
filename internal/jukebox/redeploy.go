@@ -165,7 +165,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 	if s.admission == nil {
 		return RedeployResult{}, fmt.Errorf("admission controller not configured; redeploy-member requires admission")
 	}
-	modelCfg, ok := s.cfg.Models[name]
+	modelCfg, ok := liveModelCfg(s.cfg, name)
 	if !ok {
 		return RedeployResult{}, ErrRedeployUnknownModel
 	}
@@ -223,7 +223,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 				// Already not awake (sleeping/stopped/etc.) — nothing to pause.
 				continue
 			}
-			peerCfg, ok := s.cfg.Models[peer]
+			peerCfg, ok := liveModelCfg(s.cfg, peer)
 			if !ok {
 				continue
 			}
@@ -306,7 +306,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 				// Already stopped — nothing to reclaim, nothing to do.
 				continue
 			}
-			peerCfg, ok := s.cfg.Models[peer]
+			peerCfg, ok := liveModelCfg(s.cfg, peer)
 			if !ok {
 				continue
 			}
@@ -595,7 +595,7 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 				slog.Warn("redeploy_restore_pinned_peer_skipped", "peer", peer, "reason", "no instance")
 				continue
 			}
-			peerCfg, ok := s.cfg.Models[peer]
+			peerCfg, ok := liveModelCfg(s.cfg, peer)
 			if !ok {
 				continue
 			}
@@ -742,7 +742,7 @@ func (s *Scheduler) bestEffortRestorePinned(ctx context.Context, paused []string
 		if peerInst == nil {
 			continue
 		}
-		peerCfg, ok := s.cfg.Models[peer]
+		peerCfg, ok := liveModelCfg(s.cfg, peer)
 		if !ok {
 			continue
 		}

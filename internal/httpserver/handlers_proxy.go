@@ -94,6 +94,12 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		}
 
 		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
+		// Resolve against the live config so a mid-flight active.yaml
+		// reload that adds / removes a model is reflected immediately.
+		liveCfg := config.Current()
+		if liveCfg == nil {
+			liveCfg = opts.Config
+		}
 		_, _, err = liveCfg.ResolveModel(modelName)
 		if err != nil {
 			return writeOpenAIError(
