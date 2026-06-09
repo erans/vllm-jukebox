@@ -47,6 +47,49 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			requestID = c.Get(requestIDHeader)
 		}
 
+		// Async-503 contract for wake-from-Stopped (per Kagi PATCH 16).
+		// If admission has the model in admissionStopped (its container is
+		// `docker compose stop`'d because a previous admission cycle picked
+		// it as an evict_action: stop victim), the synchronous wake path
+		// would block this request for ~5 min (moe/longctx) — way past
+		// Bifrost / downstream HTTP-client timeouts. Kick the cold-load on
+		// a background goroutine (using context.Background() with a
+		// generous timeout — NOT the inbound ctx which dies when the
+		// client gives up) and return 503 + Retry-After: 60 immediately.
+		// The client retries against another 503 ("still warming") or hits
+		// a Sleeping → Awake fast path once cold-load completes.
+		//
+		// admissionSleeping (the other not-Awake state) is NOT 503'd —
+		// /wake_up takes ~10-30s and fits comfortably in client timeouts.
+		//
+		// Type-assert to the OPTIONAL ColdLoadAware interface. Routers
+		// that don't implement it (e.g. LegacyRouter for swap mode) skip
+		// this branch entirely and fall through to AcquireRoute, which
+		// still works correctly — swap mode has no admissionStopped state
+		// so the async-503 path is structurally inapplicable there.
+		if cl, ok := opts.Router.(jukebox.ColdLoadAware); ok && cl.IsModelColdLoading(modelName) {
+			cl.KickColdLoad(modelName)
+			// Retry-After: 60 (NOT 300). Rationale:
+			//   - OpenAI Python SDK caps its retry budget around ~8s and
+			//     gives up entirely on Retry-After > a few minutes.
+			//   - Anthropic SDK respects up to ~60s, then surfaces the
+			//     error to the caller.
+			//   - Bifrost / other proxies enforce their own deadlines.
+			// 300s caused most SDK clients to surface user-visible errors
+			// instead of retrying. With 60s, clients re-poll every minute,
+			// see more 503s while the model is still cold-loading, and
+			// eventually land on the warm Sleeping path on a later retry —
+			// which is the whole point of the async-503 contract.
+			c.Set("Retry-After", "60")
+			return writeOpenAIError(
+				c,
+				http.StatusServiceUnavailable,
+				"Model is cold-starting (~5 min for large models). Please retry.",
+				"service_unavailable",
+				"warming_up",
+			)
+		}
+
 		route, err := opts.Router.AcquireRoute(c.UserContext(), modelName, requestID)
 		if err != nil {
 			return mapEnsureError(c, err)
@@ -101,7 +144,16 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 		case jukebox.RejectNoCapacity:
 			msg = "Insufficient capacity to start requested model, please retry"
 		case jukebox.RejectInsufficient:
-			msg = "Insufficient GPU resources to start requested model, please retry"
+			// Non-retryable: structural infeasibility (model exceeds the
+			// pinned-adjusted GPU budget no matter what we evict). The
+			// header omits Retry-After so retry-aware SDKs don't loop.
+			// Body must NOT contradict by saying "please retry".
+			msg = "Model exceeds available GPU budget; reconfigure or add capacity"
+		case jukebox.RejectAdminIntervention:
+			// Non-retryable: admission books may have drifted from
+			// physical container state because a cleanup `docker stop`
+			// failed. Operator intervention is required (see audit log).
+			msg = "Resource state inconsistent; operator intervention required (see audit log)"
 		case jukebox.RejectMinUptime:
 			msg = "Insufficient GPU resources (min uptime), please retry"
 		}

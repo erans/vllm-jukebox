@@ -29,6 +29,11 @@ func NewApp(opts Options) *fiber.App {
 	app.Get("/health", healthHandler(opts.Router))
 	app.Get("/status", statusHandler(opts.Config, opts.Router))
 
+	// Admin endpoints. No auth — see handlers_admin.go's docstring for
+	// the loopback-binding contract that makes that safe.
+	admin := app.Group("/admin")
+	admin.Post("/redeploy-member", redeployMemberHandler(opts.Router))
+
 	app.Get("/v1/models", listModelsHandler(opts.Config))
 	app.Get("/metrics", metricsHandler())
 
@@ -39,6 +44,12 @@ func NewApp(opts Options) *fiber.App {
 	app.Post("/v1/embeddings", switchingProxyHandler(opts))
 	app.Post("/v1/tokenize", switchingProxyHandler(opts))
 	app.Post("/v1/detokenize", switchingProxyHandler(opts))
+	// vLLM exposes reranking under both /v1/rerank and /rerank depending on
+	// the installed serving entrypoint. Route both so jukebox is a transparent
+	// proxy regardless of which one the client uses. The model is extracted
+	// from the request body, so admission + wake fan-out apply normally.
+	app.Post("/v1/rerank", switchingProxyHandler(opts))
+	app.Post("/rerank", switchingProxyHandler(opts))
 
 	// Anthropic endpoints
 	app.Post("/v1/messages", anthropicProxyHandler(opts))

@@ -76,8 +76,14 @@ func statusHandler(cfg *config.Config, coord StatusProvider) fiber.Handler {
 		}
 
 		return c.JSON(fiber.Map{
-			"state":                           st.State,
-			"accepting_requests":              st.State == jukebox.StateReady,
+			"state": st.State,
+			// Sleeping AND Stopped are warm-on-demand: Sleeping wakes via
+			// /wake_up (~30s), Stopped wakes via docker start + cold-load
+			// (~5min from page cache). Both surfaces should signal
+			// "accepting (with latency)" so an operator dashboard / LB
+			// status check doesn't false-alarm during routine eviction
+			// or redeploy-member windows. Mirrors /health.
+			"accepting_requests":              st.State == jukebox.StateReady || st.State == jukebox.StateSleeping || st.State == jukebox.StateStopped,
 			"current_model":                   st.CurrentModel,
 			"in_flight_requests":              st.InFlight,
 			"uptime_seconds":                  st.UptimeSeconds,
