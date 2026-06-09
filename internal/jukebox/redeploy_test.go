@@ -1374,7 +1374,7 @@ func TestRedeployMember_PeerStop_CtxCancelMidExec_NoAdmissionDrift(t *testing.T)
 	for _, g := range moeState.GPUs {
 		// drop the residual that was added by the constructor
 		a.l1ResidualByGPU[g] -= moeState.L1ResidualMB
-		a.awakeByGPU[g] += moeState.ExpectedVRAMMB
+		a.awakeByGPU[g] += moeState.ExpectedOn(g)
 	}
 	a.mu.Unlock()
 

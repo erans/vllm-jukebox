@@ -340,6 +340,21 @@ type ModelConfig struct {
 	// Default 0 = no admission control for this model (legacy behavior:
 	// jukebox calls /wake_up directly and any OOM surfaces as 503).
 	ExpectedVRAMMBPerGPU int `yaml:"expected_vram_mb_per_gpu"`
+	// ExpectedVRAMMBByGPU is the per-GPU override of ExpectedVRAMMBPerGPU
+	// — needed when a model's footprint is asymmetric across its GPUs
+	// (e.g. vLLM pipeline parallelism: rank 1 carries the embedding +
+	// lm_head + sampler, +1-2 GiB heavier than rank 0). Using a flat
+	// scalar in that case forces the operator to pick the heavier rank
+	// for the whole set, stranding the delta on the lighter ranks.
+	//
+	// When set, every GPU in `gpus` MUST have an entry, each value MUST
+	// be > 0, and ExpectedVRAMMBPerGPU MUST be unset (mutually exclusive
+	// — picking one source of truth avoids drift). When unset, admission
+	// falls back to ExpectedVRAMMBPerGPU on every GPU.
+	//
+	// Default nil = admission uses the flat ExpectedVRAMMBPerGPU value
+	// (legacy behavior).
+	ExpectedVRAMMBByGPU map[int]int `yaml:"expected_vram_mb_by_gpu,omitempty" json:"expected_vram_mb_by_gpu,omitempty"`
 	// SleepL1ResidualMB is the VRAM that vLLM's cumem allocator keeps
 	// reserved after an L1 sleep (weights freed, but the pool is not
 	// returned to the driver until full process exit). Measured empirically
@@ -617,24 +632,65 @@ func (c *Config) validateAdmission() error {
 		if model.ExpectedVRAMMBPerGPU < 0 {
 			return fmt.Errorf("model %q: expected_vram_mb_per_gpu must be >= 0", name)
 		}
+		// Mutually exclusive: pick one source of truth so drift between the
+		// scalar and the per-GPU map can't silently desync admission books.
+		if model.ExpectedVRAMMBPerGPU > 0 && len(model.ExpectedVRAMMBByGPU) > 0 {
+			return fmt.Errorf("model %q: expected_vram_mb_per_gpu and expected_vram_mb_by_gpu are mutually exclusive — pick one", name)
+		}
+		// Per-GPU map validation: every value > 0, every model GPU has an
+		// entry, no stray entries for GPUs the model doesn't touch.
+		if len(model.ExpectedVRAMMBByGPU) > 0 {
+			for gpu, mb := range model.ExpectedVRAMMBByGPU {
+				if mb <= 0 {
+					return fmt.Errorf("model %q: expected_vram_mb_by_gpu[%d] must be > 0, got %d", name, gpu, mb)
+				}
+			}
+			gpuSet := map[int]bool{}
+			for _, g := range model.GPUs {
+				gpuSet[g] = true
+			}
+			for gpu := range model.ExpectedVRAMMBByGPU {
+				if !gpuSet[gpu] {
+					return fmt.Errorf("model %q: expected_vram_mb_by_gpu has entry for GPU %d which is not in gpus list %v", name, gpu, model.GPUs)
+				}
+			}
+			for _, g := range model.GPUs {
+				if _, ok := model.ExpectedVRAMMBByGPU[g]; !ok {
+					return fmt.Errorf("model %q: expected_vram_mb_by_gpu must have an entry for every GPU in gpus list; missing GPU %d", name, g)
+				}
+			}
+		}
 		if model.SleepL1ResidualMB < 0 {
 			return fmt.Errorf("model %q: sleep_l1_residual_mb must be >= 0", name)
 		}
-		if model.SleepL1ResidualMB > model.ExpectedVRAMMBPerGPU {
-			return fmt.Errorf("model %q: sleep_l1_residual_mb (%d) must not exceed expected_vram_mb_per_gpu (%d) — a sleeping model cannot hold more VRAM than it took while awake",
-				name, model.SleepL1ResidualMB, model.ExpectedVRAMMBPerGPU)
+		// L1 residual must not exceed the model's per-GPU expected footprint
+		// on ANY GPU. With per-GPU calibration, the smallest per-GPU expected
+		// value is the binding constraint.
+		minExpected := model.ExpectedVRAMMBPerGPU
+		if len(model.ExpectedVRAMMBByGPU) > 0 {
+			first := true
+			for _, mb := range model.ExpectedVRAMMBByGPU {
+				if first || mb < minExpected {
+					minExpected = mb
+					first = false
+				}
+			}
+		}
+		if model.SleepL1ResidualMB > minExpected {
+			return fmt.Errorf("model %q: sleep_l1_residual_mb (%d) must not exceed expected_vram_mb_per_gpu / expected_vram_mb_by_gpu (min %d) — a sleeping model cannot hold more VRAM than it took while awake",
+				name, model.SleepL1ResidualMB, minExpected)
 		}
 		if model.Alias != "" {
 			// Aliases must NOT declare their own admission footprint —
 			// they share the target's state, and double-counting would
 			// break budget accounting.
-			return fmt.Errorf("model %q: aliases must not set expected_vram_mb_per_gpu (admission state is owned by the alias target)", name)
+			return fmt.Errorf("model %q: aliases must not set expected_vram_mb_per_gpu or expected_vram_mb_by_gpu (admission state is owned by the alias target)", name)
 		}
 		if c.Scheduler == nil {
-			return fmt.Errorf("model %q: expected_vram_mb_per_gpu requires scheduler mode (admission control is scheduler-only)", name)
+			return fmt.Errorf("model %q: expected_vram_mb_per_gpu/expected_vram_mb_by_gpu requires scheduler mode (admission control is scheduler-only)", name)
 		}
 		if len(model.GPUs) == 0 {
-			return fmt.Errorf("model %q: expected_vram_mb_per_gpu requires 'gpus' to be set", name)
+			return fmt.Errorf("model %q: expected_vram_mb_per_gpu/expected_vram_mb_by_gpu requires 'gpus' to be set", name)
 		}
 	}
 	return nil
@@ -1031,7 +1087,19 @@ func (m ModelConfig) EffectiveEvictAction() string {
 // this model. A model with no declared VRAM footprint is invisible to
 // admission — its wake is unmediated and any peer's wake won't evict it.
 func (m ModelConfig) AdmissionEnabled() bool {
-	return m.ExpectedVRAMMBPerGPU > 0
+	return m.ExpectedVRAMMBPerGPU > 0 || len(m.ExpectedVRAMMBByGPU) > 0
+}
+
+// EffectiveExpectedVRAMMB returns the expected awake VRAM footprint for
+// this model on the specified GPU. When the per-GPU map is set, the
+// per-GPU value wins (validator guarantees every model GPU has an entry
+// and each is > 0). Otherwise falls back to the flat scalar. For models
+// where AdmissionEnabled() is false, returns 0.
+func (m ModelConfig) EffectiveExpectedVRAMMB(gpu int) int {
+	if v, ok := m.ExpectedVRAMMBByGPU[gpu]; ok {
+		return v
+	}
+	return m.ExpectedVRAMMBPerGPU
 }
 
 // AdmissionEnabled at the config level reports whether ANY model has
