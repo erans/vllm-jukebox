@@ -27,6 +27,21 @@ import (
 )
 
 func main() {
+	// Subcommand dispatch. Keep this above flag.Parse so the subcommand
+	// gets its own arg slice — the default daemon mode still parses
+	// flags exactly as before. Currently `health` is the only
+	// subcommand; it short-circuits and exits with the probe's result.
+	//
+	// IMPORTANT: subcommand detection ONLY fires when the first
+	// non-program arg does not start with "-", so existing invocations
+	// like `jukebox -config foo.yaml` keep working unchanged.
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		switch os.Args[1] {
+		case "health":
+			os.Exit(runHealthCheck(os.Args[2:]))
+		}
+	}
+
 	var configPath string
 	flag.StringVar(&configPath, "config", "", "Path to YAML config file")
 	flag.Parse()
