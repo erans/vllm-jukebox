@@ -87,6 +87,27 @@ type Scheduler struct {
 	// Guarded by mu.
 	coldLoadFailures map[string]coldLoadFailureRecord
 
+	// coldLoadEvictionMu + coldLoadEviction track models that are
+	// currently mid-eviction as part of an in-flight peer cold-load.
+	// Populated synchronously at coldLoadStoppedMember's WithColdLoadLock
+	// entry (target + every potential peer in the same swap group),
+	// cleared on exit. The handler-side fast-fail gate consults this map
+	// via IsInColdLoadEviction to close the gap between "cold-load
+	// started" and "admission state flipped" — a gap observed live
+	// 2026-06-10 as a 600s hang because admission state remained
+	// admissionAwake throughout sleepInstance's StateReady → Stopping →
+	// Sleeping walk, so the IsModelColdLoading gate (which checks for
+	// admissionStopped) missed the request and it blocked downstream on
+	// coldLoadMu inside performWake. See router.ColdLoadAware docstring.
+	//
+	// Mutex is separate from `mu` (the scheduler's main lock) because
+	// the hot path (handler-side IsInColdLoadEviction) takes RLock once
+	// per request and we don't want it to contend with scheduler
+	// state writes. Read-mostly; writes only fire on cold-load entry +
+	// exit (rare relative to request rate).
+	coldLoadEvictionMu sync.RWMutex
+	coldLoadEviction   map[string]struct{}
+
 	total inflight.Tracker
 }
 
