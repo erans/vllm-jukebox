@@ -502,6 +502,53 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 	}
 
 	now := s.now()
+
+	// 2026-06-10 (B-6-rev): drift-recovery probe.
+	//
+	// External sleep-capable instances can transition Ready -> Sleeping
+	// out-of-band — manual /sleep, container restart, or a wake-then-
+	// sleep cycle that completes between checkIdle ticks while the
+	// scheduler is busy with main's heavy load. There is no periodic
+	// /is_sleeping reconcile loop, so jukebox's bookkeeping can drift.
+	//
+	// If we route to a Ready-by-bookkeeping instance that is actually
+	// sleeping, ForwardFiber POSTs to a sleeping vLLM. /v1/chat/completions
+	// auto-wakes there, but /v1/rerank and /v1/embeddings DO NOT — the
+	// server hangs ~60s, the client retries 3x, observed wall-clock 180s
+	// (Phase B-3 live evidence 2026-06-10: rerank to L1-slept reranker
+	// while main concurrent-busy hung 180s; manual /wake_up succeeded in
+	// 226 ms; manual /v1/rerank to woken reranker succeeded in 57 ms).
+	//
+	// Probe budget:
+	//   - lastUsedAt > 30s stale -> only fire when there's been a
+	//     meaningful gap; fresh hot-path requests skip the probe entirely
+	//     (zero added latency under request bursts).
+	//   - 500ms timeout caps worst-case added latency when the probe
+	//     itself is unreachable (we ignore the error and proceed with
+	//     the Ready route — no worse than today's behaviour).
+	//
+	// On confirmed sleep we flip state to StateSleeping and return
+	// (_, false) so the caller (AcquireRoute) falls through to
+	// tryRouteFromSleep, which performs the wake.
+	if sc, ok := inst.mgr.(SleepCapable); ok && now.Sub(inst.lastUsedAt) > 30*time.Second {
+		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		sleeping, perr := sc.IsSleeping(probeCtx)
+		cancel()
+		if perr == nil && sleeping {
+			s.mu.Lock()
+			// Re-check under lock to avoid racing with a concurrent
+			// state transition (NotifyStarted, NotifySleep, etc).
+			if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady {
+				inst.state = StateSleeping
+			}
+			s.mu.Unlock()
+			return Route{}, false
+		}
+		// Probe error or sleeping==false -> proceed with Ready route.
+		// We deliberately DO NOT log on every error here; an unreachable
+		// vllm during the 500ms probe is common during cold-load /
+		// container-restart windows and would spam logs.
+	}
 	s.mu.Lock()
 	// Re-check under lock.
 	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
