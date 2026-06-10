@@ -450,11 +450,29 @@ models:
 	a.mu.Lock()
 	switch admState {
 	case admissionAwake:
-		a.awakeByGPU[0] += a.models["moe"].ExpectedOn(0)
-		a.models["moe"].State = admissionAwake
+		// Snapshot BookedExpectedVRAMMB to match the awake booking so
+		// later markSleepingLocked / markStoppedLocked correctly reverse
+		// it. Mirrors the snapshot discipline that the production
+		// RequestWake awake-commit path uses.
+		m := a.models["moe"]
+		m.State = admissionAwake
+		booked := make(map[int]int, len(m.GPUs))
+		for _, g := range m.GPUs {
+			v := m.ExpectedOn(g)
+			a.awakeByGPU[g] += v
+			booked[g] = v
+		}
+		m.BookedExpectedVRAMMB = booked
 	case admissionSleeping:
-		a.l1ResidualByGPU[0] += a.models["moe"].L1ResidualMB
-		a.models["moe"].State = admissionSleeping
+		m := a.models["moe"]
+		m.State = admissionSleeping
+		if m.L1ResidualMB > 0 {
+			for _, g := range m.GPUs {
+				a.l1ResidualByGPU[g] += m.L1ResidualMB
+			}
+			m.BookedL1ResidualMB = m.L1ResidualMB
+			m.BookedL1ResidualGPUs = append([]int(nil), m.GPUs...)
+		}
 	}
 	a.mu.Unlock()
 

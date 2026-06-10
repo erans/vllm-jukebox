@@ -194,6 +194,36 @@ type modelAdmissionState struct {
 	EvictAction     string // config.EvictActionSleep | config.EvictActionStop
 	State           admissionModelState
 	LastRequestTime time.Time
+
+	// Booked* fields snapshot the EXACT values used when this model's
+	// footprint was added to the controller's per-GPU maps (awakeByGPU,
+	// l1ResidualByGPU, pinnedByGPU). Reversal arithmetic in
+	// markSleepingLocked / markStoppedLocked / RequestWake (Sleeping →
+	// Awake transition) MUST use these snapshots — NOT the live
+	// ExpectedVRAMMB / GPUs / L1ResidualMB fields, which may have been
+	// mutated in place by a hot-reload RefreshConfig in between booking
+	// and reversal.
+	//
+	// Grandfathering invariant: RefreshConfig replaces ExpectedVRAMMB /
+	// GPUs / L1ResidualMB in place but leaves Booked* untouched while
+	// the booking is live. Booked* is refreshed only on the NEXT
+	// booking transition (e.g. Sleeping → Awake re-snapshots from the
+	// then-current live fields).
+	//
+	// BookedExpectedVRAMMB: per-GPU awake-vram amounts currently
+	//   contributing to awakeByGPU (or pinnedByGPU when BookedInPinnedMap).
+	//   nil when nothing is booked (e.g. admissionUnknown / admissionStopped).
+	// BookedL1ResidualMB: per-GPU residual currently contributing to
+	//   l1ResidualByGPU (same on every GPU in BookedL1ResidualGPUs).
+	// BookedL1ResidualGPUs: GPUs where the L1 residual is currently
+	//   booked. nil when nothing is booked.
+	// BookedInPinnedMap: true when BookedExpectedVRAMMB is contributing
+	//   to pinnedByGPU (non-swap-group pinned at construction time)
+	//   rather than awakeByGPU.
+	BookedExpectedVRAMMB map[int]int
+	BookedL1ResidualMB   int
+	BookedL1ResidualGPUs []int
+	BookedInPinnedMap    bool
 }
 
 // ExpectedOn returns the model's awake VRAM footprint on the given GPU.
@@ -249,25 +279,46 @@ func (a *AdmissionController) SetEvictor(evictor AdmissionEvictor) {
 //
 // Grandfathering — IMPORTANT: live per-GPU bookkeeping (awakeByGPU,
 // l1ResidualByGPU, pinnedByGPU) is NOT recomputed against the new
-// config. A model that was already awake stays booked at its
-// ORIGINAL ExpectedVRAMMB on the per-GPU maps; the NEW
-// ExpectedVRAMMB applies only to the next admission decision involving
-// this model (e.g. a future wake after a sleep/stop). Same for
-// SleepL1ResidualMB. This avoids retroactively rewriting bookkeeping
-// for in-flight states (which would risk negative balances and
-// inconsistent eviction math mid-decision).
+// config for currently-booked models. The reversal arithmetic in
+// markSleepingLocked / markStoppedLocked / RequestWake uses the
+// per-model Booked* snapshots (captured at booking time, never
+// rewritten while the booking is live), so a hot-reload of
+// expected_vram_mb_* / gpus / sleep_l1_residual_mb mid-booking does
+// NOT leak phantom budget on the next reversal.
+//
+// The NEW ExpectedVRAMMB / GPUs / L1ResidualMB apply on the next
+// booking transition (Sleeping/Stopped → Awake re-snapshots from the
+// then-current live fields). This matches operator intent: "tuning
+// vram doesn't move the running model around; the next wake uses the
+// new value."
 //
 // Adding a model that wasn't admission-tracked before: registered with
 // zero current bookkeeping; it is admissionUnknown until the next
-// scheduler-observed lifecycle event (wake / sleep / stop).
+// scheduler-observed lifecycle event (wake / sleep / stop). If the
+// new model is pinned AND admission-enabled, its footprint is ALSO
+// immediately added — to pinnedByGPU when non-swap-group, to
+// awakeByGPU when swap-group — and State set to admissionAwake. This
+// mirrors NewAdmissionController so a hot-reload that adds a pinned
+// model behaves identically to a restart with that model already in
+// config.
+//
 // Removing a model that WAS tracked: dropped from the controller's
-// view; any stale bookings on the per-GPU maps are NOT clawed back
-// (would risk a negative balance on a GPU shared with another
-// tracked peer). The next time that GPU's awake set is rebuilt from
-// scratch (process restart) the stale entry is gone.
+// view; any stale bookings on the per-GPU maps ARE clawed back via
+// the Booked* snapshots, so the per-GPU maps stay accurate across
+// model removal too.
+//
+// Pinned-flip handling (pinned ↔ unpinned via hot-reload):
+//   - flip TRUE → FALSE for a model whose footprint is in pinnedByGPU
+//     (non-swap-group): footprint is migrated from pinnedByGPU to
+//     awakeByGPU (BookedInPinnedMap cleared). Model stays awake.
+//   - flip FALSE → TRUE: not reconciled — the model's footprint stays
+//     in awakeByGPU until its next sleep. Pinned arithmetic is
+//     deferred to the next booking transition. Operator-tolerable:
+//     pinned-flag is a hot-reloadable knob that takes effect on the
+//     next wake; documented in the hot-reload matrix.
 //
 // Field-by-field per-model refresh:
-//   - GPUs               replaced
+//   - GPUs               replaced (booking grandfathered via snapshot)
 //   - ExpectedVRAMMB     replaced (grandfathered booking)
 //   - L1ResidualMB       replaced (grandfathered booking)
 //   - Priority           replaced (Pinned still forces critical)
@@ -275,7 +326,8 @@ func (a *AdmissionController) SetEvictor(evictor AdmissionEvictor) {
 //   - SwapGroup          replaced
 //   - EvictAction        replaced
 //
-// State / LastRequestTime are preserved across refresh.
+// State / LastRequestTime / Booked* fields are preserved across
+// refresh; Booked* turns over only at the next booking transition.
 func (a *AdmissionController) RefreshConfig(cfg *config.Config) {
 	if a == nil || cfg == nil {
 		return
@@ -311,11 +363,34 @@ func (a *AdmissionController) RefreshConfig(cfg *config.Config) {
 			}
 			if st.Pinned {
 				st.Priority = config.PriorityCritical
+				// Mirror NewAdmissionController: pinned models get
+				// immediate booking + Awake state at registration time,
+				// snapshotting Booked* so future hot-reload mutations
+				// don't corrupt reversal arithmetic.
+				st.State = admissionAwake
+				booked := make(map[int]int, len(st.GPUs))
+				for _, g := range st.GPUs {
+					booked[g] = st.ExpectedOn(g)
+				}
+				st.BookedExpectedVRAMMB = booked
+				if st.SwapGroup == "" {
+					st.BookedInPinnedMap = true
+					for _, g := range st.GPUs {
+						a.pinnedByGPU[g] += st.ExpectedOn(g)
+					}
+				} else {
+					for _, g := range st.GPUs {
+						a.awakeByGPU[g] += st.ExpectedOn(g)
+					}
+				}
 			}
 			a.models[name] = st
 			continue
 		}
-		// In-place field update; State + LastRequestTime preserved.
+		// In-place field update; State + LastRequestTime + Booked*
+		// preserved. The booking on the per-GPU maps stays at the
+		// original (snapshotted) values — the new ExpectedVRAMMB /
+		// L1ResidualMB / GPUs apply on the NEXT booking transition.
 		existing.GPUs = append(existing.GPUs[:0], m.GPUs...)
 		newExpected := make(map[int]int, len(m.GPUs))
 		for _, g := range m.GPUs {
@@ -323,7 +398,20 @@ func (a *AdmissionController) RefreshConfig(cfg *config.Config) {
 		}
 		existing.ExpectedVRAMMB = newExpected
 		existing.L1ResidualMB = m.SleepL1ResidualMB
-		existing.Pinned = m.Pinned != nil && *m.Pinned
+		newPinned := m.Pinned != nil && *m.Pinned
+		// Pinned TRUE → FALSE migration: footprint currently in
+		// pinnedByGPU (BookedInPinnedMap=true) moves to awakeByGPU.
+		// Reverse-and-re-add using the BookedExpectedVRAMMB snapshot
+		// (NOT live ExpectedVRAMMB) so the migration is exactly
+		// budget-conservative.
+		if existing.Pinned && !newPinned && existing.BookedInPinnedMap {
+			for g, v := range existing.BookedExpectedVRAMMB {
+				a.pinnedByGPU[g] -= v
+				a.awakeByGPU[g] += v
+			}
+			existing.BookedInPinnedMap = false
+		}
+		existing.Pinned = newPinned
 		existing.SwapGroup = m.SwapGroup
 		existing.EvictAction = m.EffectiveEvictAction()
 		if existing.Pinned {
@@ -332,14 +420,44 @@ func (a *AdmissionController) RefreshConfig(cfg *config.Config) {
 			existing.Priority = m.EffectivePriority()
 		}
 	}
-	// Drop models that disappeared from the config. We do NOT claw back
-	// their per-GPU bookings — that would risk going negative on a GPU
-	// shared with a still-tracked peer. The next process restart
-	// rebuilds the books from scratch.
-	for name := range a.models {
-		if !seen[name] {
-			delete(a.models, name)
+	// Drop models that disappeared from the config. Claw back their
+	// bookings via the Booked* snapshots — safe because the snapshots
+	// describe EXACTLY what was added to the per-GPU maps. Without this,
+	// a model removed mid-Awake would leak its footprint until restart.
+	for name, m := range a.models {
+		if seen[name] {
+			continue
 		}
+		a.reverseAllBookingsLocked(m)
+		delete(a.models, name)
+	}
+	a.publishGauges()
+}
+
+// reverseAllBookingsLocked subtracts every active per-GPU booking for m
+// using the Booked* snapshots. Used by RefreshConfig when a tracked
+// model disappears from the new config. Idempotent (clears the
+// snapshots so a second call is a no-op). Caller must hold a.mu.
+func (a *AdmissionController) reverseAllBookingsLocked(m *modelAdmissionState) {
+	if len(m.BookedExpectedVRAMMB) > 0 {
+		if m.BookedInPinnedMap {
+			for g, v := range m.BookedExpectedVRAMMB {
+				a.pinnedByGPU[g] -= v
+			}
+		} else {
+			for g, v := range m.BookedExpectedVRAMMB {
+				a.awakeByGPU[g] -= v
+			}
+		}
+		m.BookedExpectedVRAMMB = nil
+		m.BookedInPinnedMap = false
+	}
+	if m.BookedL1ResidualMB > 0 && len(m.BookedL1ResidualGPUs) > 0 {
+		for _, g := range m.BookedL1ResidualGPUs {
+			a.l1ResidualByGPU[g] -= m.BookedL1ResidualMB
+		}
+		m.BookedL1ResidualMB = 0
+		m.BookedL1ResidualGPUs = nil
 	}
 }
 
@@ -385,7 +503,16 @@ func NewAdmissionController(cfg *config.Config, totalsByGPU map[int]int, evictor
 		if st.Pinned {
 			st.Priority = config.PriorityCritical
 			st.State = admissionAwake
+			// Snapshot the per-GPU footprint used for the booking so a
+			// future hot-reload of expected_vram_mb_* / gpus does NOT
+			// retroactively rewrite the reversal arithmetic.
+			booked := make(map[int]int, len(st.GPUs))
+			for _, g := range st.GPUs {
+				booked[g] = st.ExpectedOn(g)
+			}
+			st.BookedExpectedVRAMMB = booked
 			if st.SwapGroup == "" {
+				st.BookedInPinnedMap = true
 				for _, g := range st.GPUs {
 					a.pinnedByGPU[g] += st.ExpectedOn(g)
 				}
@@ -606,14 +733,27 @@ func (a *AdmissionController) RequestWake(ctx context.Context, name string) ([]s
 
 	// Mark model awake and update budgets. If it was sleeping, also
 	// drop its residual contribution.
-	if m.State == admissionSleeping {
-		for _, g := range m.GPUs {
-			a.l1ResidualByGPU[g] -= m.L1ResidualMB
+	//
+	// Snapshot discipline: reverse the residual using the BookedL1*
+	// snapshots (set when the model entered Sleeping), then re-snapshot
+	// from the LIVE config (m.GPUs / m.ExpectedVRAMMB / m.L1ResidualMB)
+	// for the new awake booking. This is the canonical "next booking
+	// transition picks up the hot-reloaded config" point.
+	if m.State == admissionSleeping && m.BookedL1ResidualMB > 0 {
+		for _, g := range m.BookedL1ResidualGPUs {
+			a.l1ResidualByGPU[g] -= m.BookedL1ResidualMB
 		}
+		m.BookedL1ResidualMB = 0
+		m.BookedL1ResidualGPUs = nil
 	}
+	booked := make(map[int]int, len(m.GPUs))
 	for _, g := range m.GPUs {
-		a.awakeByGPU[g] += m.ExpectedOn(g)
+		v := m.ExpectedOn(g)
+		a.awakeByGPU[g] += v
+		booked[g] = v
 	}
+	m.BookedExpectedVRAMMB = booked
+	m.BookedInPinnedMap = false
 	m.State = admissionAwake
 	m.LastRequestTime = time.Now()
 
@@ -803,14 +943,39 @@ func (a *AdmissionController) WithColdLoadLock(fn func()) {
 // markSleepingLocked is the idempotent state-update primitive used by
 // both NotifySleep and RequestWake's eviction loop. Caller must hold
 // a.mu.
+//
+// Snapshot discipline: reverses the awake booking via the model's
+// BookedExpectedVRAMMB snapshot (NOT the live ExpectedVRAMMB which a
+// hot-reload may have mutated since booking). Then snapshots the new
+// L1 residual booking from the LIVE config so the future Sleeping →
+// Awake / Sleeping → Stopped reversal also uses a known-correct
+// snapshot.
 func (a *AdmissionController) markSleepingLocked(m *modelAdmissionState) {
 	if m.State != admissionAwake {
 		// Already sleeping or never woke. Don't double-count.
 		return
 	}
-	for _, g := range m.GPUs {
-		a.awakeByGPU[g] -= m.ExpectedOn(g)
-		a.l1ResidualByGPU[g] += m.L1ResidualMB
+	if m.BookedInPinnedMap {
+		// Pinned-non-swap-group footprint lives in pinnedByGPU. Reverse
+		// using snapshot. (Pinned + swap-group goes through awakeByGPU
+		// and falls into the else branch.)
+		for g, v := range m.BookedExpectedVRAMMB {
+			a.pinnedByGPU[g] -= v
+		}
+		m.BookedInPinnedMap = false
+	} else {
+		for g, v := range m.BookedExpectedVRAMMB {
+			a.awakeByGPU[g] -= v
+		}
+	}
+	m.BookedExpectedVRAMMB = nil
+	// Snapshot new residual booking from live config.
+	if m.L1ResidualMB > 0 && len(m.GPUs) > 0 {
+		for _, g := range m.GPUs {
+			a.l1ResidualByGPU[g] += m.L1ResidualMB
+		}
+		m.BookedL1ResidualMB = m.L1ResidualMB
+		m.BookedL1ResidualGPUs = append(m.BookedL1ResidualGPUs[:0], m.GPUs...)
 	}
 	m.State = admissionSleeping
 	a.publishGauges()
@@ -822,6 +987,8 @@ func (a *AdmissionController) markSleepingLocked(m *modelAdmissionState) {
 //
 // Unlike markSleepingLocked which leaves the L1 residual on the books,
 // this fully releases the model's footprint on every GPU it touches.
+// Reversal uses the Booked* snapshots — NOT the live ExpectedVRAMMB /
+// GPUs / L1ResidualMB — so a hot-reload mid-booking does not leak.
 // Restoring requires a docker compose up + health-wait + an explicit
 // NotifyStarted call (cold load ~5 min from page cache); /wake_up does
 // NOT apply.
@@ -830,14 +997,24 @@ func (a *AdmissionController) markStoppedLocked(m *modelAdmissionState) {
 		return
 	}
 	if m.State == admissionAwake {
-		for _, g := range m.GPUs {
-			a.awakeByGPU[g] -= m.ExpectedOn(g)
+		if m.BookedInPinnedMap {
+			for g, v := range m.BookedExpectedVRAMMB {
+				a.pinnedByGPU[g] -= v
+			}
+		} else {
+			for g, v := range m.BookedExpectedVRAMMB {
+				a.awakeByGPU[g] -= v
+			}
 		}
+		m.BookedExpectedVRAMMB = nil
+		m.BookedInPinnedMap = false
 	}
 	if m.State == admissionSleeping {
-		for _, g := range m.GPUs {
-			a.l1ResidualByGPU[g] -= m.L1ResidualMB
+		for _, g := range m.BookedL1ResidualGPUs {
+			a.l1ResidualByGPU[g] -= m.BookedL1ResidualMB
 		}
+		m.BookedL1ResidualMB = 0
+		m.BookedL1ResidualGPUs = nil
 	}
 	// admissionUnknown: no books to release.
 	m.State = admissionStopped
@@ -849,12 +1026,21 @@ func (a *AdmissionController) markStoppedLocked(m *modelAdmissionState) {
 // is_sleeping. Caller must hold a.mu. Re-adds the L1 residual (vLLM
 // containers are typically slept-L1 immediately after the cold-load
 // settle, before any consumer demand reaches them).
+//
+// Snapshot discipline: snapshots the new residual booking from the
+// LIVE config (m.GPUs / m.L1ResidualMB) so reversal in a later
+// markSleepingLocked / markStoppedLocked / RequestWake uses a
+// known-correct snapshot rather than potentially-mutated live fields.
 func (a *AdmissionController) markStartedLocked(m *modelAdmissionState) {
 	if m.State != admissionStopped {
 		return
 	}
-	for _, g := range m.GPUs {
-		a.l1ResidualByGPU[g] += m.L1ResidualMB
+	if m.L1ResidualMB > 0 && len(m.GPUs) > 0 {
+		for _, g := range m.GPUs {
+			a.l1ResidualByGPU[g] += m.L1ResidualMB
+		}
+		m.BookedL1ResidualMB = m.L1ResidualMB
+		m.BookedL1ResidualGPUs = append(m.BookedL1ResidualGPUs[:0], m.GPUs...)
 	}
 	m.State = admissionSleeping
 	a.publishGauges()

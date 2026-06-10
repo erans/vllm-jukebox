@@ -341,27 +341,43 @@ models:
 		t.Fatal(err)
 	}
 
-	select {
-	case <-reloadCh:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("watcher reload never fired")
-	}
-
-	tracked := a.TrackedModels()
-	hasBeta := false
-	for _, n := range tracked {
-		if n == "beta" {
-			hasBeta = true
+	// Poll for the expected admission state rather than waiting on a
+	// wall-clock fallback. fsnotify on macOS (kqueue) can be 1-3s
+	// between file-rename and event-delivery on a loaded CI runner;
+	// the prior 5s wall-clock fallback masked platform-specific
+	// failures with a single magic timeout. Poll every 50ms for up to
+	// 3s asserting the expected state.
+	deadline := time.Now().Add(3 * time.Second)
+	var lastTracked []string
+	for time.Now().Before(deadline) {
+		select {
+		case <-reloadCh:
+		default:
 		}
+		lastTracked = a.TrackedModels()
+		hasBeta := false
+		for _, n := range lastTracked {
+			if n == "beta" {
+				hasBeta = true
+				break
+			}
+		}
+		if hasBeta {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if !hasBeta {
-		t.Errorf("beta not picked up via fsnotify-driven reload: tracked=%v", tracked)
-	}
+	t.Fatalf("beta not picked up via fsnotify-driven reload within 3s: tracked=%v", lastTracked)
 }
 
 // TestAdmissionRefreshConfig_StatePreservation verifies that an
 // admission-tracked model in admissionAwake state remains awake (and
 // keeps its booking) across a RefreshConfig that changes other fields.
+// Also drives a SUBSEQUENT sleep transition to assert no phantom leak
+// nor negative balance in the per-GPU bookkeeping — the bug the
+// architect's round-N+1 review flagged hid behind tests that only
+// snapshotted immediately after RefreshConfig and never exercised
+// reversal arithmetic.
 func TestAdmissionRefreshConfig_StatePreservation(t *testing.T) {
 	cfg := makeAdmissionCfg(t, false, 5000)
 	config.SetCurrent(cfg)
@@ -433,5 +449,424 @@ models:
 	}
 	if postAwake != preAwake {
 		t.Errorf("awake bookkeeping retroactively rewritten: pre=%d post=%d (grandfathering broken)", preAwake, postAwake)
+	}
+
+	// Drive subsequent sleep — markSleepingLocked should reverse using
+	// the SNAPSHOT (original 5000) not the live config (now 8000), so
+	// awakeByGPU returns to exactly its pre-wake value (0 contribution
+	// from alpha) and l1ResidualByGPU gets the NEW residual (800).
+	a.NotifySleep("alpha", "manual")
+
+	sleptBudgets := a.SnapshotBudgets()
+	var sleptAwake, sleptResidual int
+	for _, b := range sleptBudgets {
+		if b.GPUID == 0 {
+			sleptAwake = b.AwakeMB
+			sleptResidual = b.L1ResidualMB
+		}
+	}
+	if sleptAwake != 0 {
+		t.Errorf("post-sleep awake bookkeeping not zero: got %d (phantom leak — reversal used wrong vram)", sleptAwake)
+	}
+	if sleptResidual != 800 {
+		t.Errorf("post-sleep residual: got %d want 800 (new config applied at transition boundary)", sleptResidual)
+	}
+}
+
+// TestRefreshConfig_VRAMDown_AwakeModelSleeps_NoPhantomLeak — CRITICAL
+// regression test for the round-N+1 architect review. Model awake at
+// expected=5000. Operator hot-reloads to 3000. Model sleeps. The
+// reversal must use the SNAPSHOT (5000) not the live config (3000),
+// otherwise awakeByGPU is left with a +2000 phantom positive.
+func TestRefreshConfig_VRAMDown_AwakeModelSleeps_NoPhantomLeak(t *testing.T) {
+	cfg := makeAdmissionCfg(t, false, 5000)
+	config.SetCurrent(cfg)
+	t.Cleanup(func() { config.SetCurrent(nil) })
+
+	a := jukebox.NewAdmissionController(cfg, map[int]int{0: 24000}, &stubEvictor{})
+
+	if _, err := a.RequestWake(context.Background(), "alpha"); err != nil {
+		t.Fatalf("RequestWake: %v", err)
+	}
+
+	// alpha awake @ 5000. Hot-reload to 3000.
+	cfg2Body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "alpha"}
+models:
+  alpha:
+    path: "/models/alpha"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 3000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+  beta:
+    path: "/models/beta"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg2, err := config.Load([]byte(cfg2Body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	a.RefreshConfig(cfg2)
+
+	a.NotifySleep("alpha", "manual")
+
+	for _, b := range a.SnapshotBudgets() {
+		if b.GPUID != 0 {
+			continue
+		}
+		if b.AwakeMB != 0 {
+			t.Fatalf("phantom leak on GPU 0: awake=%d (expected 0; bug allows +2000 phantom)", b.AwakeMB)
+		}
+	}
+}
+
+// TestRefreshConfig_VRAMUp_AwakeModelSleeps_NoNegativeBalance — CRITICAL
+// regression test. Model awake at expected=5000. Operator hot-reloads
+// to 8000. Model sleeps. Reversal using live (8000) instead of snapshot
+// (5000) would underflow awakeByGPU to -3000, then a subsequent
+// admission of a peer sees +3000 phantom-free and OOMs at vLLM.
+func TestRefreshConfig_VRAMUp_AwakeModelSleeps_NoNegativeBalance(t *testing.T) {
+	cfg := makeAdmissionCfg(t, false, 5000)
+	config.SetCurrent(cfg)
+	t.Cleanup(func() { config.SetCurrent(nil) })
+
+	a := jukebox.NewAdmissionController(cfg, map[int]int{0: 24000}, &stubEvictor{})
+
+	if _, err := a.RequestWake(context.Background(), "alpha"); err != nil {
+		t.Fatalf("RequestWake: %v", err)
+	}
+
+	// alpha awake @ 5000. Hot-reload to 8000.
+	cfg2Body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "alpha"}
+models:
+  alpha:
+    path: "/models/alpha"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 8000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+  beta:
+    path: "/models/beta"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg2, err := config.Load([]byte(cfg2Body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	a.RefreshConfig(cfg2)
+
+	a.NotifySleep("alpha", "manual")
+
+	for _, b := range a.SnapshotBudgets() {
+		if b.GPUID != 0 {
+			continue
+		}
+		if b.AwakeMB < 0 {
+			t.Fatalf("negative awake balance on GPU 0: %d (next admit would phantom-fit a peer and OOM at vLLM)", b.AwakeMB)
+		}
+		if b.AwakeMB != 0 {
+			t.Fatalf("awake balance not zero on GPU 0: got %d want 0", b.AwakeMB)
+		}
+	}
+}
+
+// TestRefreshConfig_GpusShrink_AwakeModelSleeps_FullyFrees — HIGH-1
+// regression test. Model awake on [0,1,2,3] booking +5000 each.
+// Operator hot-reloads to [0,1]. Model sleeps. Reversal iterating the
+// new GPU list misses GPUs 2+3 → 10GB leaks until restart. Snapshot
+// pattern iterates BookedGPUs and frees all four GPUs cleanly.
+func TestRefreshConfig_GpusShrink_AwakeModelSleeps_FullyFrees(t *testing.T) {
+	body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "alpha"}
+models:
+  alpha:
+    path: "/models/alpha"
+    gpus: [0, 1, 2, 3]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg, err := config.Load([]byte(body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	config.SetCurrent(cfg)
+	t.Cleanup(func() { config.SetCurrent(nil) })
+
+	totals := map[int]int{0: 24000, 1: 24000, 2: 24000, 3: 24000}
+	a := jukebox.NewAdmissionController(cfg, totals, &stubEvictor{})
+
+	if _, err := a.RequestWake(context.Background(), "alpha"); err != nil {
+		t.Fatalf("RequestWake: %v", err)
+	}
+
+	// Verify pre-sleep: 5000 booked on each of 4 GPUs.
+	preBudgets := a.SnapshotBudgets()
+	for _, b := range preBudgets {
+		if b.AwakeMB != 5000 {
+			t.Fatalf("pre-sleep awake on GPU %d: got %d want 5000", b.GPUID, b.AwakeMB)
+		}
+	}
+
+	// Hot-reload to shrink GPU set to [0, 1].
+	shrunkBody := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "alpha"}
+models:
+  alpha:
+    path: "/models/alpha"
+    gpus: [0, 1]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg2, err := config.Load([]byte(shrunkBody))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	a.RefreshConfig(cfg2)
+
+	a.NotifySleep("alpha", "manual")
+
+	// All 4 GPUs must show zero awake bookings (full reversal via snapshot).
+	for _, b := range a.SnapshotBudgets() {
+		if b.AwakeMB != 0 {
+			t.Fatalf("GPU %d leaked %dMB after sleep on shrunk-gpus config (snapshot reversal broken)", b.GPUID, b.AwakeMB)
+		}
+	}
+}
+
+// TestRefreshConfig_AddPinnedModel_UpdatesPinnedByGPU — HIGH-2.
+// Adding a new pinned non-swap-group model via hot-reload must add
+// its footprint to pinnedByGPU so future availableMB calculations
+// reserve VRAM correctly. Pre-fix: only NewAdmissionController wrote
+// pinnedByGPU; RefreshConfig left it stale.
+func TestRefreshConfig_AddPinnedModel_UpdatesPinnedByGPU(t *testing.T) {
+	cfg := makeAdmissionCfg(t, false, 5000)
+	config.SetCurrent(cfg)
+	t.Cleanup(func() { config.SetCurrent(nil) })
+
+	a := jukebox.NewAdmissionController(cfg, map[int]int{0: 24000}, &stubEvictor{})
+
+	prePinned := a.SnapshotBudgets()[0].PinnedMB
+	if prePinned != 0 {
+		t.Fatalf("pre-refresh PinnedMB: got %d want 0", prePinned)
+	}
+
+	// Add a pinned model via hot-reload.
+	cfg2Body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "alpha"}
+models:
+  alpha:
+    path: "/models/alpha"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+  beta:
+    path: "/models/beta"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+  pinnedguy:
+    path: "/models/pinnedguy"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    pinned: true
+    expected_vram_mb_per_gpu: 4000
+    sleep_l1_residual_mb: 400
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg2, err := config.Load([]byte(cfg2Body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	a.RefreshConfig(cfg2)
+
+	postPinned := a.SnapshotBudgets()[0].PinnedMB
+	if postPinned != 4000 {
+		t.Fatalf("post-refresh PinnedMB: got %d want 4000 (pinned model add not reconciled into pinnedByGPU)", postPinned)
+	}
+}
+
+// TestRefreshConfig_RemovePinnedModel_UpdatesPinnedByGPU — HIGH-2.
+// Removing a pinned non-swap-group model via hot-reload must release
+// its footprint from pinnedByGPU. Pre-fix: removed model's footprint
+// stayed subtracted from every availableMB calculation forever.
+func TestRefreshConfig_RemovePinnedModel_UpdatesPinnedByGPU(t *testing.T) {
+	body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "alpha"}
+models:
+  alpha:
+    path: "/models/alpha"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+  pinnedguy:
+    path: "/models/pinnedguy"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    pinned: true
+    expected_vram_mb_per_gpu: 4000
+    sleep_l1_residual_mb: 400
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg, err := config.Load([]byte(body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	config.SetCurrent(cfg)
+	t.Cleanup(func() { config.SetCurrent(nil) })
+
+	a := jukebox.NewAdmissionController(cfg, map[int]int{0: 24000}, &stubEvictor{})
+
+	if got := a.SnapshotBudgets()[0].PinnedMB; got != 4000 {
+		t.Fatalf("initial PinnedMB: got %d want 4000", got)
+	}
+
+	// Drop pinnedguy from config.
+	cfg2Body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "alpha"}
+models:
+  alpha:
+    path: "/models/alpha"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 500
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg2, err := config.Load([]byte(cfg2Body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	a.RefreshConfig(cfg2)
+
+	if got := a.SnapshotBudgets()[0].PinnedMB; got != 0 {
+		t.Fatalf("post-removal PinnedMB: got %d want 0 (pinned model removal not reconciled)", got)
+	}
+}
+
+// TestRefreshConfig_FlipPinnedFalse_UpdatesPinnedByGPU — HIGH-2.
+// Flipping pinned: true → false via hot-reload must migrate the
+// footprint from pinnedByGPU to awakeByGPU. Pre-fix: the booking
+// stayed in pinnedByGPU forever, the model was treated as evictable
+// (via Priority change), but pinnedByGPU stayed inflated → next
+// availableMB lied.
+func TestRefreshConfig_FlipPinnedFalse_UpdatesPinnedByGPU(t *testing.T) {
+	body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "pinnedguy"}
+models:
+  pinnedguy:
+    path: "/models/pinnedguy"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    pinned: true
+    expected_vram_mb_per_gpu: 4000
+    sleep_l1_residual_mb: 400
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg, err := config.Load([]byte(body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	config.SetCurrent(cfg)
+	t.Cleanup(func() { config.SetCurrent(nil) })
+
+	a := jukebox.NewAdmissionController(cfg, map[int]int{0: 24000}, &stubEvictor{})
+
+	b0 := a.SnapshotBudgets()[0]
+	if b0.PinnedMB != 4000 || b0.AwakeMB != 0 {
+		t.Fatalf("initial PinnedMB=%d AwakeMB=%d want PinnedMB=4000 AwakeMB=0", b0.PinnedMB, b0.AwakeMB)
+	}
+
+	// Flip pinned: true → false.
+	cfg2Body := `
+server: {port: 8080}
+vllm: {binary: "/usr/bin/vllm"}
+scheduler: {port_range_start: 9000, port_range_end: 9100}
+behavior: {default_model: "pinnedguy"}
+models:
+  pinnedguy:
+    path: "/models/pinnedguy"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 1000
+    pinned: false
+    expected_vram_mb_per_gpu: 4000
+    sleep_l1_residual_mb: 400
+    cold_load_timeout_seconds: 300
+    sleep_mode: true
+`
+	cfg2, err := config.Load([]byte(cfg2Body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	a.RefreshConfig(cfg2)
+
+	b0p := a.SnapshotBudgets()[0]
+	if b0p.PinnedMB != 0 {
+		t.Errorf("post-flip PinnedMB: got %d want 0 (pinned-flip not migrated out of pinnedByGPU)", b0p.PinnedMB)
+	}
+	if b0p.AwakeMB != 4000 {
+		t.Errorf("post-flip AwakeMB: got %d want 4000 (pinned-flip should migrate to awakeByGPU)", b0p.AwakeMB)
+	}
+	// Total reserved (Pinned + Awake) should be conserved across the flip.
+	if (b0p.PinnedMB + b0p.AwakeMB) != (b0.PinnedMB + b0.AwakeMB) {
+		t.Errorf("flip non-conservative: pre Pinned+Awake=%d post=%d", b0.PinnedMB+b0.AwakeMB, b0p.PinnedMB+b0p.AwakeMB)
 	}
 }
