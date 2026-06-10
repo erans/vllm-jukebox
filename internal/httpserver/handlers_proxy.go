@@ -156,18 +156,31 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		// served-name so vLLM accepts it; RequestedModel + RewriteModelName
 		// rewrites the RESPONSE back to the originally-requested name so
 		// the client never sees the swap.
+		//
+		// External-lifecycle gotcha: route.UpstreamModel is sourced from
+		// modelCfg.Path which is EMPTY for `lifecycle: external` models
+		// (vllm-main, vllm-vision, etc — they're remote URLs, no on-disk
+		// path). When the classifier rewrote, we MUST set UpstreamModel
+		// explicitly to the rewritten served-name; otherwise the body
+		// rewrite in proxy.RewriteJSONModel skips (the cond is
+		// `UpstreamModel != ""`) and vision sees the OLD model name in
+		// the body → 404 NotFoundError.
 		rewriteModelName := opts.Config.Behavior.RewriteModelName
 		requestedForRewrite := modelName
+		upstreamForBody := route.UpstreamModel
 		if rewroteByContent {
 			rewriteModelName = true
 			requestedForRewrite = originalModel
+			if upstreamForBody == "" {
+				upstreamForBody = modelName // the rewritten served-name
+			}
 		}
 
 		return proxy.ForwardFiber(c, proxy.ForwardOptions{
 			BaseURL:          route.BaseURL,
 			RewriteModelName: rewriteModelName,
 			RequestedModel:   requestedForRewrite,
-			UpstreamModel:    route.UpstreamModel,
+			UpstreamModel:    upstreamForBody,
 			RequestID:        requestID,
 		})
 	}
