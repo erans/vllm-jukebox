@@ -67,4 +67,26 @@ type ColdLoadAware interface {
 	// admissionStopped (caller bug — should have checked IsModelColdLoading
 	// first) or if the model/instance can't be located.
 	KickColdLoad(name string) bool
+
+	// IsInColdLoadEviction reports whether `name` is currently being
+	// slept or stopped as part of an in-flight peer cold-load (i.e. it
+	// is a swap-group peer of a model whose cold-load is mid-flight).
+	//
+	// This is the COMPANION gate to IsModelColdLoading. The latter
+	// returns true ONLY when admission state == admissionStopped (i.e.
+	// the model whose container is `docker compose stop`'d). The former
+	// closes the gap during the brief window where:
+	//   - a peer's cold-load has acquired coldLoadMu,
+	//   - admission has begun evicting `name` to make room for the peer,
+	//   - but `name`'s admission state is still admissionAwake/Sleeping
+	//     (NotifySleep hasn't fired yet because the sleep is still in
+	//     progress or has just completed).
+	//
+	// During that window, a request for `name` would otherwise fall
+	// through the IsModelColdLoading fast-fail gate and block on
+	// `performWake` which itself blocks on coldLoadMu — observed live
+	// 2026-06-10 as a 600s hang on a priority=critical model.
+	//
+	// Returns false for unknown models and when no cold-load is active.
+	IsInColdLoadEviction(name string) bool
 }

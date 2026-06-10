@@ -130,8 +130,15 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		// this branch entirely and fall through to AcquireRoute, which
 		// still works correctly — swap mode has no admissionStopped state
 		// so the async-503 path is structurally inapplicable there.
-		if cl, ok := opts.Router.(jukebox.ColdLoadAware); ok && cl.IsModelColdLoading(modelName) {
-			cl.KickColdLoad(modelName)
+		if cl, ok := opts.Router.(jukebox.ColdLoadAware); ok && (cl.IsModelColdLoading(modelName) || cl.IsInColdLoadEviction(modelName)) {
+			// IsInColdLoadEviction-only path (model is a peer being slept
+			// for an in-flight cold-load, not the cold-load target itself):
+			// don't KickColdLoad here — the peer's own cold-load isn't
+			// what's needed; the target's cold-load is in flight. Just
+			// fast-fail with the same 503 + Retry-After contract.
+			if cl.IsModelColdLoading(modelName) {
+				cl.KickColdLoad(modelName)
+			}
 			c.Set("Retry-After", "60")
 			return writeOpenAIError(
 				c,
