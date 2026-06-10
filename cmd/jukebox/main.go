@@ -222,29 +222,43 @@ func main() {
 			defer checkCancel()
 
 			gpus, err := inv.List(checkCtx)
-			if err != nil {
+			switch {
+			case err != nil && gpu.IsBinaryNotFound(err):
+				// nvidia-smi is not installed in this environment. Operators
+				// run jukebox in CPU-only / external-routing setups where
+				// nvidia-smi may legitimately be absent. Hard-failing here
+				// crash-loops the container. Degrade: skip the GPU-id
+				// existence check and let the scheduler boot. Admission
+				// control (below) will independently degrade for the same
+				// reason and log its own warning.
+				slog.Warn("scheduler_mode_no_nvidia_smi",
+					"err", err,
+					"msg", "nvidia-smi not found; skipping GPU id validation and degrading to legacy routing (no admission VRAM tracking). Operators who want admission MUST make nvidia-smi available to the jukebox container.",
+				)
+			case err != nil:
 				slog.Error("failed to read GPU inventory (scheduler mode)", "err", err)
 				os.Exit(1)
-			}
-			exists := map[int]bool{}
-			for _, g := range gpus {
-				exists[g.Index] = true
-			}
-			for name, model := range cfg.Models {
-				if model.Alias != "" {
-					continue
+			default:
+				exists := map[int]bool{}
+				for _, g := range gpus {
+					exists[g.Index] = true
 				}
-				// External-lifecycle instances may declare GPUs that live on
-				// a different host (jukebox doesn't own the process). Skip
-				// the local nvidia-smi check for them — the gpus field on an
-				// external model is informational.
-				if model.EffectiveLifecycle() == config.LifecycleExternal {
-					continue
-				}
-				for _, id := range model.GPUs {
-					if !exists[id] {
-						slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
-						os.Exit(1)
+				for name, model := range cfg.Models {
+					if model.Alias != "" {
+						continue
+					}
+					// External-lifecycle instances may declare GPUs that live on
+					// a different host (jukebox doesn't own the process). Skip
+					// the local nvidia-smi check for them — the gpus field on an
+					// external model is informational.
+					if model.EffectiveLifecycle() == config.LifecycleExternal {
+						continue
+					}
+					for _, id := range model.GPUs {
+						if !exists[id] {
+							slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
+							os.Exit(1)
+						}
 					}
 				}
 			}
