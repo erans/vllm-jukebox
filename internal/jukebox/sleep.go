@@ -339,6 +339,95 @@ func (s *Scheduler) IsModelColdLoading(name string) bool {
 // admissionStopped, isn't registered, has no config, or already has
 // a kick in flight. Caller (proxy handler) should ignore the bool —
 // the 503 + Retry-After response is the same either way.
+// markColdLoadEviction registers `names` as currently mid-eviction
+// during an in-flight peer cold-load. Idempotent — re-marking a name
+// that is already marked is a no-op. Concurrent cold-loads are
+// serialized by coldLoadMu (a single global Mutex), so two marks for
+// the same name from different goroutines is structurally impossible
+// in practice; the map nonetheless tolerates it.
+//
+// Caller MUST pair this with a deferred unmarkColdLoadEviction for the
+// same set so a panic inside the cold-load body still clears the gate
+// (a stale marker would silently 503 every request to those models
+// until process restart).
+func (s *Scheduler) markColdLoadEviction(names ...string) {
+	if s == nil || len(names) == 0 {
+		return
+	}
+	s.coldLoadEvictionMu.Lock()
+	defer s.coldLoadEvictionMu.Unlock()
+	if s.coldLoadEviction == nil {
+		s.coldLoadEviction = make(map[string]struct{}, 8)
+	}
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		s.coldLoadEviction[n] = struct{}{}
+	}
+}
+
+// unmarkColdLoadEviction removes `names` from the in-flight eviction set.
+// Called via defer from coldLoadStoppedMember after the WithColdLoadLock
+// callback returns (success or failure).
+func (s *Scheduler) unmarkColdLoadEviction(names ...string) {
+	if s == nil || len(names) == 0 || s.coldLoadEviction == nil {
+		return
+	}
+	s.coldLoadEvictionMu.Lock()
+	defer s.coldLoadEvictionMu.Unlock()
+	for _, n := range names {
+		delete(s.coldLoadEviction, n)
+	}
+}
+
+// IsInColdLoadEviction implements ColdLoadAware. Returns true while the
+// named model is mid-eviction (or is the cold-load target itself)
+// during an in-flight cold-load. See ColdLoadAware docstring for the
+// gap this closes vs IsModelColdLoading.
+func (s *Scheduler) IsInColdLoadEviction(name string) bool {
+	if s == nil {
+		return false
+	}
+	s.coldLoadEvictionMu.RLock()
+	defer s.coldLoadEvictionMu.RUnlock()
+	if s.coldLoadEviction == nil {
+		return false
+	}
+	_, ok := s.coldLoadEviction[name]
+	return ok
+}
+
+// swapGroupMembersForColdLoad returns every model name in the same
+// swap_group as `target`, INCLUDING `target` itself. Used by
+// coldLoadStoppedMember to pre-compute the set of models that the
+// in-flight cold-load may transiently sleep/stop, so the
+// IsInColdLoadEviction gate fast-fails requests for any of them for
+// the duration of the cold-load.
+//
+// Conservative-by-design: includes peers that may already be slept
+// (the gate briefly fast-fails them too — harmless given the cold-load
+// will only run for ~5-10 min). Excludes models in OTHER swap groups
+// (they're physically free to serve in parallel with the cold-load).
+//
+// Returns just [target] when swapGroup is empty (no swap-group → no
+// peer eviction → only the target itself is the eviction subject).
+func (s *Scheduler) swapGroupMembersForColdLoad(target, swapGroup string) []string {
+	out := []string{target}
+	if s == nil || swapGroup == "" {
+		return out
+	}
+	for name, m := range config.Current().Models {
+		if name == target {
+			continue
+		}
+		if m.SwapGroup == swapGroup {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func (s *Scheduler) KickColdLoad(name string) bool {
 	if s == nil {
 		return false
@@ -558,6 +647,18 @@ func (s *Scheduler) coldLoadStoppedMember(ctx context.Context, inst *schedInstan
 	// surface "queued at T, acquired at T+X" so a stuck cold-load is
 	// visually distinct from a slowly-progressing one (e.g. N peers all
 	// kicked at once → N-th waits ~(N-1)*5min on Lock()).
+	// 2026-06-10 (B-1-rev): mark target + swap-group peers as
+	// "in cold-load eviction" BEFORE the WithColdLoadLock acquires.
+	// This closes the gate from the moment the cold-load is admitted,
+	// not just when admission state finally flips to admissionStopped.
+	// Without this, a request for any swap-group member that lands
+	// during the eviction window can fall through IsModelColdLoading
+	// and block on coldLoadMu inside performWake for the full
+	// cold-load wall-clock (~600s observed live).
+	evictionScope := s.swapGroupMembersForColdLoad(inst.model, modelCfg.SwapGroup)
+	s.markColdLoadEviction(evictionScope...)
+	defer s.unmarkColdLoadEviction(evictionScope...)
+
 	slog.Info("cold_load_queued_behind_lock",
 		"model", inst.model,
 		"container", modelCfg.Host,
