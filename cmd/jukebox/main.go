@@ -258,17 +258,22 @@ func main() {
 				for _, g := range gpus {
 					exists[g.Index] = true
 				}
-				// External-lifecycle instances may declare GPUs that live on
-				// a different host (jukebox doesn't own the process). Skip
-				// the local nvidia-smi check for them — the gpus field on an
-				// external model is informational.
-				if model.EffectiveLifecycle() == config.LifecycleExternal {
-					continue
-				}
-				for _, id := range model.GPUs {
-					if !exists[id] {
-						slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
-						os.Exit(1)
+				for name, model := range cfg.Models {
+					if model.Alias != "" {
+						continue
+					}
+					// External-lifecycle instances may declare GPUs that live on
+					// a different host (jukebox doesn't own the process). Skip
+					// the local nvidia-smi check for them — the gpus field on an
+					// external model is informational.
+					if model.EffectiveLifecycle() == config.LifecycleExternal {
+						continue
+					}
+					for _, id := range model.GPUs {
+						if !exists[id] {
+							slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
+							os.Exit(1)
+						}
 					}
 				}
 			}
