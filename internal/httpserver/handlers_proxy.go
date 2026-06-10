@@ -12,6 +12,7 @@ import (
 
 	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/jukebox"
+	"vllm-jukebox/internal/metrics"
 	"vllm-jukebox/internal/proxy"
 )
 
@@ -31,13 +32,68 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 
 		c.Locals(requestedModelLocal, modelName)
 
-		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
 		// Resolve against the live config so a mid-flight active.yaml
 		// reload that adds / removes a model is reflected immediately.
 		liveCfg := config.Current()
 		if liveCfg == nil {
 			liveCfg = opts.Config
 		}
+
+		// === Stage J — content-aware routing (kill-switch default off) ===
+		//
+		// Only triggers on POST /v1/chat/completions (this handler is only
+		// wired to chat / completions / responses; embeddings/rerank/
+		// tokenize endpoints use the same dispatcher but the classifier
+		// returns DecisionForward in zero time when ContentRouting is off,
+		// AND a request without messages[].content[].image_url won't match
+		// any reroute rule, so /embeddings traffic with content routing
+		// ON is also harmless).
+		//
+		// The classifier reads the body once via json.Unmarshal — same
+		// cost as extractModel above. When ContentRouting is false, the
+		// classifier short-circuits at the first config check and adds
+		// no measurable latency.
+		originalModel := modelName
+		rewroteByContent := false
+		isChatPath := strings.HasSuffix(c.OriginalURL(), "/v1/chat/completions")
+		if isChatPath && liveCfg.Behavior.ContentRouting {
+			cls := ClassifyContent(c.Body(), modelName, liveCfg)
+			if cls.EstTokens > 0 {
+				metrics.ContentRoutingEstTokensHistogram.Observe(float64(cls.EstTokens))
+			}
+			switch cls.Decision {
+			case DecisionForward:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("forward", originalModel, "").Inc()
+			case DecisionRerouteImage:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reroute_image", originalModel, cls.NewModel).Inc()
+				modelName = cls.NewModel
+				rewroteByContent = true
+			case DecisionRerouteOverflow:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reroute_overflow", originalModel, cls.NewModel).Inc()
+				modelName = cls.NewModel
+				rewroteByContent = true
+			case DecisionRejectNoVision:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reject_no_vision", originalModel, "").Inc()
+				return writeOpenAIError(
+					c,
+					http.StatusServiceUnavailable,
+					cls.Reason+" — configure behavior.vision_model",
+					"service_unavailable",
+					"vision_model_unavailable",
+				)
+			case DecisionRejectTooLong:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reject_too_long", originalModel, "").Inc()
+				return writeOpenAIError(
+					c,
+					http.StatusBadRequest,
+					cls.Reason,
+					"invalid_request_error",
+					"context_length_exceeded",
+				)
+			}
+		}
+
+		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
 		_, _, err = liveCfg.ResolveModel(modelName)
 		if err != nil {
 			return writeOpenAIError(
@@ -76,17 +132,6 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		// so the async-503 path is structurally inapplicable there.
 		if cl, ok := opts.Router.(jukebox.ColdLoadAware); ok && cl.IsModelColdLoading(modelName) {
 			cl.KickColdLoad(modelName)
-			// Retry-After: 60 (NOT 300). Rationale:
-			//   - OpenAI Python SDK caps its retry budget around ~8s and
-			//     gives up entirely on Retry-After > a few minutes.
-			//   - Anthropic SDK respects up to ~60s, then surfaces the
-			//     error to the caller.
-			//   - Bifrost / other proxies enforce their own deadlines.
-			// 300s caused most SDK clients to surface user-visible errors
-			// instead of retrying. With 60s, clients re-poll every minute,
-			// see more 503s while the model is still cold-loading, and
-			// eventually land on the warm Sleeping path on a later retry —
-			// which is the whole point of the async-503 contract.
 			c.Set("Retry-After", "60")
 			return writeOpenAIError(
 				c,
@@ -105,10 +150,23 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			defer route.Done()
 		}
 
+		// When the classifier rewrote the target, force response-rewriting
+		// so the client sees the original requested model name in the
+		// completion. UpstreamModel rewrites the REQUEST body to the new
+		// served-name so vLLM accepts it; RequestedModel + RewriteModelName
+		// rewrites the RESPONSE back to the originally-requested name so
+		// the client never sees the swap.
+		rewriteModelName := opts.Config.Behavior.RewriteModelName
+		requestedForRewrite := modelName
+		if rewroteByContent {
+			rewriteModelName = true
+			requestedForRewrite = originalModel
+		}
+
 		return proxy.ForwardFiber(c, proxy.ForwardOptions{
 			BaseURL:          route.BaseURL,
-			RewriteModelName: opts.Config.Behavior.RewriteModelName,
-			RequestedModel:   modelName,
+			RewriteModelName: rewriteModelName,
+			RequestedModel:   requestedForRewrite,
 			UpstreamModel:    route.UpstreamModel,
 			RequestID:        requestID,
 		})

@@ -210,6 +210,70 @@ type VLLMDefaults struct {
 type BehaviorConfig struct {
 	DefaultModel     string `yaml:"default_model"`
 	RewriteModelName bool   `yaml:"rewrite_model_name"`
+
+	// --- content-aware routing (Stage J overnight build, 2026-06-10) ---
+	//
+	// All fields below are gated on ContentRouting (kill-switch, default
+	// false). When false, the proxy handler skips the classifier entirely
+	// and behaves byte-for-byte as before. Hot-reloadable via active.yaml
+	// fsnotify watcher.
+
+	// ContentRouting enables the content classifier in the chat-completions
+	// proxy path. When true, inbound POST /v1/chat/completions bodies are
+	// inspected for (a) image_url content blocks (image-reroute rule P1)
+	// and (b) byte-length-derived token estimate (length-overflow rule P2).
+	// Other endpoints (/v1/embeddings, /v1/rerank, /v1/tokenize, etc.) are
+	// untouched regardless of this flag.
+	//
+	// Default false — must be explicitly enabled per stack.
+	ContentRouting bool `yaml:"content_routing"`
+
+	// MultimodalCapableModels lists served-names that natively accept
+	// image_url content blocks. Requests with images targeting models in
+	// this list are forwarded as-is. Requests with images targeting models
+	// NOT in this list are rerouted to VisionModel (or rejected if no
+	// VisionModel is configured — see DecisionRejectNoVision).
+	MultimodalCapableModels []string `yaml:"multimodal_capable_models"`
+
+	// VisionModel is the served-name to which image-bearing requests are
+	// rerouted when the requested model is not multimodal-capable. When
+	// empty, image requests to text-only models return 503 with a clear
+	// pointer rather than silently 200 with a hallucinated description.
+	VisionModel string `yaml:"vision_model"`
+
+	// OverflowModel maps {requested-served-name → long-context-served-name}.
+	// When a request's estimated token count exceeds
+	// LengthOverflowThresholdTokens AND there's an entry here for the
+	// requested model, the proxy rewrites the target to the overflow model.
+	// Models not in this map are forwarded as-is (vLLM will return its own
+	// "context too long" error).
+	OverflowModel map[string]string `yaml:"overflow_model"`
+
+	// LengthOverflowThresholdTokens is the estimated-token boundary above
+	// which OverflowModel is consulted. Set ~6K under the requested model's
+	// max_model_len to leave room for response tokens (e.g. 256000 for a
+	// 262144-cap model with 6K reserved for output).
+	//
+	// Default 0 = length-overflow rule disabled.
+	LengthOverflowThresholdTokens int `yaml:"length_overflow_threshold_tokens"`
+
+	// LengthHardCapTokens is the absolute ceiling above which NO model can
+	// serve the request. Even the overflow model has a max — once an
+	// estimate exceeds this, the proxy returns 503 "exceeds long-context
+	// capacity" rather than wasting a swap to a model that will also
+	// reject.
+	//
+	// Default 0 = hard-cap disabled (only forwarder/overflow rules apply).
+	LengthHardCapTokens int `yaml:"length_hard_cap_tokens"`
+
+	// EstTokensCharsPerToken calibrates the byte-length token estimate.
+	// JSON-encoded chat (with role markers, escapes, tool definitions)
+	// runs ~3 chars/tok in English vs the naive 4 chars/tok. Defaulting
+	// to 3.3 gives ±25% accuracy at the 256K threshold, which is fine for
+	// the coarse reroute-or-not decision.
+	//
+	// Default 0 = use 3.3.
+	EstTokensCharsPerToken float64 `yaml:"est_tokens_chars_per_token"`
 }
 
 type ModelConfig struct {
@@ -441,6 +505,44 @@ func (c *Config) Validate() error {
 	if c.Behavior.DefaultModel != "" {
 		if _, ok := c.Models[c.Behavior.DefaultModel]; !ok {
 			return fmt.Errorf("default_model %q not found in models", c.Behavior.DefaultModel)
+		}
+	}
+
+	// Content-aware routing validation. Only enforced when ContentRouting
+	// is enabled — when disabled, fields can be partially-set (operator
+	// staging the rollout) without erroring out.
+	if c.Behavior.ContentRouting {
+		if c.Behavior.VisionModel != "" {
+			if _, ok := c.Models[c.Behavior.VisionModel]; !ok {
+				return fmt.Errorf("behavior.vision_model %q not found in models", c.Behavior.VisionModel)
+			}
+		}
+		for _, mm := range c.Behavior.MultimodalCapableModels {
+			if _, ok := c.Models[mm]; !ok {
+				return fmt.Errorf("behavior.multimodal_capable_models entry %q not found in models", mm)
+			}
+		}
+		for from, to := range c.Behavior.OverflowModel {
+			if _, ok := c.Models[from]; !ok {
+				return fmt.Errorf("behavior.overflow_model: source %q not found in models", from)
+			}
+			if _, ok := c.Models[to]; !ok {
+				return fmt.Errorf("behavior.overflow_model: target %q (for %q) not found in models", to, from)
+			}
+		}
+		if c.Behavior.LengthOverflowThresholdTokens < 0 {
+			return fmt.Errorf("behavior.length_overflow_threshold_tokens must be >= 0 (got %d)", c.Behavior.LengthOverflowThresholdTokens)
+		}
+		if c.Behavior.LengthHardCapTokens < 0 {
+			return fmt.Errorf("behavior.length_hard_cap_tokens must be >= 0 (got %d)", c.Behavior.LengthHardCapTokens)
+		}
+		if c.Behavior.LengthHardCapTokens > 0 && c.Behavior.LengthOverflowThresholdTokens > 0 &&
+			c.Behavior.LengthHardCapTokens < c.Behavior.LengthOverflowThresholdTokens {
+			return fmt.Errorf("behavior.length_hard_cap_tokens (%d) must be >= length_overflow_threshold_tokens (%d)",
+				c.Behavior.LengthHardCapTokens, c.Behavior.LengthOverflowThresholdTokens)
+		}
+		if c.Behavior.EstTokensCharsPerToken < 0 {
+			return fmt.Errorf("behavior.est_tokens_chars_per_token must be >= 0 (got %f)", c.Behavior.EstTokensCharsPerToken)
 		}
 	}
 
