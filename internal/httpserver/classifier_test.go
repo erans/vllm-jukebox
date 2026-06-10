@@ -198,3 +198,58 @@ func TestClassifyContent_TokenEstimateMath(t *testing.T) {
 		t.Errorf("estimate too low for ~370-char body: got %d", got.EstTokens)
 	}
 }
+
+// 2026-06-10 (B-7-rev): regression test for the envelope-overshoot bug.
+// A 1KB JSON envelope with short user content should estimate from CONTENT
+// chars (~200 chars system + ~200 chars user / 3.3 ≈ 120 tokens), NOT from
+// the full envelope (~1000 / 3.3 ≈ 303 tokens). Pre-fix this would have
+// overflowed; post-fix it forwards.
+func TestClassifyContent_ContentOnly_NotEnvelope(t *testing.T) {
+	cfg := newClassifierCfg(true)
+
+	// Construct a body where the JSON envelope is much larger than the
+	// user content (a realistic chat request with tool definitions etc).
+	shortContent := strings.Repeat("x", 200)
+	envelopePad := strings.Repeat(" ", 700) // simulates tool defs / role overhead in the envelope
+	body := []byte(`{"model":"text-model","messages":[{"role":"system","content":"sys-pad"` + envelopePad +
+		`"},{"role":"user","content":"` + shortContent + `"}]}`)
+
+	got := ClassifyContent(body, "text-model", cfg)
+	// Total content chars = ~200 (user) + ~7 (sys-pad) = ~207 chars.
+	// Envelope is ~1KB. If we were still envelope-counting we'd estimate
+	// ~303 tokens; content-counting gives ~63. Assert content-derived.
+	envelopeEstimate := len(body) / 3 // approx envelope/3.3
+	if got.EstTokens >= envelopeEstimate {
+		t.Errorf("est-tokens should be content-derived, not envelope-derived: got %d, envelope-rough=%d, body=%d bytes",
+			got.EstTokens, envelopeEstimate, len(body))
+	}
+	if got.EstTokens == 0 {
+		t.Errorf("est-tokens should be non-zero for content-bearing request")
+	}
+}
+
+// All-image content yields contentChars=0; the function falls back to the
+// envelope estimate (preserves prior behaviour for image-only requests).
+func TestClassifyContent_AllImageContent_EnvelopeFallback(t *testing.T) {
+	cfg := newClassifierCfg(true)
+	body := []byte(`{"model":"vision-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`)
+	got := ClassifyContent(body, "vision-model", cfg)
+	if got.EstTokens == 0 {
+		t.Errorf("all-image content should fall back to envelope estimate, got 0")
+	}
+	if got.Decision != DecisionForward {
+		t.Errorf("image to MM-capable should forward, got %v (%s)", got.Decision, got.Reason)
+	}
+}
+
+// Malformed JSON falls back to the envelope estimate so the length gate
+// still catches abusive payloads even when their structure is broken.
+func TestClassifyContent_MalformedJSON_EnvelopeFallback(t *testing.T) {
+	cfg := newClassifierCfg(true)
+	body := []byte(`{not valid json at all, just bytes for the gate to size`)
+	got := ClassifyContent(body, "text-model", cfg)
+	if got.EstTokens == 0 {
+		t.Errorf("malformed JSON should still get envelope-sized estimate, got 0")
+	}
+}
+
