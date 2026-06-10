@@ -456,7 +456,21 @@ func (s *Scheduler) KickColdLoad(name string) bool {
 		// per-model kick map is cleared regardless of where in the
 		// pipeline the goroutine exits — so a future request can
 		// re-kick once the queue drains.
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		//
+		// Outer ctx timeout MUST outlive the inner /is_sleeping wait
+		// (modelCfg.EffectiveColdLoadTimeout) — otherwise the outer
+		// fires first and SIGKILLs vllm mid-init regardless of the
+		// per-model timeout setting. Use max(model timeout, 10 min
+		// historical floor) + 60s grace for cleanup. Live finding
+		// 2026-06-10 overnight: longctx with cold_load_timeout_seconds=720
+		// was getting killed at ~632s by the hardcoded 10*Minute outer
+		// ctx — the configured 720s was unreachable.
+		outerTimeout := modelCfg.EffectiveColdLoadTimeout()
+		if outerTimeout < 10*time.Minute {
+			outerTimeout = 10 * time.Minute
+		}
+		outerTimeout += 60 * time.Second // cleanup grace
+		ctx, cancel := context.WithTimeout(context.Background(), outerTimeout)
 		defer cancel()
 		if err := s.coldLoadStoppedMember(ctx, inst, modelCfg); err != nil {
 			slog.Error("async_cold_load_failed",
