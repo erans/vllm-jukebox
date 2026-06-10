@@ -35,6 +35,18 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # the prior distroless nonroot UID) since the cuda base ships only root.
 FROM nvidia/cuda:12.6.0-base-ubuntu24.04
 
+# docker CLI for shell-out to host docker.sock — jukebox uses `docker stop`,
+# `docker start`, `docker inspect` for evict_action: stop / wake-from-Stopped
+# / redeploy-member flows (see internal/jukebox/sleep.go + redeploy.go).
+# Distroless predecessor never had docker CLI either, which silently broke
+# Phase 4 cold-load when the image switched to overnight-stage-j-* — the
+# error 'exec: "docker": executable file not found in $PATH' surfaced at
+# the first wake-from-Stopped request. docker.io package installs just
+# the CLI binary; the dockerd daemon doesn't auto-start (no systemd in
+# container), so this is CLI-only as desired.
+RUN apt-get update && apt-get install -y --no-install-recommends docker.io \
+ && rm -rf /var/lib/apt/lists/*
+
 # Non-root jukebox user, UID/GID 65532 — matches the distroless `nonroot`
 # UID the prior image used, so any host bind-mount or NFS ACL keyed on
 # 65532 stays correct after the base swap. nologin shell, no home write,
