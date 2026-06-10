@@ -94,12 +94,6 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		}
 
 		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
-		// Resolve against the live config so a mid-flight active.yaml
-		// reload that adds / removes a model is reflected immediately.
-		liveCfg := config.Current()
-		if liveCfg == nil {
-			liveCfg = opts.Config
-		}
 		_, _, err = liveCfg.ResolveModel(modelName)
 		if err != nil {
 			return writeOpenAIError(
@@ -138,17 +132,6 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		// so the async-503 path is structurally inapplicable there.
 		if cl, ok := opts.Router.(jukebox.ColdLoadAware); ok && cl.IsModelColdLoading(modelName) {
 			cl.KickColdLoad(modelName)
-			// Retry-After: 60 (NOT 300). Rationale:
-			//   - OpenAI Python SDK caps its retry budget around ~8s and
-			//     gives up entirely on Retry-After > a few minutes.
-			//   - Anthropic SDK respects up to ~60s, then surfaces the
-			//     error to the caller.
-			//   - Bifrost / other proxies enforce their own deadlines.
-			// 300s caused most SDK clients to surface user-visible errors
-			// instead of retrying. With 60s, clients re-poll every minute,
-			// see more 503s while the model is still cold-loading, and
-			// eventually land on the warm Sleeping path on a later retry —
-			// which is the whole point of the async-503 contract.
 			c.Set("Retry-After", "60")
 			return writeOpenAIError(
 				c,
@@ -173,31 +156,18 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		// served-name so vLLM accepts it; RequestedModel + RewriteModelName
 		// rewrites the RESPONSE back to the originally-requested name so
 		// the client never sees the swap.
-		//
-		// External-lifecycle gotcha: route.UpstreamModel is sourced from
-		// modelCfg.Path which is EMPTY for `lifecycle: external` models
-		// (vllm-main, vllm-vision, etc — they're remote URLs, no on-disk
-		// path). When the classifier rewrote, we MUST set UpstreamModel
-		// explicitly to the rewritten served-name; otherwise the body
-		// rewrite in proxy.RewriteJSONModel skips (the cond is
-		// `UpstreamModel != ""`) and vision sees the OLD model name in
-		// the body → 404 NotFoundError.
 		rewriteModelName := opts.Config.Behavior.RewriteModelName
 		requestedForRewrite := modelName
-		upstreamForBody := route.UpstreamModel
 		if rewroteByContent {
 			rewriteModelName = true
 			requestedForRewrite = originalModel
-			if upstreamForBody == "" {
-				upstreamForBody = modelName // the rewritten served-name
-			}
 		}
 
 		return proxy.ForwardFiber(c, proxy.ForwardOptions{
 			BaseURL:          route.BaseURL,
 			RewriteModelName: rewriteModelName,
 			RequestedModel:   requestedForRewrite,
-			UpstreamModel:    upstreamForBody,
+			UpstreamModel:    route.UpstreamModel,
 			RequestID:        requestID,
 		})
 	}
