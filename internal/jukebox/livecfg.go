@@ -1,6 +1,8 @@
 package jukebox
 
 import (
+	"fmt"
+
 	"vllm-jukebox/internal/config"
 )
 
@@ -94,6 +96,15 @@ func liveModelCfg(fallback *config.Config, name string) (config.ModelConfig, boo
 // (*config.Config).ResolveModel. It resolves alias chains against the
 // latest Current() config (falling back to the captured config when
 // Current() is nil — primarily a test path).
+//
+// Guards against the pathological case where BOTH config.Current() and
+// the captured fallback are nil (sibling liveModelCfg already guards;
+// mirror that here for parity). Returns a not-found error rather than
+// nil-derefing on ResolveModel.
 func liveResolveModel(fallback *config.Config, name string) (string, config.ModelConfig, error) {
-	return liveCfg(fallback).ResolveModel(name)
+	cfg := liveCfg(fallback)
+	if cfg == nil {
+		return "", config.ModelConfig{}, fmt.Errorf("liveResolveModel: no config available (both Current() and fallback are nil)")
+	}
+	return cfg.ResolveModel(name)
 }
