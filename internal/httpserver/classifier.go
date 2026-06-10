@@ -126,19 +126,47 @@ func ClassifyContent(body []byte, requestedModel string, cfg *config.Config) Cla
 		return r
 	}
 
-	// Estimate tokens up-front. Cheap, no JSON parse needed.
 	cpt := cfg.Behavior.EstTokensCharsPerToken
 	if cpt <= 0 {
-		cpt = 3.3 // calibrated for English JSON chat with tool defs
+		cpt = 3.3 // legacy default; semantics changed 2026-06-10 — applies to content chars now
 	}
-	r.EstTokens = int(float64(len(body))/cpt + 0.5)
 
-	// Parse just enough to walk content blocks.
+	// Parse messages once. We use the same probe shape as before for image
+	// detection; we now also walk Content for char counting.
 	var probe chatRequestProbe
 	if err := json.Unmarshal(body, &probe); err != nil {
-		// Malformed JSON — let the upstream's existing 400 path handle it.
+		// Malformed JSON — fall back to envelope-bytes estimate so the
+		// length guard still applies, then return (let the upstream 400
+		// path handle the actual error response).
+		r.EstTokens = int(float64(len(body))/cpt + 0.5)
 		return r
 	}
+
+	// 2026-06-10 (B-7-rev): switch est-token source from JSON envelope to
+	// message-content text only. Envelope counting overshot ~2× for plain
+	// English chat (role markers + JSON escapes inflate byte length);
+	// 200K-token requests measured as ~378K and falsely overflowed to the
+	// long-context model. Content-only counting tracks actual prompt tokens.
+	//
+	// Image content contributes 0 chars — image_url/input_image parts'
+	// URL/base64 byte length is not a meaningful proxy for visual-token
+	// cost; vLLM's tokenizer accounts for visual tokens at serve time.
+	//
+	// The 3.3 default (originally calibrated for JSON envelope) now slightly
+	// over-counts content-only chars (English plain text is closer to ~4.0
+	// chars/tok). That's conservative-safe: an over-count routes a fitting
+	// request to the overflow model; an under-count would let a too-long
+	// request OOM main. Errs toward safety.
+	contentChars := contentCharCount(probe.Messages)
+	if contentChars > 0 {
+		r.EstTokens = int(float64(contentChars)/cpt + 0.5)
+	} else {
+		// Empty messages, all-image content, or only non-text typed parts:
+		// fall back to envelope estimate. Preserves the prior gate so an
+		// abusive empty-content request still trips a sane bound.
+		r.EstTokens = int(float64(len(body))/cpt + 0.5)
+	}
+
 	r.HasImage = hasImageContentBlock(probe.Messages)
 
 	// Rule P1: image content + non-MM target → vision reroute (or reject).
@@ -183,6 +211,45 @@ func ClassifyContent(body []byte, requestedModel string, cfg *config.Config) Cla
 	}
 
 	return r
+}
+
+// contentCharCount sums len(text) across all message content blocks.
+// String content counts in full. Array content sums len(text) of each
+// text-typed part. Image parts and other typed parts contribute zero —
+// their cost is accounted for separately by vLLM's tokenizer at serve
+// time, and including their URL/base64 byte length would re-introduce
+// the envelope-overshoot bug this function exists to fix.
+func contentCharCount(messages []chatRequestProbeEntry) int {
+	total := 0
+	for _, m := range messages {
+		if len(m.Content) == 0 {
+			continue
+		}
+		// String content: "..."
+		if m.Content[0] == '"' {
+			var s string
+			if json.Unmarshal(m.Content, &s) == nil {
+				total += len(s)
+			}
+			continue
+		}
+		// Array of typed parts: [{"type":"text","text":"..."},...]
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(m.Content, &parts) != nil {
+			continue
+		}
+		for _, p := range parts {
+			// "text" parts have a text field; treat unspecified type as
+			// text (some clients omit type for plain-text-only parts).
+			if p.Type == "text" || p.Type == "" {
+				total += len(p.Text)
+			}
+		}
+	}
+	return total
 }
 
 func isMultimodalCapable(name string, list []string) bool {
