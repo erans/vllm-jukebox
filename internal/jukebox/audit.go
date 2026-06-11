@@ -37,6 +37,13 @@ const (
 	// detected unreachable evict_action:stop container at startup),
 	// "failed" (cold-load timeout).
 	LifecycleColdLoad LifecycleAction = "cold_load"
+
+	// LifecycleCircuitBreakerTrip — the jukebox-native circuit breaker
+	// observed Threshold consecutive 5xx for a Ready model and issued
+	// `docker restart` on its container. `Model` is the model;
+	// `Reason` describes the trigger ("5xx_consecutive") or failure
+	// mode ("docker_restart_failed").
+	LifecycleCircuitBreakerTrip LifecycleAction = "circuit_breaker_trip"
 )
 
 // LifecycleEvent is the unified shape for every model state transition

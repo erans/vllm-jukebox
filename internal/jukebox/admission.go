@@ -1251,6 +1251,7 @@ func (a *AdmissionController) publishGauges() {
 		label := strconv.Itoa(g)
 		metrics.GPUBudgetAwakeMB.WithLabelValues(label).Set(float64(a.awakeByGPU[g] + a.pinnedByGPU[g]))
 		metrics.GPUBudgetAvailableMB.WithLabelValues(label).Set(float64(total - a.pinnedByGPU[g] - a.awakeByGPU[g] - a.l1ResidualByGPU[g]))
+		metrics.GPUResidualMB.WithLabelValues(label).Set(float64(a.l1ResidualByGPU[g]))
 	}
 }
 

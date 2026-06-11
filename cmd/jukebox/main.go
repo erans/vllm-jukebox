@@ -312,6 +312,18 @@ func main() {
 			}
 		}
 
+		// Always attach the circuit breaker. It self-gates on
+		// behavior.circuit_breaker.enabled so a config without the
+		// block is a no-op; the upside of the constant attachment is
+		// that an active.yaml hot-reload flipping enabled=true picks
+		// up immediately without restarting jukebox.
+		sched.EnableCircuitBreaker(config.Current)
+		slog.Info("circuit_breaker_attached",
+			"enabled", cfg.Behavior.CircuitBreaker.Enabled,
+			"window", cfg.Behavior.CircuitBreaker.Window,
+			"threshold", cfg.Behavior.CircuitBreaker.Threshold,
+		)
+
 		// Bootstrap lifecycle: external instances + start the auto-suspend
 		// idle monitor.
 		if err := sched.RegisterExternalInstances(ctx); err != nil {

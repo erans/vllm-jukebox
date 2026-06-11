@@ -347,6 +347,47 @@ var (
 			Buckets: []float64{1024, 4096, 16384, 65536, 131072, 196608, 262144, 393216, 524288},
 		},
 	)
+
+	// --- circuit breaker (Track A, 2026-06-11) ---
+
+	// CircuitBreakerObservedTotal counts every response status the
+	// breaker observed, labeled by model + outcome bucket (2xx/4xx/5xx).
+	// Useful to verify the breaker is actually receiving signal —
+	// silent zero on 5xx during a known-bad period means the wireup
+	// is broken (handler not invoking RecordResponse, etc.).
+	CircuitBreakerObservedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_circuit_breaker_observed_total",
+			Help: "Responses observed by the circuit breaker per model, labeled by outcome class (2xx/4xx/5xx).",
+		},
+		[]string{"model", "class"},
+	)
+
+	// CircuitBreakerTripsTotal counts trip-decisions, labeled by model
+	// and outcome (fired = docker restart issued, suppressed_cooldown,
+	// suppressed_not_ready, suppressed_crashloop, suppressed_dryrun,
+	// failed = exec error). Use sum(rate(...{outcome="fired"})) for the
+	// trip-rate dashboard panel.
+	CircuitBreakerTripsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_circuit_breaker_trips_total",
+			Help: "Circuit breaker trip decisions per model+outcome (fired/suppressed_*/failed).",
+		},
+		[]string{"model", "outcome"},
+	)
+
+	// GPUResidualMB exposes per-GPU L1-sleep residual VRAM from
+	// admission bookkeeping. Companion to GPUBudgetAvailableMB which
+	// SUBTRACTS this. Surfaced separately so dashboards can answer
+	// "how much GPU is wasted on slept-L1 weight pools right now?"
+	// directly, without algebra against three other gauges.
+	GPUResidualMB = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_gpu_residual_mb",
+			Help: "Per-GPU L1-sleep residual VRAM (vLLM cumem allocator pool retained after /sleep, MB). From admission bookkeeping, NOT live nvidia-smi.",
+		},
+		[]string{"gpu"},
+	)
 )
 
 func init() {
@@ -382,6 +423,9 @@ func init() {
 		ConfigReloadsTotal,
 		ContentRoutingDecisionsTotal,
 		ContentRoutingEstTokensHistogram,
+		CircuitBreakerObservedTotal,
+		CircuitBreakerTripsTotal,
+		GPUResidualMB,
 	)
 }
 

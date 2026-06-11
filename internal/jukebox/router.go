@@ -24,6 +24,22 @@ type Router interface {
 	AcquireRoute(ctx context.Context, requestedModel, requestID string) (Route, error)
 }
 
+// ResponseRecorder is the OPTIONAL extension implemented by routers
+// that participate in the in-proxy circuit breaker. The HTTP handler
+// calls RecordResponse after every upstream-bound proxy call with the
+// resolved model name and the upstream status code (or 0 if the proxy
+// never reached upstream — network error / timeout / ctx cancel).
+//
+// Routers that don't implement it skip the breaker entirely; the path
+// is purely additive. Scheduler implements it via its embedded
+// CircuitBreaker; LegacyRouter (swap mode) implements a no-op variant
+// (swap mode owns the single vllm process and restarts it directly,
+// so the docker-restart breaker doesn't apply — but the interface is
+// satisfied so handlers don't need a swap/scheduler-mode branch).
+type ResponseRecorder interface {
+	RecordResponse(model string, status int)
+}
+
 // ColdLoadAware is the OPTIONAL extension implemented by routers that
 // can asynchronously cold-load a Stopped model (admissionStopped state:
 // the container is `docker compose stop`'d because a previous admission

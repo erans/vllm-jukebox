@@ -274,6 +274,56 @@ type BehaviorConfig struct {
 	//
 	// Default 0 = use 3.3.
 	EstTokensCharsPerToken float64 `yaml:"est_tokens_chars_per_token"`
+
+	// CircuitBreaker is the per-model 5xx auto-restart policy. Replaces
+	// the external sidecar that polls Bifrost postgres logs. Default
+	// disabled; opt in via behavior.circuit_breaker.enabled = true.
+	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+}
+
+// CircuitBreakerConfig configures the jukebox-native circuit breaker.
+// When a model's recent response stream shows THRESHOLD consecutive 5xx
+// AND the scheduler reports the model as Ready (not sleeping/stopped),
+// the breaker `docker restart`s the model's container (per
+// ModelConfig.Container) to recover from a hung engine. Sleep/Stopped
+// states are intentional jukebox-managed states and never trigger a
+// trip — the breaker only catches /v1/models-says-healthy-but-
+// EngineCore-is-dead crashes.
+//
+// All fields are hot-reloadable via active.yaml fsnotify watcher.
+type CircuitBreakerConfig struct {
+	// Enabled is the master kill-switch. Default false — when false the
+	// breaker observes nothing and trips nothing.
+	Enabled bool `yaml:"enabled"`
+
+	// Window is the number of most-recent responses kept per model in
+	// the rolling decision buffer. Default 5.
+	Window int `yaml:"window"`
+
+	// Threshold is the count of consecutive 5xx from the head of Window
+	// required to fire a trip. Default 3.
+	Threshold int `yaml:"threshold"`
+
+	// CooldownSeconds suppresses re-trips on the same container within
+	// this many seconds of the most recent trip. Default 300 (5min).
+	CooldownSeconds int `yaml:"cooldown_seconds"`
+
+	// CrashLoopMaxTrips is the cap on trips per container within
+	// CrashLoopWindowSeconds before the breaker freezes that container
+	// (no further trips, operator intervention required). Default 3.
+	CrashLoopMaxTrips int `yaml:"crash_loop_max_trips"`
+
+	// CrashLoopWindowSeconds is the sliding window for the crash-loop
+	// guard. Default 1800 (30min).
+	CrashLoopWindowSeconds int `yaml:"crash_loop_window_seconds"`
+
+	// RestartTimeoutSeconds bounds the docker restart wall-clock.
+	// Default 60.
+	RestartTimeoutSeconds int `yaml:"restart_timeout_seconds"`
+
+	// DryRun logs decisions without executing docker restart. Useful
+	// during initial rollout. Default false.
+	DryRun bool `yaml:"dry_run"`
 }
 
 type ModelConfig struct {
@@ -389,6 +439,18 @@ type ModelConfig struct {
 	//
 	// Default empty = "sleep" (backward-compat).
 	EvictAction string `yaml:"evict_action"`
+
+	// Container is the docker container name backing this model — used
+	// by the jukebox-native circuit breaker (behavior.circuit_breaker)
+	// to issue `docker restart <container>` when N consecutive 5xx
+	// indicate a hung engine. Empty = breaker skips this model
+	// (gracefully degraded — request stream is observed but no trip
+	// can fire). For `lifecycle: external` models served by a separate
+	// vllm-* container on the same host (vllm-main, vllm-vision, …)
+	// set this to the compose service name. For `lifecycle: managed`
+	// models the docker restart path doesn't apply — the supervised
+	// process is restarted by jukebox itself, not docker.
+	Container string `yaml:"container,omitempty"`
 }
 
 func Load(data []byte) (*Config, error) {
@@ -481,6 +543,29 @@ func (c *Config) applyDefaults() {
 			c.Models[name] = model
 		}
 	}
+
+	// Circuit breaker defaults — applied even when Enabled=false so
+	// hot-reload that flips Enabled=true picks up sane values without
+	// the operator needing to spell out every knob.
+	cb := &c.Behavior.CircuitBreaker
+	if cb.Window == 0 {
+		cb.Window = 5
+	}
+	if cb.Threshold == 0 {
+		cb.Threshold = 3
+	}
+	if cb.CooldownSeconds == 0 {
+		cb.CooldownSeconds = 300
+	}
+	if cb.CrashLoopMaxTrips == 0 {
+		cb.CrashLoopMaxTrips = 3
+	}
+	if cb.CrashLoopWindowSeconds == 0 {
+		cb.CrashLoopWindowSeconds = 1800
+	}
+	if cb.RestartTimeoutSeconds == 0 {
+		cb.RestartTimeoutSeconds = 60
+	}
 }
 
 func (c *Config) Validate() error {
@@ -543,6 +628,32 @@ func (c *Config) Validate() error {
 		}
 		if c.Behavior.EstTokensCharsPerToken < 0 {
 			return fmt.Errorf("behavior.est_tokens_chars_per_token must be >= 0 (got %f)", c.Behavior.EstTokensCharsPerToken)
+		}
+	}
+
+	// Circuit breaker validation. Only enforced when Enabled is true.
+	if c.Behavior.CircuitBreaker.Enabled {
+		cb := c.Behavior.CircuitBreaker
+		if cb.Window <= 0 {
+			return fmt.Errorf("behavior.circuit_breaker.window must be > 0 (got %d)", cb.Window)
+		}
+		if cb.Threshold <= 0 {
+			return fmt.Errorf("behavior.circuit_breaker.threshold must be > 0 (got %d)", cb.Threshold)
+		}
+		if cb.Threshold > cb.Window {
+			return fmt.Errorf("behavior.circuit_breaker.threshold (%d) must be <= window (%d)", cb.Threshold, cb.Window)
+		}
+		if cb.CooldownSeconds <= 0 {
+			return fmt.Errorf("behavior.circuit_breaker.cooldown_seconds must be > 0 (got %d)", cb.CooldownSeconds)
+		}
+		if cb.CrashLoopMaxTrips <= 0 {
+			return fmt.Errorf("behavior.circuit_breaker.crash_loop_max_trips must be > 0 (got %d)", cb.CrashLoopMaxTrips)
+		}
+		if cb.CrashLoopWindowSeconds <= 0 {
+			return fmt.Errorf("behavior.circuit_breaker.crash_loop_window_seconds must be > 0 (got %d)", cb.CrashLoopWindowSeconds)
+		}
+		if cb.RestartTimeoutSeconds <= 0 {
+			return fmt.Errorf("behavior.circuit_breaker.restart_timeout_seconds must be > 0 (got %d)", cb.RestartTimeoutSeconds)
 		}
 	}
 

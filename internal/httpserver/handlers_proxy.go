@@ -189,6 +189,17 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			RequestedModel:   requestedForRewrite,
 			UpstreamModel:    upstreamForBody,
 			RequestID:        requestID,
+			OnComplete: func(status int) {
+				// Hand every upstream response status to the circuit
+				// breaker so it can decide whether to docker-restart
+				// a hung container. status==0 means proxy never
+				// reached upstream (network err/timeout/ctx cancel) —
+				// breaker treats that as 5xx. Routers that don't
+				// implement ResponseRecorder no-op.
+				if recorder, ok := opts.Router.(jukebox.ResponseRecorder); ok {
+					recorder.RecordResponse(modelName, status)
+				}
+			},
 		})
 	}
 }

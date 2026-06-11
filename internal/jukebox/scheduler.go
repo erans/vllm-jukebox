@@ -33,6 +33,14 @@ type Scheduler struct {
 	// after construction.
 	admission *AdmissionController
 
+	// cb is the optional in-proxy circuit breaker (Track A). When
+	// non-nil, HTTP handlers call s.RecordResponse after every proxy
+	// call and the breaker decides whether to docker-restart a hung
+	// container. nil = breaker disabled (legacy behavior, sidecar
+	// can still be deployed externally). Set via EnableCircuitBreaker
+	// after construction.
+	cb *CircuitBreaker
+
 	// sched is a semaphore (size 1) that serializes scheduling operations.
 	sched chan struct{}
 
