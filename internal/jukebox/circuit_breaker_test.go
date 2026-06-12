@@ -32,6 +32,22 @@ func (r *recordingDocker) Count() int {
 	return len(r.calls)
 }
 
+// RestartCount returns the number of `docker restart` invocations,
+// filtering out `docker inspect` calls (the cold-load grace gate
+// runs an inspect before every potential trip; tests that count
+// trip-actions want only restarts).
+func (r *recordingDocker) RestartCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, call := range r.calls {
+		if len(call) >= 2 && call[1] == "restart" {
+			n++
+		}
+	}
+	return n
+}
+
 func (r *recordingDocker) Last() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -131,6 +147,12 @@ func TestCircuitBreaker_TripsAfterThreshold(t *testing.T) {
 	cb := NewCircuitBreaker(func() *config.Config { return cfg },
 		func(string) bool { return true }, time.Now)
 
+	// Seed cold-load grace latch (Track A fix 2026-06-12) — a 2xx
+	// proves the container has serviced traffic, so subsequent 5xx
+	// counts as a real wedge rather than a legit cold-load. Without
+	// this seed every test expecting a trip would suppress.
+	cb.RecordResponse("vllm-main", 200)
+
 	// 2 5xx (below threshold) — no trip.
 	cb.RecordResponse("vllm-main", 500)
 	cb.RecordResponse("vllm-main", 502)
@@ -192,10 +214,11 @@ func TestCircuitBreaker_CooldownSuppresses(t *testing.T) {
 	cb := NewCircuitBreaker(func() *config.Config { return cfg },
 		func(string) bool { return true }, clock.Now)
 
+	cb.RecordResponse("vllm-main", 200) // seed cold-load grace latch
 	for i := 0; i < 3; i++ {
 		cb.RecordResponse("vllm-main", 500)
 	}
-	waitFor(t, func() bool { return rd.Count() >= 1 }, "first trip")
+	waitFor(t, func() bool { return rd.RestartCount() >= 1 }, "first trip")
 
 	// Bump clock 30s — still within 300s cooldown. The first trip
 	// already cleared the model's window, so we need a fresh burst
@@ -205,7 +228,7 @@ func TestCircuitBreaker_CooldownSuppresses(t *testing.T) {
 		cb.RecordResponse("vllm-main", 500)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if rd.Count() != 1 {
+	if rd.RestartCount() != 1 {
 		t.Fatalf("trip re-fired inside cooldown: %v", rd.calls)
 	}
 }
@@ -217,12 +240,14 @@ func TestCircuitBreaker_CooldownExpiresThenTripsAgain(t *testing.T) {
 	cb := NewCircuitBreaker(func() *config.Config { return cfg },
 		func(string) bool { return true }, clock.Now)
 
+	cb.RecordResponse("vllm-main", 200) // seed cold-load grace latch
 	for i := 0; i < 3; i++ {
 		cb.RecordResponse("vllm-main", 500)
 	}
 	waitFor(t, func() bool { return rd.Count() >= 1 }, "first trip")
 
 	clock.Advance(301 * time.Second) // past cooldown
+	cb.RecordResponse("vllm-main", 200) // re-seed latch (trip-fire cleared it)
 	for i := 0; i < 3; i++ {
 		cb.RecordResponse("vllm-main", 500)
 	}
@@ -241,6 +266,7 @@ func TestCircuitBreaker_CrashLoopFreezes(t *testing.T) {
 		func(string) bool { return true }, clock.Now)
 
 	for run := 0; run < 5; run++ {
+		cb.RecordResponse("vllm-main", 200) // re-seed latch each iter (trip-fire clears it)
 		for i := 0; i < 3; i++ {
 			cb.RecordResponse("vllm-main", 500)
 		}
@@ -249,8 +275,8 @@ func TestCircuitBreaker_CrashLoopFreezes(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 	// MaxTrips=2 so we should see exactly 2 fires, then suppressions.
-	if rd.Count() != 2 {
-		t.Fatalf("crash-loop guard didn't freeze: got %d trips, want 2", rd.Count())
+	if rd.RestartCount() != 2 {
+		t.Fatalf("crash-loop guard didn't freeze: got %d trips, want 2", rd.RestartCount())
 	}
 }
 
@@ -260,6 +286,7 @@ func TestCircuitBreaker_AliasResolvesToContainer(t *testing.T) {
 	cb := NewCircuitBreaker(func() *config.Config { return cfg },
 		func(string) bool { return true }, time.Now)
 
+	cb.RecordResponse("alias", 200) // seed latch (alias resolves to vllm-main)
 	for i := 0; i < 3; i++ {
 		cb.RecordResponse("alias", 500)
 	}
@@ -296,8 +323,8 @@ func TestCircuitBreaker_DryRunDoesntRestart(t *testing.T) {
 		cb.RecordResponse("vllm-main", 500)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if rd.Count() != 0 {
-		t.Fatalf("dry-run fired docker: %v", rd.calls)
+	if rd.RestartCount() != 0 {
+		t.Fatalf("dry-run fired docker restart: %v", rd.calls)
 	}
 }
 
@@ -307,6 +334,7 @@ func TestCircuitBreaker_StatusZeroTreatedAs5xx(t *testing.T) {
 	cb := NewCircuitBreaker(func() *config.Config { return cfg },
 		func(string) bool { return true }, time.Now)
 
+	cb.RecordResponse("vllm-main", 200) // seed latch
 	for i := 0; i < 3; i++ {
 		cb.RecordResponse("vllm-main", 0)
 	}
@@ -335,6 +363,8 @@ func TestCircuitBreaker_ConcurrentRecordSafe(t *testing.T) {
 	cb := NewCircuitBreaker(func() *config.Config { return cfg },
 		func(string) bool { return true }, time.Now)
 
+	cb.RecordResponse("vllm-main", 200) // seed cold-load grace latch
+
 	var wg sync.WaitGroup
 	var counter int64
 	for i := 0; i < 16; i++ {
@@ -354,4 +384,128 @@ func TestCircuitBreaker_ConcurrentRecordSafe(t *testing.T) {
 	if rd.Count() < 1 {
 		t.Fatalf("concurrent burst didn't trip: %d records, %d calls", counter, rd.Count())
 	}
+}
+
+// --- Cold-load grace gate tests (Track A fix 2026-06-12) ---
+//
+// The breaker tripped on legit cold-load during the 2026-06-12 02:00 UTC
+// incident: vllm-main was rebooting on a new image, /is_sleeping returned
+// connect-refused for ~6min while workers spawned, drift_probe counted
+// those refusals as 5xx (status=0), breaker tripped → `docker restart`
+// aborted the cold-load mid-flight → infinite loop. Root cause: breaker
+// had no way to distinguish "container has never been up yet" from
+// "container was up and is now wedged".
+//
+// Gate: latch per-container on the first 2xx response. A container that
+// has not returned a 2xx in its current incarnation gets the trip
+// suppressed. The latch CLEARS when the breaker fires `docker restart`
+// (the restart starts a fresh cold-load window — see breaker.go).
+
+// TestCircuitBreaker_ColdLoadGrace_NoPriorHealthy_SuppressesTrip
+// reproduces the 2026-06-12 02:00Z incident: cold-load in progress,
+// every drift_probe returns refused (status 0 = 5xx in breaker). The
+// 5xx threshold (3) is crossed but the grace gate must suppress
+// because no 2xx has been observed.
+func TestCircuitBreaker_ColdLoadGrace_NoPriorHealthy_SuppressesTrip(t *testing.T) {
+	rd := installRecordingDocker(t)
+	cfg := cbTestCfg(t, true)
+	cb := NewCircuitBreaker(func() *config.Config { return cfg },
+		func(string) bool { return true }, time.Now)
+
+	// Cold-load: every drift_probe returns refused.
+	for i := 0; i < 5; i++ {
+		cb.RecordResponse("vllm-main", 0)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if rd.RestartCount() != 0 {
+		t.Fatalf("cold-load grace failed — trip fired with no 2xx observed: %v", rd.calls)
+	}
+}
+
+// TestCircuitBreaker_ColdLoadGrace_PriorHealthyThenWedge_TripsNormally
+// is the inverse: container HAS returned 2xx (latch set). When it
+// later returns 5xx burst, the breaker SHOULD trip — that's the real
+// wedge signal the breaker exists to catch.
+func TestCircuitBreaker_ColdLoadGrace_PriorHealthyThenWedge_TripsNormally(t *testing.T) {
+	rd := installRecordingDocker(t)
+	cfg := cbTestCfg(t, true)
+	cb := NewCircuitBreaker(func() *config.Config { return cfg },
+		func(string) bool { return true }, time.Now)
+
+	// Healthy phase — one 2xx is enough to set the latch.
+	cb.RecordResponse("vllm-main", 200)
+	// Now wedged: 5xx burst should trip.
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	waitFor(t, func() bool { return rd.RestartCount() >= 1 }, "healthy→wedged should trip")
+}
+
+// TestCircuitBreaker_ColdLoadGrace_TripClearsLatch verifies that after
+// the breaker fires `docker restart`, the latch clears so the
+// follow-on cold-load (during which /is_sleeping returns refused) does
+// NOT re-trip. This is the actual fix for the incident: a single trip
+// must not cascade into infinite restart loops while cold-loading.
+func TestCircuitBreaker_ColdLoadGrace_TripClearsLatch(t *testing.T) {
+	rd := installRecordingDocker(t)
+	cfg := cbTestCfg(t, true)
+	cfg.Behavior.CircuitBreaker.CooldownSeconds = 0 // exercise grace gate, not cooldown
+	cb := NewCircuitBreaker(func() *config.Config { return cfg },
+		func(string) bool { return true }, time.Now)
+
+	// First incarnation: healthy, then wedged → trip fires.
+	cb.RecordResponse("vllm-main", 200)
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	waitFor(t, func() bool { return rd.RestartCount() >= 1 }, "initial wedge trip")
+	tripsBefore := rd.RestartCount()
+
+	// docker restart fires → cold-load starts → refused/5xx burst.
+	// Even though we just observed 2xx pre-trip, the latch must have
+	// cleared on trip-fire — so this burst suppresses, not re-trips.
+	for i := 0; i < 5; i++ {
+		cb.RecordResponse("vllm-main", 0)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if rd.RestartCount() != tripsBefore {
+		t.Fatalf("trip-clears-latch failed — re-tripped during follow-on cold-load: %v", rd.calls)
+	}
+}
+
+// TestCircuitBreaker_ColdLoadGrace_TripClearsLatchThenRehealth verifies
+// the full recovery cycle: trip fires (latch cleared) → cold-load
+// finishes, container serves 2xx (latch re-sets) → engine wedges again
+// → next trip fires. The crash-loop guard handles the final case
+// where this pattern repeats too many times.
+func TestCircuitBreaker_ColdLoadGrace_TripClearsLatchThenRehealth(t *testing.T) {
+	rd := installRecordingDocker(t)
+	cfg := cbTestCfg(t, true)
+	cfg.Behavior.CircuitBreaker.CooldownSeconds = 0
+	cb := NewCircuitBreaker(func() *config.Config { return cfg },
+		func(string) bool { return true }, time.Now)
+
+	// Trip #1
+	cb.RecordResponse("vllm-main", 200)
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	waitFor(t, func() bool { return rd.RestartCount() >= 1 }, "first trip")
+
+	// Cold-load period — refusals suppressed (latch cleared).
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 0)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if rd.RestartCount() != 1 {
+		t.Fatalf("cold-load suppressed broke — got %d trips, want 1", rd.RestartCount())
+	}
+
+	// Container finishes cold-load → 2xx → latch re-arms.
+	cb.RecordResponse("vllm-main", 200)
+	// Wedge again → trip #2 should fire.
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	waitFor(t, func() bool { return rd.RestartCount() >= 2 }, "second trip after re-healthy")
 }

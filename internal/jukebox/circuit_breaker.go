@@ -72,6 +72,22 @@ type CircuitBreaker struct {
 	// recentTrips records trip timestamps per container within the
 	// crash-loop window. Pruned on every check.
 	recentTrips map[string][]time.Time
+
+	// hasBeenHealthy records, per container, whether we have observed
+	// at least one 2xx response from it since the last trip-fire (or
+	// since startup). Cold-load grace gate: a container that has not
+	// returned a 2xx in its current incarnation is in a legitimate
+	// cold-load — `/is_sleeping` connect-refused / network errors are
+	// expected, not a wedge signal. Only after the first 2xx do we
+	// count 5xx / refusals as a real wedge worthy of `docker restart`.
+	//
+	// Cleared after the breaker fires `docker restart` — the restarted
+	// container starts a fresh cold-load, so the gate re-engages until
+	// the next 2xx arrives. This is the fix for the 2026-06-12 02:00Z
+	// incident where the breaker false-positive-tripped vllm-main's
+	// cold-load infinitely because the post-restart cold-load window
+	// returned the same 5xx pattern that originally tripped it.
+	hasBeenHealthy map[string]bool
 }
 
 // NewCircuitBreaker builds a breaker. Both liveCfg and readyChecker
@@ -81,12 +97,13 @@ func NewCircuitBreaker(liveCfg func() *config.Config, readyChecker func(model st
 		now = time.Now
 	}
 	return &CircuitBreaker{
-		liveCfg:      liveCfg,
-		readyChecker: readyChecker,
-		now:          now,
-		statuses:     map[string][]int{},
-		lastTripAt:   map[string]time.Time{},
-		recentTrips:  map[string][]time.Time{},
+		liveCfg:        liveCfg,
+		readyChecker:   readyChecker,
+		now:            now,
+		statuses:       map[string][]int{},
+		lastTripAt:     map[string]time.Time{},
+		recentTrips:    map[string][]time.Time{},
+		hasBeenHealthy: map[string]bool{},
 	}
 }
 
@@ -125,6 +142,12 @@ func (cb *CircuitBreaker) RecordResponse(model string, status int) {
 	}
 
 	cb.mu.Lock()
+	// Latch the cold-load grace gate: any 2xx proves the container
+	// has serviced traffic in its current incarnation, so subsequent
+	// 5xx burst counts as a real wedge (not a legit cold-load).
+	if status >= 200 && status < 300 {
+		cb.hasBeenHealthy[container] = true
+	}
 	statuses := append([]int{status}, cb.statuses[model]...)
 	if len(statuses) > cbcfg.Window {
 		statuses = statuses[:cbcfg.Window]
@@ -153,12 +176,29 @@ func (cb *CircuitBreaker) RecordResponse(model string, status int) {
 	go cb.evaluateAndTrip(model, container, cbcfg)
 }
 
-// evaluateAndTrip runs the gate stack (ready, cooldown, crash-loop,
-// dry-run) and either fires the docker restart or records the
-// suppression reason. Caller is RecordResponse on its own goroutine.
+// evaluateAndTrip runs the gate stack (ready, cold-load grace, cooldown,
+// crash-loop, dry-run) and either fires the docker restart or records
+// the suppression reason. Caller is RecordResponse on its own goroutine.
 func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.CircuitBreakerConfig) {
 	if !cb.readyChecker(model) {
 		metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "suppressed_not_ready").Inc()
+		return
+	}
+
+	// Cold-load grace gate: a container that has not returned a 2xx
+	// in its current incarnation is in a legitimate cold-load —
+	// /is_sleeping connect-refused / network errors during a 6-12min
+	// TP/PP cold-load are expected, not a wedge. Only after the
+	// first 2xx do refusals count as a real wedge.
+	//
+	// The latch clears when we fire docker restart (the restart
+	// starts a fresh cold-load window — see below).
+	cb.mu.Lock()
+	hasBeenHealthy := cb.hasBeenHealthy[container]
+	cb.mu.Unlock()
+	if !hasBeenHealthy {
+		log.Printf("circuit-breaker: cold-load grace container=%s model=%s — suppressing trip (no 2xx observed yet from this incarnation)", container, model)
+		metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "suppressed_cold_load").Inc()
 		return
 	}
 
@@ -219,6 +259,15 @@ func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.
 	}
 	metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "fired").Inc()
 	log.Printf("circuit-breaker: TRIP FIRED container=%s model=%s out=%q", container, model, truncate(out, 200))
+	// Clear the cold-load grace latch — the restart starts a fresh
+	// cold-load (6-12 min for TP/PP models) during which /is_sleeping
+	// will return refused. Without clearing, the same refusal pattern
+	// that fired this trip would fire it again during cold-load,
+	// creating the infinite restart loop the 2026-06-12 02:00Z
+	// incident exposed.
+	cb.mu.Lock()
+	delete(cb.hasBeenHealthy, container)
+	cb.mu.Unlock()
 	LogLifecycleTransition(LifecycleEvent{
 		Action: LifecycleCircuitBreakerTrip,
 		Reason: "5xx_consecutive",
