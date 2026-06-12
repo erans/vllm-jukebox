@@ -417,7 +417,20 @@ func (s *Scheduler) swapGroupMembersForColdLoad(target, swapGroup string) []stri
 	if s == nil || swapGroup == "" {
 		return out
 	}
-	for name, m := range config.Current().Models {
+	// config.Current() can return nil in tests that build a Scheduler
+	// directly via NewSchedulerWithFactory without calling
+	// config.SetCurrent (e.g. concurrency stress tests). In that case
+	// fall back to the Scheduler's captured cfg pointer; if that is also
+	// nil treat it as "no swap-group context known" and return just the
+	// target (same conservative behavior as the empty-swapGroup branch).
+	cfg := config.Current()
+	if cfg == nil {
+		cfg = s.cfg
+	}
+	if cfg == nil {
+		return out
+	}
+	for name, m := range cfg.Models {
 		if name == target {
 			continue
 		}
