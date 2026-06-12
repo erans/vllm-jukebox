@@ -365,13 +365,15 @@ var (
 
 	// CircuitBreakerTripsTotal counts trip-decisions, labeled by model
 	// and outcome (fired = docker restart issued, suppressed_cooldown,
-	// suppressed_not_ready, suppressed_crashloop, suppressed_dryrun,
-	// failed = exec error). Use sum(rate(...{outcome="fired"})) for the
-	// trip-rate dashboard panel.
+	// suppressed_not_ready, suppressed_crashloop, suppressed_cold_load,
+	// suppressed_dryrun, failed = exec error). Use sum(rate(...{outcome="fired"}))
+	// for the trip-rate dashboard panel. Sustained
+	// suppressed_cold_load over 15m+ indicates a born-broken container
+	// (model never returns 2xx) — page on it.
 	CircuitBreakerTripsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jukebox_circuit_breaker_trips_total",
-			Help: "Circuit breaker trip decisions per model+outcome (fired/suppressed_*/failed).",
+			Help: "Circuit breaker trip decisions per model+outcome (fired/suppressed_cooldown/suppressed_not_ready/suppressed_crashloop/suppressed_cold_load/suppressed_dryrun/failed).",
 		},
 		[]string{"model", "outcome"},
 	)

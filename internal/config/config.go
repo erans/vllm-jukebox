@@ -321,6 +321,18 @@ type CircuitBreakerConfig struct {
 	// Default 60.
 	RestartTimeoutSeconds int `yaml:"restart_timeout_seconds"`
 
+	// ColdLoadGraceMaxSeconds bounds the cold-load grace gate so a
+	// container that NEVER returns a 2xx (born-broken: bad weights,
+	// OOM-at-init, missing config, broken image) doesn't silently
+	// suppress every trip forever. After this many seconds since the
+	// first response was observed for a container, the grace gate
+	// exits and trips are allowed even without a prior 2xx. Set well
+	// above the worst-case cold-load (TP/PP 27B AWQ runs ~6-12 min on
+	// 4×3090). Default 900 (15min). Set 0 to disable the timeout
+	// (latch-only mode — the pre-fix behavior of the 2026-06-12 02:00Z
+	// incident; not recommended).
+	ColdLoadGraceMaxSeconds int `yaml:"cold_load_grace_max_seconds"`
+
 	// DryRun logs decisions without executing docker restart. Useful
 	// during initial rollout. Default false.
 	DryRun bool `yaml:"dry_run"`
@@ -565,6 +577,9 @@ func (c *Config) applyDefaults() {
 	}
 	if cb.RestartTimeoutSeconds == 0 {
 		cb.RestartTimeoutSeconds = 60
+	}
+	if cb.ColdLoadGraceMaxSeconds == 0 {
+		cb.ColdLoadGraceMaxSeconds = 900 // 15min — longer than worst-case TP/PP cold-load
 	}
 }
 

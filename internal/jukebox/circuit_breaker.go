@@ -73,21 +73,29 @@ type CircuitBreaker struct {
 	// crash-loop window. Pruned on every check.
 	recentTrips map[string][]time.Time
 
-	// hasBeenHealthy records, per container, whether we have observed
-	// at least one 2xx response from it since the last trip-fire (or
-	// since startup). Cold-load grace gate: a container that has not
-	// returned a 2xx in its current incarnation is in a legitimate
-	// cold-load — `/is_sleeping` connect-refused / network errors are
-	// expected, not a wedge signal. Only after the first 2xx do we
-	// count 5xx / refusals as a real wedge worthy of `docker restart`.
+	// lastHealthyAt records the timestamp of the most recent 2xx
+	// response observed per container. Cold-load grace gate: a trip
+	// only fires if lastHealthyAt[container] is set AND is more recent
+	// than lastTripAt[container] — i.e. we have evidence the container
+	// has actually served traffic in its current incarnation, post any
+	// prior breaker restart.
 	//
-	// Cleared after the breaker fires `docker restart` — the restarted
-	// container starts a fresh cold-load, so the gate re-engages until
-	// the next 2xx arrives. This is the fix for the 2026-06-12 02:00Z
-	// incident where the breaker false-positive-tripped vllm-main's
-	// cold-load infinitely because the post-restart cold-load window
-	// returned the same 5xx pattern that originally tripped it.
-	hasBeenHealthy map[string]bool
+	// This is the fix for the 2026-06-12 02:00Z incident where the
+	// breaker false-positive-tripped vllm-main's cold-load infinitely
+	// because /is_sleeping connect-refused during the 6-12min cold-load
+	// looked like a 5xx burst. The timestamp comparison naturally
+	// handles the post-restart race (a stale 2xx from the dying engine
+	// landing AFTER trip-fire is excluded because its timestamp is
+	// earlier than lastTripAt).
+	lastHealthyAt map[string]time.Time
+
+	// firstSeenAt records the timestamp of the FIRST response observed
+	// for each container (any status). Bounds the cold-load grace gate:
+	// after ColdLoadGraceMaxSeconds since first-seen, the grace gate
+	// exits even without a prior 2xx — protects against born-broken
+	// containers (bad weights / OOM-at-init / missing config) that
+	// would otherwise silently suppress every trip forever.
+	firstSeenAt map[string]time.Time
 }
 
 // NewCircuitBreaker builds a breaker. Both liveCfg and readyChecker
@@ -97,13 +105,14 @@ func NewCircuitBreaker(liveCfg func() *config.Config, readyChecker func(model st
 		now = time.Now
 	}
 	return &CircuitBreaker{
-		liveCfg:        liveCfg,
-		readyChecker:   readyChecker,
-		now:            now,
-		statuses:       map[string][]int{},
-		lastTripAt:     map[string]time.Time{},
-		recentTrips:    map[string][]time.Time{},
-		hasBeenHealthy: map[string]bool{},
+		liveCfg:       liveCfg,
+		readyChecker:  readyChecker,
+		now:           now,
+		statuses:      map[string][]int{},
+		lastTripAt:    map[string]time.Time{},
+		recentTrips:   map[string][]time.Time{},
+		lastHealthyAt: map[string]time.Time{},
+		firstSeenAt:   map[string]time.Time{},
 	}
 }
 
@@ -142,11 +151,19 @@ func (cb *CircuitBreaker) RecordResponse(model string, status int) {
 	}
 
 	cb.mu.Lock()
+	now := cb.now()
+	// Track first-ever response for this container — bounds the
+	// cold-load grace gate (see ColdLoadGraceMaxSeconds in config).
+	if _, seen := cb.firstSeenAt[container]; !seen {
+		cb.firstSeenAt[container] = now
+	}
 	// Latch the cold-load grace gate: any 2xx proves the container
-	// has serviced traffic in its current incarnation, so subsequent
-	// 5xx burst counts as a real wedge (not a legit cold-load).
+	// has serviced traffic. The gate compares this timestamp against
+	// lastTripAt so a stale 2xx from a dying engine landing AFTER
+	// trip-fire (its wall-clock is earlier than the trip) is
+	// correctly excluded.
 	if status >= 200 && status < 300 {
-		cb.hasBeenHealthy[container] = true
+		cb.lastHealthyAt[container] = now
 	}
 	statuses := append([]int{status}, cb.statuses[model]...)
 	if len(statuses) > cbcfg.Window {
@@ -185,26 +202,33 @@ func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.
 		return
 	}
 
-	// Cold-load grace gate: a container that has not returned a 2xx
-	// in its current incarnation is in a legitimate cold-load —
-	// /is_sleeping connect-refused / network errors during a 6-12min
-	// TP/PP cold-load are expected, not a wedge. Only after the
-	// first 2xx do refusals count as a real wedge.
-	//
-	// The latch clears when we fire docker restart (the restart
-	// starts a fresh cold-load window — see below).
-	cb.mu.Lock()
-	hasBeenHealthy := cb.hasBeenHealthy[container]
-	cb.mu.Unlock()
-	if !hasBeenHealthy {
-		log.Printf("circuit-breaker: cold-load grace container=%s model=%s — suppressing trip (no 2xx observed yet from this incarnation)", container, model)
-		metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "suppressed_cold_load").Inc()
-		return
-	}
-
 	now := cb.now()
 	cooldown := time.Duration(cbcfg.CooldownSeconds) * time.Second
 	crashWindow := time.Duration(cbcfg.CrashLoopWindowSeconds) * time.Second
+	graceMax := time.Duration(cbcfg.ColdLoadGraceMaxSeconds) * time.Second
+
+	// Cold-load grace gate: a trip is allowed ONLY if either
+	//   (a) we have observed a 2xx from this container more recently
+	//       than the most recent trip (proves the engine has actually
+	//       served traffic in its current incarnation), OR
+	//   (b) the grace window has elapsed since we first saw a response
+	//       (born-broken safety valve — bad weights / OOM-at-init /
+	//       missing config would otherwise silently suppress forever).
+	// Both reads happen under the same lock as the lastTripAt read so
+	// the gate is consistent.
+	cb.mu.Lock()
+	lastHealthy := cb.lastHealthyAt[container]
+	firstSeen := cb.firstSeenAt[container]
+	lastTrip := cb.lastTripAt[container]
+	cb.mu.Unlock()
+
+	healthyAfterTrip := !lastHealthy.IsZero() && lastHealthy.After(lastTrip)
+	graceExceeded := graceMax > 0 && !firstSeen.IsZero() && now.Sub(firstSeen) > graceMax
+	if !healthyAfterTrip && !graceExceeded {
+		log.Printf("circuit-breaker: cold-load grace container=%s model=%s — suppressing trip (no 2xx observed in this incarnation, grace window not exceeded)", container, model)
+		metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "suppressed_cold_load").Inc()
+		return
+	}
 
 	cb.mu.Lock()
 	if last, ok := cb.lastTripAt[container]; ok && now.Sub(last) < cooldown {
@@ -259,15 +283,10 @@ func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.
 	}
 	metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "fired").Inc()
 	log.Printf("circuit-breaker: TRIP FIRED container=%s model=%s out=%q", container, model, truncate(out, 200))
-	// Clear the cold-load grace latch — the restart starts a fresh
-	// cold-load (6-12 min for TP/PP models) during which /is_sleeping
-	// will return refused. Without clearing, the same refusal pattern
-	// that fired this trip would fire it again during cold-load,
-	// creating the infinite restart loop the 2026-06-12 02:00Z
-	// incident exposed.
-	cb.mu.Lock()
-	delete(cb.hasBeenHealthy, container)
-	cb.mu.Unlock()
+	// No explicit latch-clear needed — the timestamp comparison in the
+	// grace gate (lastHealthyAt.After(lastTripAt)) naturally requires a
+	// fresh post-restart 2xx before the next trip can fire. This avoids
+	// the stale-2xx-races-the-delete window that an explicit clear had.
 	LogLifecycleTransition(LifecycleEvent{
 		Action: LifecycleCircuitBreakerTrip,
 		Reason: "5xx_consecutive",
@@ -345,6 +364,12 @@ func (s *Scheduler) EnableCircuitBreaker(liveCfg func() *config.Config) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cb = NewCircuitBreaker(liveCfg, s.isModelReady, s.now)
+	// Visibility marker: confirms the cold-load grace gate is the
+	// timestamp-based variant (post 2026-06-12 02:00Z incident fix),
+	// so an operator re-arming the breaker after a deploy can verify
+	// from logs that the new code is live before flipping
+	// behavior.circuit_breaker.enabled: true.
+	log.Printf("circuit-breaker: ENABLED — cold-load grace gate active (timestamp-based latch + grace TTL)")
 }
 
 // RecordResponse implements the ResponseRecorder interface — HTTP

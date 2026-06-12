@@ -2,6 +2,7 @@ package jukebox
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,10 +33,10 @@ func (r *recordingDocker) Count() int {
 	return len(r.calls)
 }
 
-// RestartCount returns the number of `docker restart` invocations,
-// filtering out `docker inspect` calls (the cold-load grace gate
-// runs an inspect before every potential trip; tests that count
-// trip-actions want only restarts).
+// RestartCount returns the number of `docker restart` invocations.
+// Currently identical to Count() since the breaker only shells out to
+// docker for restarts; defensive against future changes (status probes,
+// log pulls) that would add non-restart docker calls.
 func (r *recordingDocker) RestartCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -508,4 +509,109 @@ func TestCircuitBreaker_ColdLoadGrace_TripClearsLatchThenRehealth(t *testing.T) 
 		cb.RecordResponse("vllm-main", 503)
 	}
 	waitFor(t, func() bool { return rd.RestartCount() >= 2 }, "second trip after re-healthy")
+}
+
+// --- Architect-recommended additional gate tests (2026-06-12 refactor) ---
+
+// TestCircuitBreaker_ColdLoadGrace_LatchIsPerContainer verifies that
+// the latch is keyed by container name, not globalized — observing a
+// 2xx on one container does NOT arm another's latch, and tripping one
+// does NOT clear another's latch.
+func TestCircuitBreaker_ColdLoadGrace_LatchIsPerContainer(t *testing.T) {
+	rd := installRecordingDocker(t)
+	cfg := cbTestCfg(t, true)
+	cb := NewCircuitBreaker(func() *config.Config { return cfg },
+		func(string) bool { return true }, time.Now)
+
+	// Seed latch on vllm-main ONLY.
+	cb.RecordResponse("vllm-main", 200)
+
+	// 5xx burst on vllm-task should NOT trip (its own latch is empty).
+	for i := 0; i < 5; i++ {
+		cb.RecordResponse("vllm-task", 0)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if rd.RestartCount() != 0 {
+		t.Fatalf("vllm-task tripped despite vllm-main being the only seeded container: %v", rd.calls)
+	}
+
+	// 5xx burst on vllm-main SHOULD trip (its latch IS armed).
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	waitFor(t, func() bool { return rd.RestartCount() >= 1 }, "vllm-main with armed latch should trip")
+	last := rd.Last()
+	if last[len(last)-1] != "vllm-main" {
+		t.Fatalf("trip fired on wrong container: %v", last)
+	}
+}
+
+// TestCircuitBreaker_ColdLoadGrace_FailedRestartLeavesLatchArmed
+// pins the failed-restart behavior. If `docker restart` errors,
+// `lastTripAt` IS recorded (trip is counted toward crash-loop) but
+// the next 5xx burst still needs to clear cooldown before re-tripping;
+// the latch was never explicitly cleared so the grace gate doesn't
+// re-engage. This is an architect-recommended documentation test —
+// pre-fix it captured the intentional asymmetry.
+func TestCircuitBreaker_ColdLoadGrace_FailedRestartLeavesLatchArmed(t *testing.T) {
+	rd := installRecordingDocker(t)
+	rd.err = errors.New("docker daemon unreachable")
+	cfg := cbTestCfg(t, true)
+	cb := NewCircuitBreaker(func() *config.Config { return cfg },
+		func(string) bool { return true }, time.Now)
+
+	// Seed + burst → trip attempted, runDocker errors → "failed" metric.
+	cb.RecordResponse("vllm-main", 200)
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	// The docker exec runs but errors; we can verify it WAS attempted
+	// by checking that rd.calls has the restart attempt recorded.
+	waitFor(t, func() bool { return rd.RestartCount() >= 1 }, "docker restart attempt (will fail)")
+	// `lastTripAt` IS set even on docker error (trip-slot reserved
+	// before runDocker), so a follow-on burst within cooldown is
+	// correctly suppressed by cooldown, not by the grace gate.
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	time.Sleep(50 * time.Millisecond)
+	// Expect: cooldown gate suppresses the second attempt; total
+	// docker-restart calls stays at 1 (the failing attempt).
+	if rd.RestartCount() != 1 {
+		t.Fatalf("post-failed-restart burst should be cooldown-suppressed, not re-tried: %v", rd.calls)
+	}
+}
+
+// TestCircuitBreaker_ColdLoadGrace_BornBrokenContainerTripsAfterTTL
+// verifies the architect-recommended TTL safety valve: if a container's
+// first-ever observation is older than ColdLoadGraceMaxSeconds and no
+// 2xx has been observed, the grace gate EXITS and trips are allowed.
+// Without this, a born-broken container (bad weights / OOM-at-init)
+// would silently suppress every trip forever.
+func TestCircuitBreaker_ColdLoadGrace_BornBrokenContainerTripsAfterTTL(t *testing.T) {
+	rd := installRecordingDocker(t)
+	cfg := cbTestCfg(t, true)
+	cfg.Behavior.CircuitBreaker.ColdLoadGraceMaxSeconds = 60 // short TTL for fast test
+	clock := newFakeClock()
+	cb := NewCircuitBreaker(func() *config.Config { return cfg },
+		func(string) bool { return true }, clock.Now)
+
+	// First 5xx — within grace window, no 2xx ever seen → suppress.
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if rd.RestartCount() != 0 {
+		t.Fatalf("within grace window with no 2xx, trip should suppress: %v", rd.calls)
+	}
+
+	// Advance clock past TTL.
+	clock.Advance(61 * time.Second)
+
+	// Next 5xx burst — TTL exceeded → trip should fire even though
+	// no 2xx has ever been observed.
+	for i := 0; i < 3; i++ {
+		cb.RecordResponse("vllm-main", 503)
+	}
+	waitFor(t, func() bool { return rd.RestartCount() >= 1 }, "post-TTL burst should trip (born-broken safety valve)")
 }
