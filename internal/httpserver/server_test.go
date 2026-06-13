@@ -69,6 +69,14 @@ func (s *stubCoord) KickColdLoad(name string) bool {
 	return s.coldLoadModels[name]
 }
 
+// IsInColdLoadEviction completes the ColdLoadAware interface. Default
+// false so tests that only set coldLoadModels don't accidentally trigger
+// the in-cold-load-eviction branch (they exercise IsModelColdLoading).
+// Tests that need the eviction branch can subtype + override.
+func (s *stubCoord) IsInColdLoadEviction(name string) bool {
+	return false
+}
+
 func TestHealth_ReadyReturns200AndAcceptingRequests(t *testing.T) {
 	app := httpserver.NewApp(httpserver.Options{
 		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateReady, CurrentModel: "m", PID: 123}},
