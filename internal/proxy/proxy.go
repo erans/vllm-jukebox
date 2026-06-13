@@ -20,6 +20,21 @@ type ForwardOptions struct {
 	RequestID         string
 	AdditionalHeaders map[string]string
 	Timeout           time.Duration
+	// OnComplete, if non-nil, is invoked exactly once with the
+	// upstream HTTP status code after the request finishes (success
+	// or failure). status == 0 means the proxy never reached upstream
+	// (network error / timeout / ctx cancel mid-flight). Used by the
+	// circuit breaker to observe per-model 5xx streams; safe to leave
+	// nil for callers that don't need post-flight notification.
+	OnComplete func(status int)
+}
+
+// fire invokes opts.OnComplete with the given status if set. Safe to
+// call with status=0 to mean "proxy never reached upstream".
+func (opts ForwardOptions) fire(status int) {
+	if opts.OnComplete != nil {
+		opts.OnComplete(status)
+	}
 }
 
 func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
@@ -37,6 +52,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 
 	req, err := http.NewRequestWithContext(requestContext(c), c.Method(), targetURL, body)
 	if err != nil {
+		opts.fire(0)
 		return err
 	}
 
@@ -62,6 +78,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		opts.fire(0)
 		return err
 	}
 
@@ -75,6 +92,12 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	}
 
 	c.Status(resp.StatusCode)
+	// Status is locked in; the upstream call effectively succeeded
+	// from the breaker's POV (a 5xx body counts as a 5xx — the
+	// callback gets the real code). Subsequent body-copy errors are
+	// downstream-client problems (client hung up, etc.), not engine
+	// crashes, so we don't re-fire OnComplete on those.
+	opts.fire(resp.StatusCode)
 
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
