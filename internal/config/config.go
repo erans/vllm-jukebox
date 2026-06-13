@@ -185,6 +185,37 @@ type VLLMConfig struct {
 	LogDir       string `yaml:"log_dir"`
 	LogMaxSizeMB int    `yaml:"log_max_size_mb"`
 	LogMaxFiles  int    `yaml:"log_max_files"`
+
+	// TCPLiveness controls the per-upstream TCP dial probe that demotes
+	// a peer when its listening socket stops accepting connections. The
+	// HTTP /health endpoint cannot catch this case because a wedged
+	// inference loop can leave the socket half-listening while every
+	// request hangs to timeout. Defaults to enabled — opt-out by
+	// setting `enabled: false`.
+	TCPLiveness TCPLivenessConfig `yaml:"tcp_liveness"`
+}
+
+// TCPLivenessConfig configures the TCP-level liveness probe in
+// internal/health. Zero values get sensible defaults applied at load.
+type TCPLivenessConfig struct {
+	// Enabled gates the probe entirely. Defaults to true.
+	Enabled *bool `yaml:"enabled"`
+
+	// Interval between probe attempts.
+	Interval Duration `yaml:"interval"`
+
+	// Timeout per dial attempt.
+	Timeout Duration `yaml:"timeout"`
+
+	// FailThreshold is consecutive failures before demote.
+	FailThreshold int `yaml:"fail_threshold"`
+
+	// RecoverThreshold is consecutive successes required to recover.
+	RecoverThreshold int `yaml:"recover_threshold"`
+
+	// RetryAfterSeconds is the Retry-After header value emitted on the
+	// 503 returned while the upstream is demoted. Defaults to 10.
+	RetryAfterSeconds int `yaml:"retry_after_seconds"`
 }
 
 type SchedulerConfig struct {
@@ -540,6 +571,29 @@ func (c *Config) applyDefaults() {
 	}
 	if c.VLLM.LogMaxFiles == 0 {
 		c.VLLM.LogMaxFiles = 5
+	}
+
+	// TCP liveness: enabled by default, with conservative timing that
+	// catches a wedged upstream within ~15s without flapping on a single
+	// slow GC pause.
+	if c.VLLM.TCPLiveness.Enabled == nil {
+		t := true
+		c.VLLM.TCPLiveness.Enabled = &t
+	}
+	if c.VLLM.TCPLiveness.Interval.Duration == 0 {
+		c.VLLM.TCPLiveness.Interval = Duration{Duration: 5 * time.Second}
+	}
+	if c.VLLM.TCPLiveness.Timeout.Duration == 0 {
+		c.VLLM.TCPLiveness.Timeout = Duration{Duration: 2 * time.Second}
+	}
+	if c.VLLM.TCPLiveness.FailThreshold == 0 {
+		c.VLLM.TCPLiveness.FailThreshold = 3
+	}
+	if c.VLLM.TCPLiveness.RecoverThreshold == 0 {
+		c.VLLM.TCPLiveness.RecoverThreshold = 1
+	}
+	if c.VLLM.TCPLiveness.RetryAfterSeconds == 0 {
+		c.VLLM.TCPLiveness.RetryAfterSeconds = 10
 	}
 
 	if c.Scheduler != nil {
