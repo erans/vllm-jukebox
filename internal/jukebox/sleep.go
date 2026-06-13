@@ -417,7 +417,15 @@ func (s *Scheduler) swapGroupMembersForColdLoad(target, swapGroup string) []stri
 	if s == nil || swapGroup == "" {
 		return out
 	}
-	for name, m := range config.Current().Models {
+	// config.Current() is documented to return nil when SetCurrent has
+	// never been called (early startup, certain test harnesses). Guard
+	// the deref so we degrade to "just target" instead of panicking the
+	// cold-load goroutine. See sleep.go:420 nil-deref report.
+	cur := config.Current()
+	if cur == nil {
+		return out
+	}
+	for name, m := range cur.Models {
 		if name == target {
 			continue
 		}
