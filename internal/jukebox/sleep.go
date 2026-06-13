@@ -2104,6 +2104,73 @@ func (s *Scheduler) RegisterExternalInstances(ctx context.Context) error {
 				if s.admission != nil {
 					s.admission.NotifySleep(p.name, "boot-probe")
 				}
+				// Pinned-restore on boot: a pinned model found asleep at
+				// startup violates the pinned invariant ("never auto-sleep
+				// on idle; always be ready to serve"). The previous
+				// behavior — leave it Sleeping until the first request
+				// arrives — surfaces as a real correctness bug: operators
+				// observe pinned=true + state=sleeping on /status (and
+				// /v1/models reports the model available) while any
+				// arriving request pays a full cold-wake on a path that
+				// is supposed to be hot. Trigger a best-effort background
+				// wake here so the pinned default returns to the canonical
+				// awake state without operator action.
+				//
+				// Non-pinned + sleeping is preserved as-is — for a
+				// swap_group member that wasn't the operator's chosen
+				// awake one, restoring it would clobber the intended
+				// peer. Only pinned models get the boot-restore.
+				//
+				// Goroutine + fresh context: the wake calls into
+				// performWake which may take seconds (admission
+				// arbitration, /wake_up, health-wait); we must not block
+				// the parallel startup probe pool, and the probeCtx (10s
+				// budget, deferred-cancel below) would be cancelled long
+				// before performWake finishes. Mirrors the
+				// SetAutoRestoreWake goroutine pattern at sleep.go ~L132.
+				isPinned := hasCfg && modelCfg.Pinned != nil && *modelCfg.Pinned
+				if isPinned {
+					slog.Info("boot_pinned_restore_dispatched",
+						"model", p.name,
+						"url", p.mgr.BaseURL(),
+					)
+					name := p.name
+					mgr := p.mgr
+					go func() {
+						wakeCtx, wakeCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+						defer wakeCancel()
+						s.mu.RLock()
+						bootInst := s.instances[name]
+						s.mu.RUnlock()
+						if bootInst == nil {
+							slog.Warn("boot_pinned_restore_skipped",
+								"model", name,
+								"reason", "no instance registered",
+							)
+							return
+						}
+						bootCfg, bootOK := liveModelCfg(s.cfg, name)
+						if !bootOK {
+							slog.Warn("boot_pinned_restore_skipped",
+								"model", name,
+								"reason", "no model config",
+							)
+							return
+						}
+						if err := s.performWake(wakeCtx, bootInst, bootCfg, "boot-pinned-restore"); err != nil {
+							slog.Warn("boot_pinned_restore_failed",
+								"model", name,
+								"url", mgr.BaseURL(),
+								"err", err,
+							)
+							return
+						}
+						slog.Info("boot_pinned_restore_succeeded",
+							"model", name,
+							"url", mgr.BaseURL(),
+						)
+					}()
+				}
 				slog.Info("registered external instance (asleep — wake on first request)",
 					"model", p.name,
 					"url", p.mgr.BaseURL(),

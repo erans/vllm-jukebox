@@ -219,3 +219,70 @@ func TestRegisterExternalInstances_UnreachableNonStopStaysSleeping(t *testing.T)
 		t.Fatalf("expected transient-sleep (default evict_action=sleep) NOT to be admissionStopped on unreachable boot probe; got IsStopped=true")
 	}
 }
+
+// TestRegisterExternalInstances_PinnedAsleepAutoRestoresOnBoot validates
+// the boot-pinned-restore fix: a pinned model found asleep at startup
+// (sleepProbeOK=true, sleeping=true) violates the pinned invariant
+// ("never auto-sleep on idle; always be ready to serve"). The previous
+// behavior left it Sleeping until the first request, surfacing as
+// /status reporting pinned=true + state=sleeping while operators expect
+// the pinned default to be hot. The fix dispatches a background wake
+// from the boot-probe sleeping arm when the model is pinned. Non-pinned
+// peers are left Sleeping (operator may have chosen a different swap-
+// group member as the awake one). The test starts a pinned fake in the
+// SLEEPING state, runs the boot probe, then waits for the fake's
+// /wake_up counter to flip from 0 → 1 within a generous timeout. Before
+// the fix this loops forever.
+func TestRegisterExternalInstances_PinnedAsleepAutoRestoresOnBoot(t *testing.T) {
+	pinnedFake := newFakeVLLM("pinned-default")
+	defer pinnedFake.Close()
+	// Seed the fake as ALREADY sleeping at boot — exactly the scenario
+	// the latency-decomp agent observed in production (Qwen3.6-27B
+	// state=sleeping immediately after jukebox container start).
+	pinnedFake.sleeping.Store(true)
+
+	// Non-pinned swap-group peer (also sleeping) — used to assert we
+	// don't regress the explicit "boot-probe is NOT idle, don't auto-
+	// restore peers" comment. This peer must STAY sleeping.
+	peerFake := newFakeVLLM("transient-sleep")
+	defer peerFake.Close()
+	peerFake.sleeping.Store(true)
+
+	cfg := buildSleepEvictConfig(t, peerFake.Host(), peerFake.Port(), pinnedFake.Host(), pinnedFake.Port())
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 24000, FreeMB: 24000}}}
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, nil, nil)
+
+	totalsByGPU := map[int]int{0: 24000}
+	adm := jukebox.NewAdmissionController(cfg, totalsByGPU, &jukebox.SchedulerEvictor{S: s})
+	s.SetAdmission(adm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.RegisterExternalInstances(ctx); err != nil {
+		t.Fatalf("RegisterExternalInstances: %v", err)
+	}
+
+	// The pinned-restore wake is dispatched in a goroutine OUTSIDE the
+	// 10s probe context, so it runs asynchronously after Register
+	// returns. Poll the fake's /wake_up hit counter until it flips,
+	// bounded by a generous timeout so a real regression fails fast
+	// rather than hanging the test pool.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if pinnedFake.wakeHits.Load() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := pinnedFake.wakeHits.Load(); got < 1 {
+		t.Fatalf("pinned-default: expected boot-pinned-restore to call /wake_up at least once within 10s; got wakeHits=%d (regression: pinned model left Sleeping at boot)", got)
+	}
+
+	// Negative: the non-pinned swap-group peer must NOT have been
+	// auto-restored. The comment block at the boot-probe sleeping arm
+	// explicitly says non-pinned + sleeping = operator-chosen, leave it.
+	if got := peerFake.wakeHits.Load(); got != 0 {
+		t.Fatalf("transient-sleep: expected NO boot-restore for non-pinned peer; got wakeHits=%d (regression: clobbered operator-chosen sleeping peer)", got)
+	}
+}
