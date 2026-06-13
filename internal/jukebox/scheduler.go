@@ -328,6 +328,82 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 	}
 
 	now := s.now()
+
+	// 2026-06-10 (B-6-rev): drift-recovery probe.
+	//
+	// External sleep-capable instances can transition Ready -> Sleeping
+	// out-of-band — manual /sleep, container restart, or a wake-then-
+	// sleep cycle that completes between checkIdle ticks while the
+	// scheduler is busy with main's heavy load. There is no periodic
+	// /is_sleeping reconcile loop, so jukebox's bookkeeping can drift.
+	//
+	// If we route to a Ready-by-bookkeeping instance that is actually
+	// sleeping, ForwardFiber POSTs to a sleeping vLLM. /v1/chat/completions
+	// auto-wakes there, but /v1/rerank and /v1/embeddings DO NOT — the
+	// server hangs ~60s, the client retries 3x, observed wall-clock 180s
+	// (Phase B-3 live evidence 2026-06-10: rerank to L1-slept reranker
+	// while main concurrent-busy hung 180s; manual /wake_up succeeded in
+	// 226 ms; manual /v1/rerank to woken reranker succeeded in 57 ms).
+	//
+	// Probe budget:
+	//   - lastUsedAt > 30s stale -> only fire when there's been a
+	//     meaningful gap; fresh hot-path requests skip the probe entirely
+	//     (zero added latency under request bursts).
+	//   - 500ms timeout caps worst-case added latency when the probe
+	//     itself is unreachable (we ignore the error and proceed with
+	//     the Ready route — no worse than today's behaviour).
+	//
+	// On confirmed sleep we flip state to StateSleeping and return
+	// (_, false) so the caller (AcquireRoute) falls through to
+	// tryRouteFromSleep, which performs the wake.
+	// Round-2 instrumentation: log probe entry/exit so the handler-side
+	// trace can confirm the path actually fires under repro conditions.
+	staleness := now.Sub(inst.lastUsedAt)
+	sc, scOk := inst.mgr.(SleepCapable)
+	if scOk && staleness > 30*time.Second {
+		slog.Info("drift_probe_entry",
+			"model", resolvedModelName,
+			"staleness_ms", staleness.Milliseconds(),
+		)
+		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		sleeping, perr := sc.IsSleeping(probeCtx)
+		cancel()
+		if perr != nil {
+			slog.Info("drift_probe_error",
+				"model", resolvedModelName,
+				"err", perr.Error(),
+			)
+		} else {
+			slog.Info("drift_probe_result",
+				"model", resolvedModelName,
+				"sleeping", sleeping,
+			)
+		}
+		if perr == nil && sleeping {
+			s.mu.Lock()
+			// Re-check under lock to avoid racing with a concurrent
+			// state transition (NotifyStarted, NotifySleep, etc).
+			if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady {
+				inst.state = StateSleeping
+				slog.Info("drift_probe_flipped_to_sleeping",
+					"model", resolvedModelName,
+				)
+			}
+			s.mu.Unlock()
+			return Route{}, false
+		}
+		// Probe error or sleeping==false -> proceed with Ready route.
+	} else if scOk {
+		// Not stale enough — skip probe, go directly to Ready route.
+	} else {
+		// Manager doesn't implement SleepCapable — log once-per-instance
+		// would be ideal but a per-request log is fine because this is
+		// the unexpected path (every external/sleep-mode manager should
+		// satisfy SleepCapable).
+		slog.Debug("drift_probe_skipped_not_sleepcapable",
+			"model", resolvedModelName,
+		)
+	}
 	s.mu.Lock()
 	// Re-check under lock.
 	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
