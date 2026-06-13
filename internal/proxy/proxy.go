@@ -102,13 +102,58 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 		}
 	}
 
-	c.Status(resp.StatusCode)
-	// Status is locked in; the upstream call effectively succeeded
-	// from the breaker's POV (a 5xx body counts as a 5xx — the
-	// callback gets the real code). Subsequent body-copy errors are
+	// Rewrite upstream 429 (Too Many Requests) to 503 (Service Unavailable)
+	// with a short Retry-After. Rationale:
+	//
+	//   * 429 is semantically "the CLIENT exceeded a rate limit" — it
+	//     tells well-behaved SDKs to back off aggressively (often with
+	//     long exponential delays) or to surface the error to the
+	//     application as terminal. vLLM emits 429 when its in-engine
+	//     admission queue is saturated, which during engine warm-up
+	//     happens at request volumes the steady-state engine handles
+	//     fine. From the consumer's POV the right semantic is "service
+	//     is briefly busy, retry shortly" — that's 503 + Retry-After.
+	//
+	//   * Observed under chaos-style burst load (concurrency=32 against
+	//     a freshly-woken embedding backend): ~half of requests hit 429
+	//     during the wake window, yet the same load admits cleanly once
+	//     the engine is warm. Returning 429 caused SDKs to give up
+	//     instead of riding through; rewriting to 503 + Retry-After:5
+	//     keeps the request in the SDK's retry budget.
+	//
+	// The rewrite is unconditional — we don't gate on wake state because
+	// (a) the proxy package intentionally has no jukebox-state coupling,
+	// and (b) a 429 from a warm vLLM is also better surfaced as 503 to
+	// the caller (jukebox is the gateway; client-side rate-limiting is
+	// not the gateway's concern). The Retry-After header tells clients
+	// the engine should be ready momentarily.
+	//
+	// We strip any upstream-supplied Retry-After before setting ours,
+	// since vLLM does not currently emit one for 429s and a stale value
+	// (if upstream ever adds one) would defeat the purpose.
+	//
+	// Breaker integration: opts.fire() receives the UPSTREAM status code
+	// (the un-rewritten one) so the breaker sees what the engine
+	// actually returned. The client-facing status is what we Set on the
+	// fiber context. Status is locked in; the upstream call effectively
+	// succeeded from the breaker's POV (a 5xx body counts as a 5xx —
+	// the callback gets the real code). Subsequent body-copy errors are
 	// downstream-client problems (client hung up, etc.), not engine
 	// crashes, so we don't re-fire OnComplete on those.
-	opts.fire(resp.StatusCode)
+	upstreamStatus := resp.StatusCode
+	if upstreamStatus == http.StatusTooManyRequests {
+		model := opts.RequestedModel
+		if model == "" {
+			model = "unknown"
+		}
+		metrics.Upstream429RewrittenTotal.WithLabelValues(model).Inc()
+		c.Response().Header.Del("Retry-After")
+		c.Set("Retry-After", upstream429RetryAfterSeconds)
+		c.Status(http.StatusServiceUnavailable)
+	} else {
+		c.Status(upstreamStatus)
+	}
+	opts.fire(upstreamStatus)
 
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
