@@ -252,6 +252,8 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 			msg = "Resource state inconsistent; operator intervention required (see audit log)"
 		case jukebox.RejectMinUptime:
 			msg = "Insufficient GPU resources (min uptime), please retry"
+		case jukebox.RejectUpstreamUnreachable:
+			msg = "Upstream model server is unreachable (TCP probe failing); please retry"
 		}
 		return writeOpenAIError(c, http.StatusServiceUnavailable, msg, "service_unavailable", "model_switching")
 	}

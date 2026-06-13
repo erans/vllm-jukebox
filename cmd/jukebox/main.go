@@ -177,7 +177,9 @@ func main() {
 		coord := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, time.Now, powerMgr)
 		go coord.Run(ctx)
 		go coord.IdleMonitor(ctx)
-		router = jukebox.NewLegacyRouter(cfg, coord, &tr)
+		legacyRouter := jukebox.NewLegacyRouter(cfg, coord, &tr)
+		legacyRouter.StartLiveness(ctx)
+		router = legacyRouter
 
 		stopOnce := sync.Once{}
 		stop = func() {
