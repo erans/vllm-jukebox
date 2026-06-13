@@ -320,6 +320,24 @@ func main() {
 		}
 		go sched.IdleMonitor(ctx)
 
+		// Predictive cold-load (intarweb-internal carry; SKELETON commit —
+		// the predictor observes traffic and emits metrics but does NOT
+		// fire KickColdLoad yet). Started unconditionally so the metrics
+		// surface for ALL configured models even when none have it
+		// enabled — that lets us see baseline traffic shape before any
+		// operator flips the flag. The per-model gate inside the
+		// predictor checks `predictive_cold_load.enabled` per tick.
+		predictor := jukebox.NewPredictor(cfg, sched.IsModelColdLoading, jukebox.PredictorOptions{
+			// StatePath/TODO: wire to behavior.predictor_state_path once
+			// we add that to the config schema. For now: in-memory only.
+			// On restart the predictor starts cold and re-learns over
+			// ~1 day of observations.
+		})
+		if err := predictor.Load(); err != nil {
+			slog.Warn("predictor_load_failed", "err", err)
+		}
+		go predictor.Run(ctx)
+
 		// Subscribe the scheduler to active.yaml hot-reloads so its
 		// admission controller picks up per-model field edits without
 		// requiring a process restart.
