@@ -31,6 +31,10 @@ func BuildServeArgsForPort(cfg *config.Config, requestedModel string, port int) 
 		"--port", strconv.Itoa(port),
 	}
 
+	if model.Runner == config.RunnerPooling {
+		args = append(args, "--task", "embed")
+	}
+
 	if model.TensorParallelSize != nil {
 		args = append(args, "--tensor-parallel-size", strconv.Itoa(*model.TensorParallelSize))
 	}
@@ -64,6 +68,10 @@ func BuildServeArgsForPort(cfg *config.Config, requestedModel string, port int) 
 
 	if model.Quantization != "" {
 		args = append(args, "--quantization", model.Quantization)
+	}
+
+	if model.SleepMode {
+		args = append(args, "--enable-sleep-mode")
 	}
 
 	args = append(args, model.ExtraArgs...)

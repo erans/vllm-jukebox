@@ -28,6 +28,11 @@ type stubCoord struct {
 
 	baseURL       string
 	upstreamModel string
+
+	// Async-503 / cold-load knobs (Router contract).
+	coldLoadModels  map[string]bool // models reported as admissionStopped
+	kickCalls       int
+	lastKickedModel string
 }
 
 func (s stubCoord) Status() jukebox.Status { return s.st }
@@ -48,6 +53,20 @@ func (s *stubCoord) AcquireRoute(ctx context.Context, requestedModel, requestID 
 		UpstreamModel: s.upstreamModel,
 		Done:          func() {},
 	}, nil
+}
+
+// stubCoord intentionally implements both Router AND ColdLoadAware so
+// proxy-handler tests can exercise the async-503 cold-load path. For
+// the negative test (Router that does NOT implement ColdLoadAware) see
+// minimalRouter in handlers_proxy_test.go.
+func (s *stubCoord) IsModelColdLoading(name string) bool {
+	return s.coldLoadModels[name]
+}
+
+func (s *stubCoord) KickColdLoad(name string) bool {
+	s.kickCalls++
+	s.lastKickedModel = name
+	return s.coldLoadModels[name]
 }
 
 func TestHealth_ReadyReturns200AndAcceptingRequests(t *testing.T) {
