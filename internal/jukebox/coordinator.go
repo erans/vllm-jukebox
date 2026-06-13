@@ -21,7 +21,14 @@ const (
 	StateStarting State = "starting"
 	StateReady    State = "ready"
 	StateStopping State = "stopping"
-	StateError    State = "error"
+	StateSleeping State = "sleeping"
+	// StateStopped — container is `docker compose stop`'d (used by
+	// stop-on-evict for evict_action: stop members). Distinct from
+	// StateSleeping in that the container's process tree is gone and
+	// /wake_up does NOT apply — restart goes through `docker compose
+	// up` + health-wait via the redeploy-member CLI verb.
+	StateStopped State = "stopped"
+	StateError   State = "error"
 )
 
 type RejectReason string
@@ -35,6 +42,20 @@ const (
 	RejectNoCapacity     RejectReason = "no_capacity"
 	RejectInsufficient   RejectReason = "insufficient_resources"
 	RejectMinUptime      RejectReason = "min_uptime"
+	// RejectColdLoading — the requested model is currently admissionStopped
+	// (its container is `docker compose stop`'d) and a cold-load has been
+	// kicked off in the background. The client should retry after the
+	// RetryAfter duration. Distinct from RejectSwapInProgress because
+	// the wall-clock is much longer (~5 min for moe/longctx) and the
+	// proxy-layer async-503 path uses this reason to plumb the right
+	// human-readable message + Retry-After through to the consumer.
+	RejectColdLoading RejectReason = "cold_loading"
+	// RejectAdminIntervention — admission's books may have drifted from
+	// physical container state (cleanup `docker stop` failed mid-cold-load
+	// or peer-stop failed mid-redeploy). Auto-retry could stomp on a
+	// recovering process; operator must reconcile manually. Maps to 503
+	// with NO Retry-After so SDKs surface the error rather than retry-loop.
+	RejectAdminIntervention RejectReason = "admin_intervention"
 )
 
 type RejectError struct {
@@ -266,7 +287,7 @@ func (c *Coordinator) Status() Status {
 }
 
 func (c *Coordinator) handleEnsure(req ensureReq) {
-	resolvedName, _, err := c.cfg.ResolveModel(req.requestedModel)
+	resolvedName, _, err := liveResolveModel(c.cfg, req.requestedModel)
 	if err != nil {
 		req.resp <- ensureReply{err: err}
 		return
@@ -288,6 +309,21 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 			req.resp <- ensureReply{}
 			return
 		}
+	}
+
+	// Sleep-mode wake path: if we're currently sleeping the requested
+	// model, wake it (re-uses CPU-RAM weights, no full restart).
+	if state == StateSleeping && current == resolvedName {
+		c.mu.Lock()
+		c.swapInProgress = true
+		c.state = StateStarting
+		c.mu.Unlock()
+		metrics.SetState(string(StateStarting))
+
+		done := make(chan error, 1)
+		go c.performWake(context.Background(), req.requestID, done)
+		req.resp <- ensureReply{wait: done}
+		return
 	}
 
 	isCrashed := state == StateReady && current == resolvedName && c.mgr != nil && c.mgr.CurrentPID() == 0
@@ -421,7 +457,7 @@ func (c *Coordinator) performSwap(fromModel, model, requestID string, done chan<
 }
 
 func (c *Coordinator) doSwap(model, requestID string) error {
-	_, modelCfg, err := c.cfg.ResolveModel(model)
+	_, modelCfg, err := liveResolveModel(c.cfg, model)
 	if err != nil {
 		return err
 	}

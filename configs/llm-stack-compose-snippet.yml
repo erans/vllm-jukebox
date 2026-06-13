@@ -1,0 +1,61 @@
+# Reference: jukebox docker-compose service block for a multi-vLLM
+# deployment with one pinned model + several burstable co-tenants. Drop
+# this into your existing docker-compose.yml alongside the vllm-* services.
+#
+# Prereqs:
+#   - vllm-main, vllm-embeddings, vllm-reranker, vllm-ocr already exist
+#     in the same compose file and on the `vllm_default` network.
+#   - Each of those services launches vLLM with both `--enable-sleep-mode`
+#     and the `VLLM_SERVER_DEV_MODE=1` environment variable (so /sleep,
+#     /wake_up, /is_sleeping are exposed).
+#   - A `configs/llm-stack-external.yaml` (see this directory) is mounted
+#     into the jukebox container.
+#
+# After deploying, point your OpenAI-compatible client at
+# http://jukebox:9000 — the single entry point for every managed model.
+
+services:
+  jukebox:
+    container_name: jukebox
+    # Build from source (no upstream image is published):
+    #   docker build -t your-registry/vllm-jukebox:latest .
+    image: your-registry/vllm-jukebox:latest
+    depends_on:
+      vllm-main:
+        condition: service_healthy
+      # vllm-embeddings/reranker/ocr don't need to be Up at boot —
+      # jukebox registers them as external and a startup health probe
+      # logs a warning if they're not reachable, but doesn't fail.
+    environment:
+      # Optional: tune slog formatting via stdlib defaults.
+      - GOMAXPROCS=4
+    volumes:
+      - ./configs/llm-stack-external.yaml:/etc/jukebox/configs/active.yaml:ro
+    command:
+      - "-config"
+      - "/etc/jukebox/configs/active.yaml"
+    ports:
+      # Exposed on the host so an off-host client can reach it. If the
+      # client lives on this same host, prefer the `vllm_default` network
+      # — drop this `ports:` block and reference `jukebox:9000` directly
+      # from the client's compose.
+      - "9000:9000"
+    networks:
+      - vllm_default
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/health | grep -q '\"status\":\"healthy\"' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: ${RESTART_POLICY:-unless-stopped}
+
+# Note: this snippet assumes the compose file already declares the
+# `vllm_default` network. If yours uses a different name, update both
+# the `networks:` block above and the `host:` fields in the jukebox
+# config YAML to match.
