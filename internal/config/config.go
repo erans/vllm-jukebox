@@ -72,6 +72,23 @@ const (
 	// that something else is broken (disk thrash, NCCL hang, etc.) and
 	// should fail loud rather than wait silently.
 	MaxColdLoadTimeout = 30 * time.Minute
+	// DefaultCumemDrainTimeout is the cumem PP-broadcast drain barrier
+	// before /sleep — defense against vllm-project/vllm#45520, which
+	// observes that calling /sleep with in-flight decode corrupts the
+	// cumem allocator state via cudaErrorIllegalAddress. We refuse to
+	// /sleep while requests are still mid-flight, waiting up to this
+	// budget for them to drain. 5s comfortably covers in-flight
+	// generations from interactive callers (typical p99 ~1-3s) without
+	// stalling idle-evict for streaming workloads.
+	DefaultCumemDrainTimeout = 5 * time.Second
+	// DefaultWakeSettleSeconds is the post-wake settle barrier — defense
+	// against vllm-project/vllm#45519, which observes that /wake_up
+	// returns 200 before all PP workers have actually settled. A /sleep
+	// that lands in that gap re-enters cumem mid-settle and wedges the
+	// engine. 2s is short enough that legitimate idle-evicts of a
+	// just-woken model still trigger normally, long enough that the
+	// PP-broadcast settle has provably completed on observed hardware.
+	DefaultWakeSettleSeconds = 2 * time.Second
 )
 
 // Priority controls how the admission controller picks eviction victims.
@@ -424,6 +441,24 @@ type ModelConfig struct {
 	// the historical 5-min default SIGKILLed it mid-capture. Validator
 	// requires 30s..30m when set.
 	ColdLoadTimeoutSeconds int `yaml:"cold_load_timeout_seconds,omitempty"`
+	// CumemDrainTimeoutSeconds is the budget for the in-flight drain
+	// barrier executed before /sleep. When the in-flight tracker is
+	// non-empty, sleepInstance waits up to this duration for requests
+	// to drain; if any remain, /sleep is rejected with
+	// ErrSleepRejectedInflight. Defends against vllm-project/vllm#45520
+	// (calling /sleep with in-flight decode corrupts cumem state).
+	// 0 = use DefaultCumemDrainTimeout (5s). Validator floor: >= 0;
+	// values > 30s emit a warning (very large drain budgets stall
+	// admission-driven evicts on streaming workloads).
+	CumemDrainTimeoutSeconds int `yaml:"cumem_drain_timeout_seconds,omitempty"`
+	// WakeSettleSeconds is the post-wake settle barrier window. After
+	// a successful /wake_up, /sleep on the same model is refused for
+	// this duration. Defends against vllm-project/vllm#45519 (/wake_up
+	// returns 200 before PP workers settle; a /sleep in that gap wedges
+	// the engine). 0 = use DefaultWakeSettleSeconds (2s). Per-model
+	// because vision pipelines need a longer settle than text-only
+	// (more PP ranks + image-prefill cumem touch).
+	WakeSettleSeconds int `yaml:"wake_settle_seconds,omitempty"`
 	// IdleTimeout: if > 0 and SleepMode is true and the model is not pinned,
 	// jukebox auto-sleeps the instance after this much idle time. 0 = never
 	// auto-suspend.
@@ -891,6 +926,28 @@ func (c *Config) validateRuntimes() error {
 			}
 		}
 
+		// cumem_drain_timeout_seconds + wake_settle_seconds: defenses
+		// against vllm#45520 / #45519 respectively. Both default-on via
+		// Effective accessors when unset; the validator rejects only
+		// negative values (obvious config bugs) and warns on suspiciously
+		// large drain budgets. No upper bound is fatal — operator may
+		// have measured a workload that legitimately needs a long drain.
+		if model.CumemDrainTimeoutSeconds < 0 {
+			return fmt.Errorf("model %q: cumem_drain_timeout_seconds must be >= 0 (0 = use default %s); got %d",
+				name, DefaultCumemDrainTimeout, model.CumemDrainTimeoutSeconds)
+		}
+		if model.CumemDrainTimeoutSeconds > 30 {
+			slog.Warn("config_cumem_drain_timeout_unusually_large",
+				"model", name,
+				"value_seconds", model.CumemDrainTimeoutSeconds,
+				"note", "values >30s may stall admission-driven evicts on streaming workloads; verify intentional",
+			)
+		}
+		if model.WakeSettleSeconds < 0 {
+			return fmt.Errorf("model %q: wake_settle_seconds must be >= 0 (0 = use default %s); got %d",
+				name, DefaultWakeSettleSeconds, model.WakeSettleSeconds)
+		}
+
 		// LifecycleExternal constraints
 		if model.Lifecycle == LifecycleExternal {
 			if model.Alias != "" {
@@ -1199,6 +1256,36 @@ func (m ModelConfig) EffectiveColdLoadTimeout() time.Duration {
 		return DefaultColdLoadTimeout
 	}
 	return time.Duration(m.ColdLoadTimeoutSeconds) * time.Second
+}
+
+// EffectiveCumemDrainTimeout returns the configured
+// CumemDrainTimeoutSeconds as a Duration when explicitly set (>0), or
+// 0 when unset/disabled. A return of 0 disables the cumem-drain guard
+// for this model entirely — the existing best-effort
+// VLLM.DrainTimeout poll still runs, but no /sleep call is refused on
+// drain-timeout grounds. Operators opt INTO the guard by setting the
+// per-model knob (DefaultCumemDrainTimeout = 5s is the recommended
+// starting value); the package default is no-op so existing configs
+// keep their pre-guard behavior. Defends vllm-project/vllm#45520.
+func (m ModelConfig) EffectiveCumemDrainTimeout() time.Duration {
+	if m.CumemDrainTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(m.CumemDrainTimeoutSeconds) * time.Second
+}
+
+// EffectiveWakeSettle returns the configured WakeSettleSeconds as a
+// Duration when explicitly set (>0), or 0 when unset/disabled. A
+// return of 0 disables the post-wake settle barrier for this model
+// entirely. Operators opt INTO the guard by setting the per-model
+// knob (DefaultWakeSettleSeconds = 2s is the recommended starting
+// value); the package default is no-op so existing configs keep their
+// pre-guard behavior. Defends vllm-project/vllm#45519.
+func (m ModelConfig) EffectiveWakeSettle() time.Duration {
+	if m.WakeSettleSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(m.WakeSettleSeconds) * time.Second
 }
 
 // EffectivePriority returns the configured Priority, defaulting to

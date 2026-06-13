@@ -1132,6 +1132,28 @@ var ErrColdLoadContainerExited = errors.New("cold-load container exited")
 // the 30s cooldown to expire.
 var ErrColdLoadPinnedWakeFailed = errors.New("cold-load pinned-peer wake failed; admission inconsistent")
 
+// ErrSleepRejectedInflight is returned by sleepInstance when the
+// pre-/sleep drain barrier could not bring inst.inflight to zero
+// within the configured cumem_drain_timeout_seconds. Defense against
+// vllm-project/vllm#45520 — calling /sleep with an in-flight decode
+// corrupts the cumem allocator state via cudaErrorIllegalAddress and
+// wedges the engine. Callers (admission evictor, idle suspender,
+// redeploy-member peer-stop) should treat this as a transient refusal
+// and retry on the next admission cycle / idle tick rather than
+// escalate to docker stop — the in-flight requests will complete on
+// their own and the next /sleep attempt will succeed.
+var ErrSleepRejectedInflight = errors.New("sleep rejected: in-flight requests would race cumem PP-broadcast")
+
+// ErrSleepSkippedWakeSettle is returned by sleepInstance when /sleep
+// is requested inside the post-wake settle window. Defense against
+// vllm-project/vllm#45519 — /wake_up returns 200 before all PP
+// workers have settled; a /sleep that lands in that gap re-enters
+// cumem mid-settle and wedges the engine. The settle window is
+// per-model (wake_settle_seconds; default 2s). Callers should treat
+// this as a transient refusal — the next sleep attempt after the
+// settle expires will succeed.
+var ErrSleepSkippedWakeSettle = errors.New("sleep skipped: still inside post-wake settle window")
+
 // containerState is the subset of `docker inspect` fields jukebox cares
 // about for the cold-load fast-fail probe. JSON unmarshaling drops
 // every other field. Stored as a struct (not just a string) so future
@@ -1300,6 +1322,41 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 		return fmt.Errorf("instance %q: manager does not support sleep", inst.model)
 	}
 
+	// Read the live model config once — both guards (B: wake-settle,
+	// A: cumem-drain) consume per-model knobs from it. liveModelCfg
+	// may legitimately return ok=false for instances registered
+	// outside the active.yaml model set (RegisterExternalInstances,
+	// ComfyUI, redeploy-time pre-config-reload races); in that case
+	// we fall back to the package defaults (5s drain / 2s settle).
+	modelCfg, _ := liveModelCfg(s.cfg, inst.model)
+
+	// Guard B (post-wake settle barrier — defends vllm#45519). If a
+	// successful /wake_up completed within the wake-settle window,
+	// refuse /sleep. /wake_up returns 200 before all PP workers have
+	// finished their cumem settle; a /sleep in that gap re-enters
+	// cumem mid-broadcast and wedges the engine. The schedInstance
+	// state is NOT mutated on this path, so there's nothing to roll
+	// back. Per-model knob: wake_settle_seconds (default 2s).
+	settle := modelCfg.EffectiveWakeSettle()
+	s.mu.RLock()
+	lastWake := inst.lastWakeAt
+	s.mu.RUnlock()
+	if !lastWake.IsZero() && settle > 0 {
+		elapsed := s.now().Sub(lastWake)
+		if elapsed < settle {
+			metrics.SleepSkippedCooldownTotal.WithLabelValues(inst.model, "wake_settle").Inc()
+			slog.Warn("sleep_skipped_wake_settle_cumem_safety",
+				"model", inst.model,
+				"elapsed_ms", elapsed.Milliseconds(),
+				"settle_ms", settle.Milliseconds(),
+				"trigger_reason", reason,
+				"upstream_ref", "vllm#45519",
+			)
+			return fmt.Errorf("%w: model %q woken %s ago, settle window is %s",
+				ErrSleepSkippedWakeSettle, inst.model, elapsed, settle)
+		}
+	}
+
 	start := s.now()
 
 	s.mu.Lock()
@@ -1307,6 +1364,44 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 	prevState := inst.state
 	inst.state = StateStopping
 	s.mu.Unlock()
+
+	// Guard A (drain barrier — defends vllm#45520). Strict drain wait
+	// before the existing best-effort drain. Calling /sleep while
+	// requests are mid-decode corrupts the cumem allocator state via
+	// cudaErrorIllegalAddress and wedges the engine; the upstream bug
+	// has no client-side fix. We refuse to call sc.Sleep() while the
+	// in-flight count is non-zero. The per-model
+	// cumem_drain_timeout_seconds (default 5s) bounds the wait — if
+	// the count is still non-zero after that, restore prevState and
+	// surface ErrSleepRejectedInflight to the caller. This deliberately
+	// runs BEFORE the existing s.cfg.VLLM.DrainTimeout best-effort
+	// drain (which polls without rejecting); the strict guard catches
+	// the cumem-unsafe case quickly, the best-effort drain remains as
+	// a politeness budget for the no-rejection case where we have a
+	// few in-flight requests we can wait out.
+	cumemDrainTimeout := modelCfg.EffectiveCumemDrainTimeout()
+	if !inst.inflightIsDrained() && cumemDrainTimeout > 0 {
+		drainCtxA, cancelA := context.WithTimeout(context.Background(), cumemDrainTimeout)
+		drainErr := inst.inflight.WaitForDrain(drainCtxA)
+		remaining := inst.inflight.Count()
+		cancelA()
+		if drainErr != nil || remaining > 0 {
+			metrics.SleepRejectedInflightTotal.WithLabelValues(inst.model, reason).Inc()
+			slog.Warn("sleep_rejected_inflight_cumem_safety",
+				"model", inst.model,
+				"in_flight", remaining,
+				"timeout_ms", cumemDrainTimeout.Milliseconds(),
+				"trigger_reason", reason,
+				"upstream_ref", "vllm#45520",
+			)
+			s.mu.Lock()
+			inst.state = prevState
+			inst.draining = false
+			s.mu.Unlock()
+			return fmt.Errorf("%w: model %q has %d in-flight requests after %s drain wait",
+				ErrSleepRejectedInflight, inst.model, remaining, cumemDrainTimeout)
+		}
+	}
 
 	// Drain in-flight requests so /sleep doesn't race with active
 	// generation. vLLM's PR #16536 lands graceful error handling for
@@ -1679,6 +1774,7 @@ func (s *Scheduler) performWakeFromInsideColdLoadLock(ctx context.Context, inst 
 	s.mu.Lock()
 	inst.state = StateReady
 	inst.lastUsedAt = s.now()
+	inst.lastWakeAt = s.now()
 	s.mu.Unlock()
 
 	dur := s.now().Sub(start)

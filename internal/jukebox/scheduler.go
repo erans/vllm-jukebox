@@ -156,6 +156,13 @@ type schedInstance struct {
 	draining   bool
 	startedAt  time.Time
 	lastUsedAt time.Time
+	// lastWakeAt records the wall-clock time of the most recent
+	// successful /wake_up + /health-ready transition. Consumed by the
+	// post-wake settle barrier in sleepInstance — defense against
+	// vllm-project/vllm#45519 (/wake_up returns 200 before PP workers
+	// settle; a /sleep landing inside the settle window wedges the
+	// engine). Zero value means "never woken" — the gate is a no-op.
+	lastWakeAt time.Time
 
 	state    State
 	mgr      InstanceManager

@@ -192,6 +192,33 @@ var (
 		[]string{"model", "kind"},
 	)
 
+	// Counter: /sleep rejected because in-flight requests would race
+	// the cumem PP-broadcast (vllm-project/vllm#45520). Bumped by the
+	// drain-barrier guard in sleepInstance when WaitForDrain on the
+	// configured cumem_drain_timeout_seconds did not bring the in-flight
+	// count to zero. Distinct from SleepFailuresTotal — that tracks
+	// downstream API failures; this tracks our own pre-flight refusal
+	// that prevented a known-unsafe call.
+	SleepRejectedInflightTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_sleep_rejected_inflight_total",
+			Help: "Total /sleep operations rejected because in-flight requests didn't drain in cumem_drain_timeout_seconds (defends vllm#45520).",
+		},
+		[]string{"model", "trigger_reason"},
+	)
+
+	// Counter: /sleep skipped because of a per-model cooldown gate.
+	// Today's sole reason label is "wake_settle" — the post-wake settle
+	// barrier (defends vllm#45519). Reasons are extensible (additional
+	// cooldown variants will reuse this counter).
+	SleepSkippedCooldownTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_sleep_skipped_cooldown_total",
+			Help: "Total /sleep operations skipped by a cooldown gate (e.g. wake_settle defends vllm#45519).",
+		},
+		[]string{"model", "reason"},
+	)
+
 	// Counter: admission-initiated evictions (scheduler mode + sleep mode)
 	AdmissionEvictsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -469,6 +496,8 @@ func init() {
 		SleepDurationSeconds,
 		WakeDurationSeconds,
 		SleepFailuresTotal,
+		SleepRejectedInflightTotal,
+		SleepSkippedCooldownTotal,
 		AdmissionEvictsTotal,
 		AdmissionRejectionsTotal,
 		AdmissionVRAMDriftRiskTotal,
