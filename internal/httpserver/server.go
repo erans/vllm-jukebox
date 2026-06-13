@@ -54,6 +54,12 @@ func NewApp(opts Options) *fiber.App {
 	// Anthropic endpoints
 	app.Post("/v1/messages", anthropicProxyHandler(opts))
 
+	// Image-gen: OpenAI shape, translated into a ComfyUI workflow.
+	// Lifecycle (wake-on-request, sleep coordination) is driven through
+	// the existing Router.AcquireRoute path on the ComfyUI peer
+	// (lifecycle: comfyui). Subsumes the old comfy-openai-shim sidecar.
+	app.Post("/v1/images/generations", imagesGenerationsHandler(opts))
+
 	// Explicit unsupported endpoints.
 	app.All("/v1/audio/*", notImplementedHandler())
 	app.All("/v1/images/*", notImplementedHandler())
