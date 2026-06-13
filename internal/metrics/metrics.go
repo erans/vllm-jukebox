@@ -424,6 +424,28 @@ var (
 		},
 		[]string{"model"},
 	)
+
+	// Gauge: TCP-liveness verdict for an upstream (1 = alive, 0 = dead).
+	// Labelled by the resolved target host:port so multiple upstreams
+	// (e.g. scheduler-mode instances) can be tracked independently.
+	UpstreamTCPAlive = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_upstream_tcp_alive",
+			Help: "Upstream TCP-dial liveness (1 = alive, 0 = consecutive failures past threshold).",
+		},
+		[]string{"target"},
+	)
+
+	// Counter: TCP-liveness state transitions, labelled by direction.
+	// `direction="down"` is incremented each time the probe demotes an
+	// upstream; `direction="up"` each time it recovers.
+	UpstreamTCPTransitionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_upstream_tcp_transitions_total",
+			Help: "Upstream TCP-liveness state transitions (alive → dead and back).",
+		},
+		[]string{"target", "direction"},
+	)
 )
 
 func init() {
@@ -466,6 +488,8 @@ func init() {
 		PredictedProbability,
 		PredictiveWarmToFirstRequestSeconds,
 		Upstream429RewrittenTotal,
+		UpstreamTCPAlive,
+		UpstreamTCPTransitionsTotal,
 	)
 }
 
