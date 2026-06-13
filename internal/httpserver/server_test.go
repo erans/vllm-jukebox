@@ -30,9 +30,10 @@ type stubCoord struct {
 	upstreamModel string
 
 	// Async-503 / cold-load knobs (Router contract).
-	coldLoadModels  map[string]bool // models reported as admissionStopped
-	kickCalls       int
-	lastKickedModel string
+	coldLoadModels      map[string]bool // models reported as admissionStopped
+	coldLoadEvictModels map[string]bool // models reported as in-flight peer cold-load eviction
+	kickCalls           int
+	lastKickedModel     string
 }
 
 func (s stubCoord) Status() jukebox.Status { return s.st }
@@ -67,6 +68,13 @@ func (s *stubCoord) KickColdLoad(name string) bool {
 	s.kickCalls++
 	s.lastKickedModel = name
 	return s.coldLoadModels[name]
+}
+
+// IsInColdLoadEviction reports whether `name` is being slept/stopped as
+// part of an in-flight peer cold-load. Required by the ColdLoadAware
+// interface (companion gate to IsModelColdLoading).
+func (s *stubCoord) IsInColdLoadEviction(name string) bool {
+	return s.coldLoadEvictModels[name]
 }
 
 func TestHealth_ReadyReturns200AndAcceptingRequests(t *testing.T) {
