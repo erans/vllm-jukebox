@@ -123,6 +123,53 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// Counter: predictive cold-load pre-warms attempted by the histogram
+	// predictor. `outcome` is one of:
+	//   - "fired"   — predictor crossed threshold AND budgets allowed; in
+	//                 the skeleton this is the only path that increments
+	//                 (the actual scheduler hook is still a TODO).
+	//   - "hit"     — a real request landed within the forecast window
+	//                 after a "fired" tick (post-hoc validation).
+	//   - "miss"    — forecast window elapsed with no real request (the
+	//                 predictor was wrong; the model stayed Stopped).
+	//   - "skipped_cooldown"      — gate fired but the per-model cooldown
+	//                               window was still active.
+	//   - "skipped_budget"        — gate fired but max_per_day was hit.
+	//   - "skipped_not_stopped"   — gate fired but model was not Stopped.
+	//   - "skipped_disabled"      — predictor disabled for this model.
+	PredictiveWarmsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_predictive_warms_total",
+			Help: "Predictive cold-load pre-warm decisions made by the histogram predictor.",
+		},
+		[]string{"model", "outcome"},
+	)
+
+	// Gauge: most-recently-computed P(request in next window | hour, dow)
+	// for each predictively-tracked model. Sampled per predictor tick.
+	PredictedProbability = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "jukebox_predicted_probability",
+			Help: "Most recent P(request in next window) computed by the predictor for this model. Range [0,1]. -1 sentinel = no observations yet for this bucket.",
+		},
+		[]string{"model"},
+	)
+
+	// Histogram: time elapsed between a successful predictive warm (when
+	// it eventually fires a cold-load — TODO) and the first real request
+	// that landed afterward. The whole point of predictive cold-load: if
+	// this histogram clusters near 0 we predicted too late; if it clusters
+	// near `window_minutes` * 60 we predicted right; if it has a long tail
+	// we are firing too eagerly (misses).
+	PredictiveWarmToFirstRequestSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jukebox_predictive_warm_to_first_request_seconds",
+			Help:    "Wall-clock seconds between a predictive pre-warm decision and the first real request for that model.",
+			Buckets: []float64{1, 10, 30, 60, 120, 300, 600, 1200},
+		},
+		[]string{"model"},
+	)
 )
 
 func init() {
@@ -140,6 +187,9 @@ func init() {
 		InstanceInFlightRequests,
 		EvictionsTotal,
 		ScheduleRejectionsTotal,
+		PredictiveWarmsTotal,
+		PredictedProbability,
+		PredictiveWarmToFirstRequestSeconds,
 	)
 }
 

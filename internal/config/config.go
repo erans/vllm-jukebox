@@ -113,6 +113,34 @@ type ModelConfig struct {
 	PowerLimit           *int              `yaml:"power_limit"`
 	PowerLimits          map[int]int       `yaml:"power_limits"`
 	LogFile              string            `yaml:"log_file"`
+
+	// PredictiveColdLoad opts this model into traffic-histogram-driven
+	// pre-warming. The predictor watches the model's request stream over
+	// rolling weekly hour-of-day × day-of-week buckets and pre-fires a
+	// cold-load when the probability of a request landing in the next
+	// window exceeds a threshold. Skeleton-only in this commit — when the
+	// gate fires it currently emits metrics + a slog line but does NOT
+	// actually call back into the scheduler. See internal/jukebox/predictor.go.
+	//
+	// Default: disabled (zero behavior change).
+	PredictiveColdLoad PredictiveColdLoadConfig `yaml:"predictive_cold_load,omitempty"`
+}
+
+// PredictiveColdLoadConfig per-model knobs for the histogram-driven
+// pre-warm predictor. Validation: see config.Validate.
+//
+// All fields are optional; zero values mean "use defaults":
+//   - Enabled: false → predictor does not even tick this model.
+//   - PThreshold: 0 → 0.4 (predictor package default).
+//   - MaxPerDay: 0 → 24 (one warm per hour budget).
+//   - CooldownMinutes: 0 → 30 (mute after a warm fires).
+//   - WindowMinutes: 0 → 10 (forecast horizon).
+type PredictiveColdLoadConfig struct {
+	Enabled         bool    `yaml:"enabled"`
+	PThreshold      float64 `yaml:"p_threshold,omitempty"`
+	MaxPerDay       int     `yaml:"max_per_day,omitempty"`
+	CooldownMinutes int     `yaml:"cooldown_minutes,omitempty"`
+	WindowMinutes   int     `yaml:"window_minutes,omitempty"`
 }
 
 func Load(data []byte) (*Config, error) {
