@@ -33,7 +33,7 @@ func makePredCfg(models map[string]config.PredictiveColdLoadConfig) *config.Conf
 // fakeClock returns a closure that returns a controllable time. Tests
 // use this to inject deterministic (dow, hour) buckets without waiting
 // for real wall-clock to advance.
-func fakeClock(t time.Time) (func() time.Time, *time.Time) {
+func fakeClockFn(t time.Time) (func() time.Time, *time.Time) {
 	cur := t
 	return func() time.Time { return cur }, &cur
 }
@@ -43,7 +43,7 @@ func fakeClock(t time.Time) (func() time.Time, *time.Time) {
 // to hits/observed.
 func TestHistogramObserveAndProbability(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 30, 0, 0, time.Local) // Friday 14:30 local
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true},
@@ -76,7 +76,7 @@ func TestHistogramObserveAndProbability(t *testing.T) {
 
 // TestProbabilityNoObservations — fresh model returns -1 sentinel.
 func TestProbabilityNoObservations(t *testing.T) {
-	clock, _ := fakeClock(time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local))
+	clock, _ := fakeClockFn(time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local))
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true},
 	})
@@ -94,7 +94,7 @@ func TestProbabilityNoObservations(t *testing.T) {
 // the gate must NOT fire.
 func TestEvalFireGate_BelowThreshold(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true, PThreshold: 0.9},
@@ -123,7 +123,7 @@ func TestEvalFireGate_BelowThreshold(t *testing.T) {
 // cooldown → onFire MUST be invoked.
 func TestEvalFireGate_AboveThreshold(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true, PThreshold: 0.4, MaxPerDay: 10, CooldownMinutes: 30},
@@ -158,7 +158,7 @@ func TestEvalFireGate_AboveThreshold(t *testing.T) {
 // within the cooldown window must be suppressed.
 func TestEvalFireGate_Cooldown(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true, PThreshold: 0.4, MaxPerDay: 10, CooldownMinutes: 30},
@@ -201,7 +201,7 @@ func TestEvalFireGate_Cooldown(t *testing.T) {
 // must not be re-pre-warmed even at high probability.
 func TestEvalFireGate_NotStoppedSuppresses(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true, PThreshold: 0.4},
@@ -231,7 +231,7 @@ func TestEvalFireGate_NotStoppedSuppresses(t *testing.T) {
 // must short-circuit the entire gate.
 func TestEvalFireGate_DisabledByConfig(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: false}, // explicitly off
@@ -259,7 +259,7 @@ func TestEvalFireGate_DisabledByConfig(t *testing.T) {
 // more fires today regardless of probability.
 func TestEvalFireGate_DailyBudget(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {
@@ -305,7 +305,7 @@ func TestEvalFireGate_DailyBudget(t *testing.T) {
 // stale spike doesn't dominate forever.
 func TestExponentialDecay(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(t0)
+	clock, cur := fakeClockFn(t0)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true},
@@ -365,7 +365,7 @@ func TestPersistRoundTrip(t *testing.T) {
 	statePath := filepath.Join(dir, "predictor.json")
 
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, _ := fakeClock(now)
+	clock, _ := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"alpha": {Enabled: true},
@@ -445,7 +445,7 @@ func TestRunGoroutineShutdown(t *testing.T) {
 // (reaped on the next tick past the window).
 func TestPendingFireHitMiss(t *testing.T) {
 	now := time.Date(2026, 6, 12, 14, 0, 0, 0, time.Local)
-	clock, cur := fakeClock(now)
+	clock, cur := fakeClockFn(now)
 
 	cfg := makePredCfg(map[string]config.PredictiveColdLoadConfig{
 		"hit-model":  {Enabled: true, PThreshold: 0.4, CooldownMinutes: 1, MaxPerDay: 10},
