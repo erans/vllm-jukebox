@@ -56,13 +56,6 @@ const (
 	// recovering process; operator must reconcile manually. Maps to 503
 	// with NO Retry-After so SDKs surface the error rather than retry-loop.
 	RejectAdminIntervention RejectReason = "admin_intervention"
-	// RejectUpstreamUnreachable is emitted when our local TCP liveness
-	// probe has observed the configured number of consecutive dial
-	// failures against the upstream's listening port. The proxy should
-	// translate this into a fast 503 with a short Retry-After rather
-	// than forwarding requests that we already know will fail with
-	// "dial tcp: connection refused" / "EOF" some seconds later.
-	RejectUpstreamUnreachable RejectReason = "upstream_unreachable"
 )
 
 type RejectError struct {

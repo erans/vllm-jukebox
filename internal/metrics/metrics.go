@@ -406,46 +406,6 @@ var (
 		},
 		[]string{"model"},
 	)
-
-	// Counter: upstream 429 responses rewritten to 503 by the proxy.
-	// vLLM emits 429 when its in-engine admission queue is saturated
-	// (commonly during wake / cold-start when many concurrent requests
-	// arrive before the engine reaches steady state). 429 tells SDKs
-	// "you, the client, are rate-limited" — leading to long backoffs or
-	// terminal errors. The proxy rewrites these to 503 + Retry-After so
-	// well-behaved SDKs retry within their normal budget. A non-zero
-	// rate on this counter for a given model is a signal that either
-	// (a) the model is being woken under burst load, or (b) the engine
-	// has hit its steady-state concurrency limit and needs tuning.
-	Upstream429RewrittenTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "jukebox_upstream_429_rewritten_total",
-			Help: "Total upstream 429 (Too Many Requests) responses rewritten by the proxy to 503 + Retry-After.",
-		},
-		[]string{"model"},
-	)
-
-	// Gauge: TCP-liveness verdict for an upstream (1 = alive, 0 = dead).
-	// Labelled by the resolved target host:port so multiple upstreams
-	// (e.g. scheduler-mode instances) can be tracked independently.
-	UpstreamTCPAlive = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "jukebox_upstream_tcp_alive",
-			Help: "Upstream TCP-dial liveness (1 = alive, 0 = consecutive failures past threshold).",
-		},
-		[]string{"target"},
-	)
-
-	// Counter: TCP-liveness state transitions, labelled by direction.
-	// `direction="down"` is incremented each time the probe demotes an
-	// upstream; `direction="up"` each time it recovers.
-	UpstreamTCPTransitionsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "jukebox_upstream_tcp_transitions_total",
-			Help: "Upstream TCP-liveness state transitions (alive → dead and back).",
-		},
-		[]string{"target", "direction"},
-	)
 )
 
 func init() {
@@ -487,9 +447,6 @@ func init() {
 		PredictiveWarmsTotal,
 		PredictedProbability,
 		PredictiveWarmToFirstRequestSeconds,
-		Upstream429RewrittenTotal,
-		UpstreamTCPAlive,
-		UpstreamTCPTransitionsTotal,
 	)
 }
 
