@@ -129,6 +129,22 @@ type Scheduler struct {
 	// containerState.StartedAt parsed via time.Parse(time.RFC3339Nano).
 	bootEpoch time.Time
 
+	// bootAdoptedPeers is the set of model names already adopted by
+	// adoptPreExistingPeer at this jukebox boot. Once a peer is in this
+	// set, checkOneExternalStart skips the adopt path so the WARN log +
+	// AdmissionStartupAdoptedTotal metric + lifecycle_transition audit
+	// fire exactly once per peer per boot, not every 2s tick.
+	//
+	// Why this is needed: the StateSleeping → StateSleeping adopt branch
+	// in adoptPreExistingPeer leaves inst.state unchanged, so the
+	// candidate filter in checkExternalStarts re-selects the peer on
+	// every subsequent tick and the adopt machinery re-fires. The
+	// resulting log noise (every 2s, indefinitely, for every pre-existing
+	// sleeping peer) makes real cold-load events undistinguishable from
+	// boot-adopt re-runs in dashboards. Live-observed 2026-06-13 on llm
+	// for vllm-main (Qwen3.6-27B). Guarded by mu.
+	bootAdoptedPeers map[string]struct{}
+
 	total inflight.Tracker
 
 	// cb is the jukebox-native circuit breaker. Nil when the breaker is
@@ -227,6 +243,7 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		coldLoadKicks:    map[string]bool{},
 		coldLoadFailures: map[string]coldLoadFailureRecord{},
 		bootEpoch:        now(),
+		bootAdoptedPeers: map[string]struct{}{},
 	}
 	s.total.OnChange = func(count int64) {
 		metrics.InFlightRequests.Set(float64(count))

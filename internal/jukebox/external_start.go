@@ -268,6 +268,22 @@ func (s *Scheduler) checkOneExternalStart(ctx context.Context, name string, mode
 		return
 	}
 
+	// ONE-SHOT BOOT-ADOPT GUARD: once a peer has been adopted by this
+	// jukebox process, skip the adopt path on subsequent ticks. The
+	// StateSleeping → StateSleeping adopt branch leaves inst.state
+	// unchanged, so the candidate filter re-selects the peer every 2s
+	// and the WARN + metric + lifecycle audit re-fire indefinitely
+	// (live-observed 2026-06-13 on llm for vllm-main). Without this
+	// guard, real cold-load events become indistinguishable from
+	// boot-adopt re-runs in dashboards. The bootAdoptedPeers set is
+	// populated by adoptPreExistingPeer below.
+	s.mu.RLock()
+	_, alreadyAdopted := s.bootAdoptedPeers[name]
+	s.mu.RUnlock()
+	if alreadyAdopted {
+		return
+	}
+
 	// STARTUP-ADOPT (Issue #5b): if the container's StartedAt is BEFORE
 	// jukebox's own bootEpoch, the peer was already running when
 	// jukebox itself restarted. This is the common case after every
@@ -280,6 +296,9 @@ func (s *Scheduler) checkOneExternalStart(ctx context.Context, name string, mode
 	if dec := shouldAdoptOnBoot(st.StartedAt, s.bootEpoch); dec.Adopt {
 		settled := s.adoptPreExistingPeer(name, currentState, modelCfg)
 		s.logAndCountAdoption(ctx, name, container, currentState, settled, dec)
+		s.mu.Lock()
+		s.bootAdoptedPeers[name] = struct{}{}
+		s.mu.Unlock()
 		return
 	}
 
