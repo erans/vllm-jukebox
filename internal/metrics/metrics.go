@@ -566,6 +566,25 @@ var (
 		[]string{"model"},
 	)
 
+	// Counter: upstream transport failures — the http.Client.Do call
+	// returned an error BEFORE any HTTP response was received (the backend
+	// produced no status at all). These are mapped by the proxy to a clean
+	// 503 (model_unavailable); this counter is the observability hook for
+	// the silent-200-on-dead-backend + raw-500-on-recreate fixes (both
+	// share the one transport-error classifier). Labelled by model and a
+	// coarse reason ("dns" = NXDOMAIN/unresolvable, "dial" = connection
+	// refused/no-route/recreate-rm-gap, "timeout" = ctx deadline,
+	// "unreachable" = other). A non-zero rate means a backend is down,
+	// mid-recreate, mis-resolving (mesh-DNS race), or mis-configured in
+	// active.yaml.
+	UpstreamTransportErrorsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_upstream_transport_errors_total",
+			Help: "Total upstream transport failures (no HTTP response received) mapped by the proxy to 503.",
+		},
+		[]string{"model", "reason"},
+	)
+
 	// Gauge: TCP-liveness verdict for an upstream (1 = alive, 0 = dead).
 	// Labelled by the resolved target host:port so multiple upstreams
 	// (e.g. scheduler-mode instances) can be tracked independently.
@@ -638,6 +657,7 @@ func init() {
 		PredictedProbability,
 		PredictiveWarmToFirstRequestSeconds,
 		Upstream429RewrittenTotal,
+		UpstreamTransportErrorsTotal,
 		UpstreamTCPAlive,
 		UpstreamTCPTransitionsTotal,
 	)

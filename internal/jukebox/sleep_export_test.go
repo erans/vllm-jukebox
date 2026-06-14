@@ -105,6 +105,7 @@ func SetReprobeStoppedHealthBudgetForTest(d time.Duration) time.Duration {
 	reprobeStoppedHealthBudgetNS.Store(int64(d))
 	return old
 }
+
 // /is_sleeping poll interval (production default: 5s). Returns the
 // previous value so tests can defer a restore. Used by tests that
 // exercise the cold-load loop and would otherwise pay 5s wall-clock
@@ -289,4 +290,15 @@ func SetRedeployMemberAsyncForTest(fn func(model string)) func() {
 		old = redeployMemberAsyncForTest.Swap(&wrapped)
 	}
 	return func() { redeployMemberAsyncForTest.Store(old) }
+}
+
+// HasColdLoadCooldownForTest reports whether KickColdLoad has a recorded
+// failure cooldown entry for model (i.e. a subsequent kick within the
+// cooldown window would be suppressed). Used by Forensics-A2 tests to
+// assert that a container-missing cold-load does NOT latch the cooldown.
+func (s *Scheduler) HasColdLoadCooldownForTest(model string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.coldLoadFailures[model]
+	return ok
 }

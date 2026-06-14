@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -792,13 +793,13 @@ func (s *Scheduler) crossGroupGPUContenderNamesForColdLoad(target string, modelC
 type KickColdLoadRefusalReason string
 
 const (
-	KickColdLoadRefusalNone              KickColdLoadRefusalReason = ""
+	KickColdLoadRefusalNone                KickColdLoadRefusalReason = ""
 	KickColdLoadRefusalAdmissionNotStopped KickColdLoadRefusalReason = "admission_not_stopped"
-	KickColdLoadRefusalNoLiveConfig       KickColdLoadRefusalReason = "no_live_config"
-	KickColdLoadRefusalKickInFlight       KickColdLoadRefusalReason = "kick_in_flight"
-	KickColdLoadRefusalCooldownActive     KickColdLoadRefusalReason = "cooldown_active"
-	KickColdLoadRefusalNilScheduler       KickColdLoadRefusalReason = "nil_scheduler"
-	KickColdLoadRefusalUnknownInstance    KickColdLoadRefusalReason = "unknown_instance"
+	KickColdLoadRefusalNoLiveConfig        KickColdLoadRefusalReason = "no_live_config"
+	KickColdLoadRefusalKickInFlight        KickColdLoadRefusalReason = "kick_in_flight"
+	KickColdLoadRefusalCooldownActive      KickColdLoadRefusalReason = "cooldown_active"
+	KickColdLoadRefusalNilScheduler        KickColdLoadRefusalReason = "nil_scheduler"
+	KickColdLoadRefusalUnknownInstance     KickColdLoadRefusalReason = "unknown_instance"
 )
 
 // KickColdLoad is the legacy bool-return entry point. Preserved as a
@@ -992,6 +993,26 @@ func (s *Scheduler) KickColdLoadWithReason(name string) (bool, KickColdLoadRefus
 				slog.Info("async_cold_load_deferred_no_cooldown",
 					"model", name,
 					"reason", "gpu-contender-wake-settle-deferral",
+					"err", err,
+				)
+				return
+			}
+			// Forensics A2: ErrColdLoadContainerMissing means `docker
+			// start` hit "No such container" — the operator's
+			// `compose up --force-recreate` is mid-rm-gap. doColdLoad
+			// never brought anything up and nothing is wedged. Recording
+			// the 30s cooldown here is exactly the bug: it makes the
+			// ExternalStartMonitor's KickColdLoad refuse with
+			// cooldown_active for the full window, DELAYING the
+			// external-start reconcile that adopts the recreated
+			// container. Skip the record so reconcile fires the instant
+			// the new container shows running. The cooldown is for
+			// "doomed cold-load loops" (wedged docker start, OOM at
+			// worker init) — a transient rm-gap is neither.
+			if errors.Is(err, ErrColdLoadContainerMissing) {
+				slog.Info("async_cold_load_deferred_no_cooldown",
+					"model", name,
+					"reason", "container-missing-defer-external-start",
 					"err", err,
 				)
 				return
@@ -1790,6 +1811,59 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 		)
 	}
 	if err := s.doColdLoad(ctx, inst, container, startPeriod); err != nil {
+		// Forensics A2 short-circuit: the container did not exist when we
+		// tried `docker start` (operator force-recreate rm-gap). There is
+		// nothing half-loaded to clean up and no VRAM to drift — the
+		// container was never started. Skip the entire cleanup-stop /
+		// drift-risk / NotifyStartFailed machinery (which, pre-fix, ran a
+		// `docker stop` that ALSO hit "No such container" and latched the
+		// hard vram-drift-risk audit + 30s cooldown). Restore any
+		// same-group pinned peers we slept for this aborted load and
+		// leave cross-group peers sleeping (standard async-503 recovery);
+		// then return the sentinel so KickColdLoad's goroutine skips the
+		// cooldown record and the ExternalStartMonitor can reconcile the
+		// recreated container the instant it shows running.
+		if errors.Is(err, ErrColdLoadContainerMissing) {
+			if len(sleptCross) > 0 {
+				slog.Warn("cold_load_failed_cross_group_peers_left_sleeping",
+					"model", inst.model,
+					"cross_group_peers", sleptCross,
+					"recovery", "async-503-on-next-demand",
+					"reason", "container-missing-defer-external-start",
+				)
+				for _, peer := range sleptCross {
+					LogLifecycleTransition(LifecycleEvent{
+						Action: LifecycleEvict,
+						Model:  peer,
+						Reason: "cold-load-container-missing-left-sleeping",
+						GPUs:   s.gpusForModel(peer),
+					})
+				}
+			}
+			// Best-effort re-wake of pinned same-group peers. If this
+			// fails we still do NOT latch the cooldown — the
+			// external-start reconcile path owns recovery here.
+			if pinnedRestoreFailed := s.bestEffortRestorePinned(ctx, sleptSameGroup); len(pinnedRestoreFailed) > 0 {
+				for _, peer := range pinnedRestoreFailed {
+					slog.Error("pinned_peer_wake_failed_admission_inconsistent",
+						"model", inst.model,
+						"pinned_peer", peer,
+						"cold_load_err", err,
+						"reason", "container-missing-defer-external-start",
+						"runbook", "manual-reconcile",
+					)
+					metrics.AdmissionPinnedWakeFailedTotal.WithLabelValues(peer).Inc()
+				}
+			}
+			LogLifecycleTransition(LifecycleEvent{
+				Action:   LifecycleColdLoad,
+				Model:    inst.model,
+				Reason:   "container-missing-defer-external-start",
+				GPUs:     s.gpusForModel(inst.model),
+				Duration: s.now().Sub(coldLoadStart),
+			})
+			return err
+		}
 		// MEDIUM #4 rollback: same-group pinned peers we slept must be
 		// re-woken via bestEffortRestorePinned. Cross-group sleptCross
 		// peers are LEFT sleeping (no cascade — see the comment above).
@@ -2007,6 +2081,49 @@ func (s *Scheduler) coldLoadStoppedMemberLocked(ctx context.Context, inst *sched
 // the GPU-set lock and starving Sparx.
 var ErrColdLoadContainerExited = errors.New("cold-load container exited")
 
+// ErrColdLoadContainerMissing is returned by doColdLoad when the
+// `docker start <container>` fails because the named container does not
+// currently resolve in the docker daemon ("No such container: <name>").
+//
+// Forensics A2 (confirmed live): an operator running
+// `docker compose up --force-recreate vllm-main` removes-then-recreates
+// the container. There is a sub-second-to-seconds rm-gap during which
+// the old container is gone and the new one not yet created. If a
+// cold-load `docker start vllm-main` lands in that gap, docker returns
+// "No such container: vllm-main". This is NOT a doomed-loop failure
+// (OOM at worker init, wedged docker start) and it is NOT real VRAM
+// drift — the container simply does not exist *yet*. The operator's own
+// `compose up` is in the middle of recreating it.
+//
+// The PRE-FIX behavior treated this like any other start failure: it
+// fell through to the cleanup `docker stop` (which ALSO failed with
+// "No such container"), latching the hard ErrAdmissionVRAMDriftRisk
+// drift-risk audit + metric AND recording the 30s cold-load cooldown.
+// That cooldown then made the external-start monitor's KickColdLoad
+// refuse (external_start_kick_cold_load_refused, cooldown_active) for
+// the full window — actively DELAYING the recovery that the
+// external-start reconcile path performs once the recreated container
+// appears running.
+//
+// POST-FIX: doColdLoad detects the missing-container start error and
+// returns this sentinel. coldLoadStoppedMemberLocked short-circuits on
+// it BEFORE the cleanup-stop / drift-risk block (there is no container
+// to stop and no VRAM to drift — nothing was ever started). The
+// KickColdLoad goroutine skips the cooldown record for this sentinel,
+// exactly as it does for ErrColdLoadGPUContended, so the
+// ExternalStartMonitor can adopt/reconcile the recreated container the
+// moment it is observed running — no 30s artificial delay.
+var ErrColdLoadContainerMissing = errors.New("cold-load deferred: container does not currently exist (likely operator force-recreate rm-gap); defer to external-start reconcile")
+
+// dockerNoSuchContainer reports whether a docker CLI error/output
+// indicates the target container name does not currently resolve.
+// docker emits "No such container: <name>" (CLI) and the daemon API
+// surfaces "No such container" / "no such container" depending on path;
+// match case-insensitively on the stable substring.
+func dockerNoSuchContainer(combined string) bool {
+	return strings.Contains(strings.ToLower(combined), "no such container")
+}
+
 // ErrColdLoadPinnedWakeFailed is returned by coldLoadStoppedMemberLocked
 // when the cold-load failed AND the rollback step (re-waking pinned
 // peers we slept to free VRAM for the now-failed cold-load) also
@@ -2138,6 +2255,26 @@ func (s *Scheduler) doColdLoad(ctx context.Context, inst *schedInstance, contain
 	startOut, startErr := runSleepDocker(startCtx, "docker", "start", container)
 	cancel()
 	if startErr != nil {
+		combined := startErr.Error() + " " + string(startOut)
+		// Forensics A2: the container does not currently resolve. Almost
+		// always an operator `docker compose up --force-recreate` rm-gap,
+		// NOT a doomed cold-load and NOT VRAM drift. Return the dedicated
+		// sentinel so the caller short-circuits the cleanup-stop /
+		// drift-risk / cooldown machinery and defers to the
+		// external-start reconcile path (which adopts the recreated
+		// container the moment it shows running). %w preserves the
+		// underlying error for operator postmortem.
+		if dockerNoSuchContainer(combined) {
+			slog.Warn("cold_load_container_missing_defer_external_start",
+				"model", inst.model,
+				"container", container,
+				"docker_err", startErr,
+				"docker_output", string(startOut),
+				"runbook", "operator-force-recreate-rm-gap-defer-to-external-start",
+			)
+			return fmt.Errorf("%w: docker start %q: %v (output: %s)",
+				ErrColdLoadContainerMissing, container, startErr, string(startOut))
+		}
 		return fmt.Errorf("docker start %q: %w (output: %s)", container, startErr, string(startOut))
 	}
 
@@ -2227,6 +2364,37 @@ func (s *Scheduler) doColdLoad(ctx context.Context, inst *schedInstance, contain
 		}
 	}
 	return fmt.Errorf("cold load timeout after %s waiting for is_sleeping=true on %q: %w", timeout, container, lastErr)
+}
+
+// isHostUnresolvable reports whether err (or anything it wraps) is a DNS
+// "no such host" / NXDOMAIN failure — i.e. the backend's hostname does
+// not resolve at all. This is the discriminator the sleep path uses to
+// tell a PERMANENTLY-absent backend (container never deployed, DNS name
+// gone) apart from a merely-transient probe failure (timeout, busy box,
+// connection-refused mid-restart). A *net.DNSError with IsNotFound is the
+// canonical NXDOMAIN shape; we also accept the older IsNotFound==false
+// DNSError whose message is the literal "no such host" for portability
+// across resolvers/platforms that don't set the bool. Anything else
+// (timeout, refused, EOF, context-cancel) is NOT host-unresolvable —
+// those backends exist and may recover, so the caller keeps its
+// conservative optimistic rollback.
+func isHostUnresolvable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		// IsNotFound is set on NXDOMAIN by the modern resolver. Some
+		// platforms/resolvers leave it false but still carry the
+		// "no such host" message, so accept either signal.
+		if dnsErr.IsNotFound || strings.Contains(dnsErr.Err, "no such host") {
+			return true
+		}
+	}
+	// Defensive fallback: a wrapper that flattened the DNSError into a
+	// plain string (e.g. some HTTP client error paths) still carries the
+	// substring. A timeout/temporary DNSError won't contain it.
+	return strings.Contains(err.Error(), "no such host")
 }
 
 // sleepInstance drains the instance, calls SleepCapable.Sleep, polls
@@ -2408,7 +2576,71 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 		// If all 3 probes errored, log the inconclusive outcome and fall
 		// through to the optimistic rollback (preserves prior behavior on
 		// total probe failure).
-		if len(probeErrs) == len(probeBackoffs) {
+		//
+		// ABSENT-HOST DISCRIMINATOR (forensics A4): "all probes errored"
+		// conflates two very different worlds:
+		//
+		//   (i)  transient probe-inconclusive — a busy box, a 3s timeout, a
+		//        vLLM reload window, a connection-refused while the engine
+		//        restarts. The backend EXISTS; rolling back to prevState
+		//        (StateReady) and letting the next request / next idle tick
+		//        retry is correct. This is the path the bounded retry above
+		//        was built to protect.
+		//
+		//   (ii) the host does not resolve AT ALL — *net.DNSError IsNotFound
+		//        (NXDOMAIN): the backend container was never deployed, or its
+		//        DNS name is permanently gone. There is nothing to reconcile
+		//        TO. Optimistically restoring StateReady here is a bug: the
+		//        member stays Ready forever, keeps appearing in /v1/models,
+		//        and the IdleMonitor (StateReady candidate filter, 30s tick)
+		//        re-selects it every cycle → sleepInstance fails the same way
+		//        → auto_suspend_failed WARN-spams indefinitely (1397 lines /
+		//        session observed). A permanently-unresolvable host must
+		//        reconcile DOWN to StateStopped + admissionStopped so it
+		//        leaves /v1/models AND drops out of the auto-suspend candidate
+		//        set. Recovery is then demand-driven: a later consumer request
+		//        hits the async-503 + KickColdLoad path (which docker-starts
+		//        the container) exactly like the boot-probe-stopped seed.
+		//
+		// We only reconcile-to-Stopped when BOTH the sleep-API error AND every
+		// probe error are host-unresolvable — a single resolvable probe (even
+		// a connection-refused) means the name exists and we keep the
+		// conservative optimistic rollback.
+		allProbesErrored := len(probeErrs) == len(probeBackoffs)
+		hostUnresolvable := allProbesErrored && isHostUnresolvable(err)
+		if hostUnresolvable {
+			for _, pe := range probeErrs {
+				if !isHostUnresolvable(pe) {
+					hostUnresolvable = false
+					break
+				}
+			}
+		}
+		if hostUnresolvable {
+			slog.Warn("sleep_target_host_unresolvable_reconciling_stopped",
+				"model", inst.model,
+				"err", err,
+				"probe_errs", fmt.Sprintf("%v", probeErrs),
+				"action", "reconcile_admission_to_stopped",
+				"note", "backend host does not resolve (NXDOMAIN) — was never deployed or its DNS name is gone; stop auto-suspend hammering",
+			)
+			s.mu.Lock()
+			inst.state = StateStopped
+			inst.draining = false
+			s.mu.Unlock()
+			if s.admission != nil {
+				s.admission.NotifyStopped(inst.model)
+			}
+			metrics.SleepFailuresTotal.WithLabelValues(inst.model, "host_unresolvable").Inc()
+			LogLifecycleTransition(LifecycleEvent{
+				Action: LifecycleColdLoad,
+				Model:  inst.model,
+				Reason: "sleep-host-unresolvable-stopped",
+				GPUs:   s.gpusForModel(inst.model),
+			})
+			return fmt.Errorf("sleep API: %w (host unresolvable — reconciled to Stopped)", err)
+		}
+		if allProbesErrored {
 			slog.Warn("wedge_probe_inconclusive_rolling_back_optimistically",
 				"model", inst.model,
 				"probe_errs", fmt.Sprintf("%v", probeErrs),
@@ -2950,6 +3182,19 @@ func mapWakeError(err error) error {
 			Reason:     RejectColdLoading,
 			RetryAfter: 5 * time.Second,
 			Message:    fmt.Sprintf("wake deferred (gpu-contender): %v", err),
+		}
+	case errors.Is(err, ErrColdLoadContainerMissing):
+		// Forensics A2: the container did not exist at `docker start`
+		// time — operator `compose up --force-recreate` rm-gap. This is
+		// transient: the recreate completes in seconds and the
+		// ExternalStartMonitor adopts/reconciles the new container. NOT
+		// vram-drift (nothing started) and NOT a structural infeasibility.
+		// Surface RejectColdLoading + a short Retry-After so the client
+		// re-polls rather than getting a terminal admin-intervention 503.
+		return &RejectError{
+			Reason:     RejectColdLoading,
+			RetryAfter: 5 * time.Second,
+			Message:    fmt.Sprintf("wake deferred (container recreating): %v", err),
 		}
 	default:
 		return &RejectError{

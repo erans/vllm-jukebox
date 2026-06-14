@@ -1,14 +1,38 @@
 package proxy
 
 import (
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
 )
+
+// TestMain clears any ambient HTTP(S)_PROXY before the first HTTP request
+// in this package. Go's net/http caches the proxy config exactly once per
+// process (httpproxy.FromEnvironment via a sync.Once), so a per-test
+// t.Setenv can't undo it after another test has already triggered a
+// request. Some sandboxed CI / dev environments inject an HTTP_PROXY; with
+// it set, the default http.Client (which honors http.ProxyFromEnvironment)
+// routes a request for an unresolvable backend to the *proxy* (which may
+// answer 4xx) instead of producing the real DNS/transport error these
+// tests exercise. Clearing it before any request is issued makes the
+// transport-error tests deterministic and environment-independent.
+func TestMain(m *testing.M) {
+	for _, k := range []string{
+		"HTTP_PROXY", "http_proxy",
+		"HTTPS_PROXY", "https_proxy",
+		"ALL_PROXY", "all_proxy",
+	} {
+		_ = os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
 
 // TestForwardFiber_Upstream429RewrittenTo503 asserts the proxy's
 // 429→503+Retry-After rewrite. vLLM emits 429 when its in-engine
@@ -94,6 +118,149 @@ func TestForwardFiber_Upstream429StripsStaleRetryAfter(t *testing.T) {
 	}
 	if strings.Contains(got, "999") {
 		t.Errorf("stale upstream Retry-After 999 leaked through: %q", got)
+	}
+}
+
+// TestForwardFiber_UnresolvableHostReturns503 is the regression test for
+// the silent-200-on-dead-backend bug. When a backend host is unresolvable
+// (NXDOMAIN — `dial tcp: lookup vllm-embeddings: no such host`) the Go
+// http.Client.Do call fails before any byte reaches the wire. The proxy
+// MUST map that transport failure to a 503 (model_unavailable) with a
+// clean JSON body — NOT let the raw transport error escape as a 200 with
+// the error text (and the internal hostname) in the body. Pre-fix this
+// returned 200 with the dial error leaked into the body; consumers
+// (openwebui RAG) treated the garbage as a successful completion.
+func TestForwardFiber_UnresolvableHostReturns503(t *testing.T) {
+	// RFC 6761 reserves .invalid as guaranteed-NXDOMAIN. Using a name
+	// that contains an internal-looking hostname lets us assert it does
+	// NOT leak into the client-facing body.
+	const internalHost = "vllm-embeddings-internal.invalid"
+
+	app := fiber.New()
+	app.Post("/v1/embeddings", func(c *fiber.Ctx) error {
+		return ForwardFiber(c, ForwardOptions{
+			BaseURL:        "http://" + internalHost + ":8000",
+			RequestedModel: "bge-m3",
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings",
+		strings.NewReader(`{"model":"bge-m3","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unresolvable backend must return 503, got status=%d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Body must be a clean JSON error envelope, not the raw transport error.
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("503 body must be valid JSON error envelope; got %q (unmarshal err: %v)", bodyStr, err)
+	}
+	if env.Error.Code != "model_unavailable" {
+		t.Errorf("expected error.code=model_unavailable, got %q (body=%q)", env.Error.Code, bodyStr)
+	}
+
+	// No internal hostname / DNS internals may leak to the consumer.
+	for _, leak := range []string{internalHost, "no such host", "dial tcp", "lookup", ":8000"} {
+		if strings.Contains(bodyStr, leak) {
+			t.Errorf("internal detail %q leaked into client-facing body: %q", leak, bodyStr)
+		}
+	}
+}
+
+// TestForwardFiber_ConnectionRefusedReturns503 covers the other half of
+// the dead-backend family: the host resolves but nothing is listening
+// (connection refused / *net.OpError dial error). Like NXDOMAIN this must
+// surface as a sanitized 503, never a silent 200.
+func TestForwardFiber_ConnectionRefusedReturns503(t *testing.T) {
+	// Bind a listener to grab a free port, then close it so the port is
+	// guaranteed refused.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	app := fiber.New()
+	app.Post("/v1/embeddings", func(c *fiber.Ctx) error {
+		return ForwardFiber(c, ForwardOptions{
+			BaseURL:        "http://" + addr,
+			RequestedModel: "bge-m3",
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings",
+		strings.NewReader(`{"model":"bge-m3","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("connection-refused backend must return 503, got status=%d", resp.StatusCode)
+	}
+
+	// The rewritten 503 must carry a Retry-After so SDKs ride through a
+	// recreate/reload window inside their retry budget (this is the
+	// raw-500-on-recreate contract folded into the shared classifier).
+	if got := resp.Header.Get("Retry-After"); got != upstream429RetryAfterSeconds {
+		t.Errorf("expected Retry-After=%q on transport-error 503, got %q", upstream429RetryAfterSeconds, got)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "model_unavailable") {
+		t.Errorf("expected model_unavailable error code, got %q", bodyStr)
+	}
+	for _, leak := range []string{addr, "connection refused", "dial tcp"} {
+		if strings.Contains(bodyStr, leak) {
+			t.Errorf("internal detail %q leaked into client-facing body: %q", leak, bodyStr)
+		}
+	}
+}
+
+// TestForwardFiber_UpstreamTransportErrorFiresStatusZero asserts the
+// circuit-breaker observability contract is preserved: a transport
+// failure still fires OnComplete(0) so the breaker treats it as a 5xx
+// signal, even though the client sees a sanitized 503.
+func TestForwardFiber_UpstreamTransportErrorFiresStatusZero(t *testing.T) {
+	var fired []int
+	app := fiber.New()
+	app.Post("/x", func(c *fiber.Ctx) error {
+		return ForwardFiber(c, ForwardOptions{
+			BaseURL:        "http://nonexistent-backend.invalid:8000",
+			RequestedModel: "m",
+			OnComplete:     func(status int) { fired = append(fired, status) },
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(""))
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if len(fired) != 1 || fired[0] != 0 {
+		t.Errorf("transport error must fire OnComplete exactly once with status=0; got %v", fired)
 	}
 }
 

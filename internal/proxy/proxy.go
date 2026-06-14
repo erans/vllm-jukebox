@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -64,7 +67,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	req, err := http.NewRequestWithContext(requestContext(c), c.Method(), targetURL, body)
 	if err != nil {
 		opts.fire(0)
-		return err
+		return writeTransportError(c, err, opts)
 	}
 
 	for k, values := range c.GetReqHeaders() {
@@ -90,7 +93,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		opts.fire(0)
-		return err
+		return writeTransportError(c, err, opts)
 	}
 
 	for k, values := range resp.Header {
@@ -182,6 +185,97 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	}
 
 	return c.Send(data)
+}
+
+// writeTransportError maps a Go http.Client transport failure (the err
+// returned by client.Do *before* any HTTP response is received) onto a
+// clean 503 (Service Unavailable) JSON error envelope.
+//
+// This is the single coherent classifier for the whole dead/unreachable
+// backend family. It folds together two originally-separate fixes that
+// both lived on this exact transport-error path:
+//
+//   - the silent-200-on-dead-backend fix (NXDOMAIN / unresolvable host):
+//     previously the raw transport error was returned to Fiber, which
+//     never overwrote the default 200 status the response carried at the
+//     time the logging middleware read it, so the request was logged as a
+//     SUCCESS, and the raw error string — including the internal backend
+//     hostname (e.g. "dial tcp: lookup vllm-embeddings: no such host") —
+//     leaked into the body. Consumers (notably openwebui RAG) treated that
+//     garbage as a valid 200 completion. The generalization of "/health
+//     lies 200".
+//
+//   - the raw-500-on-recreate fix (connection-refused to a KNOWN host):
+//     during a vLLM-main `compose up --force-recreate` window the upstream
+//     socket is briefly gone; the raw "connect: connection refused" error
+//     (with the internal mesh IP) otherwise bubbled to Fiber's default
+//     handler as a hard 500 — a terminal signal SDKs do not retry — while
+//     the engine is merely reloading.
+//
+// Both arrive as the same shape (client.Do returns a *url.Error wrapping a
+// *net.OpError or *net.DNSError), so they share ONE rewrite here rather
+// than two competing implementations. Failure taxonomy (all map to 503,
+// never 200/500):
+//   - *net.DNSError (NXDOMAIN / "no such host") — backend hostname is
+//     unresolvable (container down, mesh-DNS race, typo in active.yaml).
+//   - *net.OpError dial errors (connection refused, no route to host) —
+//     host resolves but nothing is listening (recreate rm-gap / reload).
+//   - context deadline / timeout and any other transport error — the
+//     backend never produced an HTTP response, so from the consumer's POV
+//     the model is unavailable.
+//
+// The client-facing body is sanitized: it carries a generic
+// "model_unavailable" code and a fixed message, never the underlying
+// hostname/port/dial detail. A Retry-After is set so well-behaved SDKs
+// ride through a reload window inside their retry budget. The real error
+// is logged server-side (with the request id) for operators, and a metric
+// (labelled by model + coarse reason) makes the transport-failure rate
+// observable in Prometheus. The circuit breaker has already been notified
+// via opts.fire(0) at the call site (status==0 = "never reached upstream",
+// treated as a 5xx signal).
+func writeTransportError(c *fiber.Ctx, err error, opts ForwardOptions) error {
+	reason := "unreachable"
+	var dnsErr *net.DNSError
+	var opErr *net.OpError
+	switch {
+	case errors.As(err, &dnsErr):
+		reason = "dns"
+	case errors.As(err, &opErr):
+		// Dial-time OpError (connection refused, no route, etc) — this is
+		// the recreate/reload-window case as well as a permanently-down
+		// known host.
+		reason = "dial"
+	case errors.Is(err, context.DeadlineExceeded):
+		reason = "timeout"
+	}
+
+	model := opts.RequestedModel
+	if model == "" {
+		model = "unknown"
+	}
+	metrics.UpstreamTransportErrorsTotal.WithLabelValues(model, reason).Inc()
+
+	// Log the *real* error server-side — operators need the hostname/port.
+	slog.Warn("upstream_transport_error",
+		"request_id", opts.RequestID,
+		"model", model,
+		"reason", reason,
+		"error", err.Error(),
+	)
+
+	// Sanitized client-facing body — no internal hostname/port/dial detail.
+	// Replace any upstream-supplied Retry-After (defensive; none exists on
+	// this path today) before setting ours.
+	c.Response().Header.Del("Retry-After")
+	c.Set("Content-Type", "application/json")
+	c.Set("Retry-After", upstream429RetryAfterSeconds)
+	return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{
+		"error": fiber.Map{
+			"message": "Upstream model server is currently unavailable; please retry.",
+			"type":    "service_unavailable",
+			"code":    "model_unavailable",
+		},
+	})
 }
 
 func copyWithFlush(r io.Reader, w *bufio.Writer) (int64, error) {
