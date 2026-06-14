@@ -339,6 +339,25 @@ func main() {
 		// cold-load for pinned peers that should always be live).
 		go sched.StateReconciler(ctx)
 
+		// Enable the jukebox-native circuit breaker. It observes upstream
+		// response statuses (5xx auto-restart) AND backs the decode-stall
+		// probe's docker-restart trip path. Both the 5xx breaker and the
+		// decode probe self-gate on their respective config kill-switches
+		// (behavior.circuit_breaker.enabled / behavior.decode_probe_interval),
+		// so enabling it here is a no-op until an operator opts in — but
+		// the wiring must exist so a hot-reload that flips either switch
+		// takes effect without a process restart. liveCfg is config.Current
+		// so behavior.circuit_breaker.* hot-reloads are picked up.
+		sched.EnableCircuitBreaker(config.Current)
+
+		// Decode-stall probe (DETECTION + RECOVERY half of vllm#45094).
+		// Background goroutine; ticks at behavior.decode_probe_interval
+		// (0 = disabled, the default). On a sustained /health/decode stall
+		// it drains the instance + fires the circuit breaker's docker
+		// restart, recovering the silent PP-cudagraph-split-brain wedge
+		// that plain /health misses.
+		go sched.DecodeProbeMonitor(ctx)
+
 		// Subscribe the scheduler to active.yaml hot-reloads so its
 		// admission controller picks up per-model field edits without
 		// requiring a process restart.

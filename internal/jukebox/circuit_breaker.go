@@ -190,14 +190,23 @@ func (cb *CircuitBreaker) RecordResponse(model string, status int) {
 	// Pre-trip gates and the actual docker restart run async — the
 	// hot path (handler return) doesn't block on Ready-check + docker
 	// exec round-trips.
-	go cb.evaluateAndTrip(model, container, cbcfg)
+	go cb.evaluateAndTrip(model, container, cbcfg, false)
 }
 
 // evaluateAndTrip runs the gate stack (ready, cold-load grace, cooldown,
 // crash-loop, dry-run) and either fires the docker restart or records
 // the suppression reason. Caller is RecordResponse on its own goroutine.
-func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.CircuitBreakerConfig) {
-	if !cb.readyChecker(model) {
+//
+// decodeStall=true is the decode-probe entry (ForceTrip): the caller
+// already has direct out-of-band evidence the engine is wedged (a
+// sustained /health/decode stall), so the ready-gate and the
+// cold-load-grace gate are BYPASSED — a wedged engine answers /health
+// 200 (so the ready check passes spuriously anyway) but NEVER returns a
+// 2xx from real inference, which would make the grace gate suppress the
+// trip forever. The cooldown + crash-loop guards are STILL enforced so a
+// flapping probe can't restart-storm a container.
+func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.CircuitBreakerConfig, decodeStall bool) {
+	if !decodeStall && !cb.readyChecker(model) {
 		metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "suppressed_not_ready").Inc()
 		return
 	}
@@ -224,7 +233,7 @@ func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.
 
 	healthyAfterTrip := !lastHealthy.IsZero() && lastHealthy.After(lastTrip)
 	graceExceeded := graceMax > 0 && !firstSeen.IsZero() && now.Sub(firstSeen) > graceMax
-	if !healthyAfterTrip && !graceExceeded {
+	if !decodeStall && !healthyAfterTrip && !graceExceeded {
 		log.Printf("circuit-breaker: cold-load grace container=%s model=%s — suppressing trip (no 2xx observed in this incarnation, grace window not exceeded)", container, model)
 		metrics.CircuitBreakerTripsTotal.WithLabelValues(model, "suppressed_cold_load").Inc()
 		return
@@ -292,6 +301,40 @@ func (cb *CircuitBreaker) evaluateAndTrip(model, container string, cbcfg config.
 		Reason: "5xx_consecutive",
 		Model:  model,
 	})
+}
+
+// ForceTrip fires the breaker's trip path for `model` WITHOUT requiring
+// the consecutive-5xx window to fill. It runs the same gate stack as a
+// normal trip (ready check, cold-load grace, cooldown, crash-loop guard,
+// dry-run) and, if all gates pass, issues the docker restart on a
+// goroutine. Used by the decode-stall probe (decode_probe.go), which has
+// its own out-of-band evidence that the engine is wedged (a sustained
+// /health/decode stall the 5xx-window can't see because /health keeps
+// lying 200). Returns immediately; the restart runs async exactly like
+// RecordResponse's trip.
+//
+// No-op when the breaker is disabled in config or the model has no
+// container — the same observe-only posture as RecordResponse.
+func (cb *CircuitBreaker) ForceTrip(model string) {
+	cfg := cb.liveCfg()
+	if cfg == nil {
+		return
+	}
+	cbcfg := cfg.Behavior.CircuitBreaker
+	if !cbcfg.Enabled {
+		return
+	}
+	container := containerForModel(cfg, model)
+	if container == "" {
+		return
+	}
+	// Clear the stale status window so a subsequent 5xx burst counts
+	// fresh after this forced trip, mirroring evaluateAndTrip's own
+	// delete-on-fire.
+	cb.mu.Lock()
+	delete(cb.statuses, model)
+	cb.mu.Unlock()
+	go cb.evaluateAndTrip(model, container, cbcfg, true)
 }
 
 // containerForModel resolves the docker container backing the model,

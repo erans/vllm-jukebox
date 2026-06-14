@@ -150,6 +150,13 @@ type Scheduler struct {
 	// cb is the jukebox-native circuit breaker. Nil when the breaker is
 	// disabled in config or hasn't been wired in yet. See circuit_breaker.go.
 	cb *CircuitBreaker
+
+	// decodeStallCounts tracks consecutive /health/decode stall counts
+	// per model for the decode-stall probe (decode_probe.go, DETECTION
+	// half of vllm#45094). A model trips only after its count reaches
+	// sustainedStallIntervals. Cleared on any healthy/endpoint-absent
+	// probe or after a trip fires. Guarded by mu. Lazily initialized.
+	decodeStallCounts map[string]int
 }
 
 // coldLoadFailureRecord captures the last cold-load failure for a model
@@ -479,8 +486,8 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 		}
 	}
 
-	if route, ok := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); ok {
-		return route, nil
+	if route, handled, err := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); handled {
+		return route, err
 	}
 
 	// Sleep-mode fast path: if there's already a slept instance for this
@@ -504,8 +511,8 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	defer func() { <-s.sched }()
 
 	// Double-check after acquiring the permit; another request may have started it.
-	if route, ok := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); ok {
-		return route, nil
+	if route, handled, err := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); handled {
+		return route, err
 	}
 
 	if s.cfg.Scheduler == nil {
@@ -606,7 +613,7 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	s.instances[resolvedName] = inst
 	s.mu.Unlock()
 
-	return s.routeForInstance(ctx, inst, modelCfg.Path), nil
+	return s.routeForInstance(ctx, inst, modelCfg.Path)
 }
 
 func (s *Scheduler) StopAll(ctx context.Context) error {
@@ -633,15 +640,19 @@ func (s *Scheduler) StopAll(ctx context.Context) error {
 	return nil
 }
 
-func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstreamModel string) (Route, bool) {
+func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstreamModel string) (Route, bool, error) {
 	s.mu.RLock()
 	inst := s.instances[resolvedModelName]
+	var lastUsedAt time.Time
+	if inst != nil {
+		lastUsedAt = inst.lastUsedAt
+	}
 	s.mu.RUnlock()
 	if inst == nil {
-		return Route{}, false
+		return Route{}, false, nil
 	}
 	if inst.state != StateReady || inst.draining || inst.mgr == nil || inst.mgr.CurrentPID() == 0 {
-		return Route{}, false
+		return Route{}, false, nil
 	}
 
 	now := s.now()
@@ -675,7 +686,7 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 	// tryRouteFromSleep, which performs the wake.
 	// Round-2 instrumentation: log probe entry/exit so the handler-side
 	// trace can confirm the path actually fires under repro conditions.
-	staleness := now.Sub(inst.lastUsedAt)
+	staleness := now.Sub(lastUsedAt)
 	sc, scOk := inst.mgr.(SleepCapable)
 	if scOk && staleness > 30*time.Second {
 		slog.Info("drift_probe_entry",
@@ -707,7 +718,7 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 				)
 			}
 			s.mu.Unlock()
-			return Route{}, false
+			return Route{}, false, nil
 		}
 		// Probe error or sleeping==false -> proceed with Ready route.
 	} else if scOk {
@@ -728,10 +739,46 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 	}
 	s.mu.Unlock()
 
-	return s.routeForInstance(ctx, inst, upstreamModel), true
+	route, err := s.routeForInstance(ctx, inst, upstreamModel)
+	if err != nil {
+		// Instance was the route target (handled) but admission refused
+		// (concurrency cap). Surface handled=true + err so AcquireRoute
+		// returns the RejectError rather than falling through to a
+		// needless re-schedule.
+		return Route{}, true, err
+	}
+	return route, true, nil
 }
 
-func (s *Scheduler) routeForInstance(ctx context.Context, inst *schedInstance, upstreamModel string) Route {
+func (s *Scheduler) routeForInstance(ctx context.Context, inst *schedInstance, upstreamModel string) (Route, error) {
+	// Per-model concurrency cap (PREVENTION half of vllm#45094). When
+	// the model declares max_concurrent_requests > 0 and the routed
+	// instance is already at the cap, refuse admission with a retryable
+	// 503 rather than piling onto a batch shape that could cross the
+	// cudagraph-bucket boundary and wedge the PP pipeline. Read through
+	// liveModelCfg so the cap hot-reloads on active.yaml edits.
+	//
+	// The count-then-Track sequence has a benign TOCTOU window (a burst
+	// of goroutines can each observe count==cap-1 and all Track),
+	// bounding the real overshoot by the number of concurrent admissions
+	// in that window. The cap is a safety margin below the measured wedge
+	// threshold (operator guidance: ~8 when the wedge is at 12), not an
+	// exact quota, so a transient +N overshoot under a thundering herd is
+	// acceptable and self-corrects as slots free.
+	if inst != nil {
+		if mc, ok := liveModelCfg(s.cfg, inst.model); ok {
+			limit := mc.EffectiveMaxConcurrentRequests()
+			if limit > 0 && inst.inflight.Count() >= int64(limit) {
+				metrics.ScheduleRejectionsTotal.WithLabelValues(string(RejectConcurrencyLimit)).Inc()
+				return Route{}, &RejectError{
+					Reason:     RejectConcurrencyLimit,
+					RetryAfter: 2 * time.Second,
+					Message:    fmt.Sprintf("model %q at max_concurrent_requests (%d); please retry", inst.model, limit),
+				}
+			}
+		}
+	}
+
 	var instDone func()
 	if inst != nil {
 		instDone = inst.inflight.Track(ctx)
@@ -749,7 +796,7 @@ func (s *Scheduler) routeForInstance(ctx context.Context, inst *schedInstance, u
 				totalDone()
 			}
 		},
-	}
+	}, nil
 }
 
 func (s *Scheduler) acquireSchedulingPermitOrReject(ctx context.Context, model string) error {

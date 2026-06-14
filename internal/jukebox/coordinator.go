@@ -63,6 +63,15 @@ const (
 	// than forwarding requests that we already know will fail with
 	// "dial tcp: connection refused" / "EOF" some seconds later.
 	RejectUpstreamUnreachable RejectReason = "upstream_unreachable"
+	// RejectConcurrencyLimit is emitted when a model's per-model
+	// max_concurrent_requests cap is already saturated on the routed
+	// instance. PREVENTION half of vllm-project/vllm#45094: bounding the
+	// admitted concurrency keeps the engine below the batch-shape
+	// threshold that triggers the PP cudagraph-vs-eager dispatch
+	// split-brain. The proxy maps this to a 503 + short Retry-After so a
+	// well-behaved client backs off and retries against a freed slot,
+	// rather than piling onto a batch that would wedge the engine.
+	RejectConcurrencyLimit RejectReason = "concurrency_limit"
 )
 
 type RejectError struct {
