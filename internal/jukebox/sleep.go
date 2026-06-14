@@ -470,14 +470,32 @@ func (s *Scheduler) swapGroupMembersForColdLoad(target, swapGroup string) []stri
 // crossGroupGPUContenderNamesForColdLoad returns the names of
 // admission-tracked peers in DIFFERENT swap-groups whose GPU sets
 // overlap the target's GPUs AND who are actually evictable by
-// evictCrossGroupGPUContendersLocked / admission.pickVictims. Used to
-// PRE-REGISTER cross-group eviction victims in the coldLoadEviction
-// gate BEFORE the WithColdLoadLock acquires, so concurrent requests
-// for those peers fast-fail with 503+Retry-After (via
-// IsInColdLoadEviction) rather than fall through to AcquireRoute →
+// evictCrossGroupGPUContendersLocked / admission.pickVictims.
+//
+// LOCK-CONTEXT CONTRACT (deferred-registration fix, commit 79ad2d3):
+// the caller MUST register/unregister these names in the
+// coldLoadEviction gate INSIDE the WithColdLoadLock callback, NOT
+// before acquiring the lock. The current call site does this at
+// coldLoadStoppedMember (sleep.go ~908-910): markColdLoadEviction +
+// deferred unmarkColdLoadEviction live inside the WithColdLoadLock
+// closure so they only register while the actual eviction window is
+// active.
+//
+// Pre-lock registration (the prior, broken behavior) wedged healthy
+// cross-group peers during the mutex-wait window: any second
+// cold-load that queued behind an in-flight cold-load on coldLoadMu
+// would mark its cross-group contenders as "in eviction" the moment
+// it queued — and those contenders would stay 503'd for the full
+// wall-clock of the FIRST cold-load (5-12 min) even though no
+// eviction was happening to them yet. The fix defers the registration
+// until B actually owns coldLoadMu and is about to evict.
+//
+// The gate still gives concurrent requests for those peers a fast
+// 503+Retry-After (via IsInColdLoadEviction) during the actual
+// eviction window, preventing fall-through to AcquireRoute →
 // StateStopping wedge.
 //
-// HIGH (architect adversarial round-7): without this pre-registration,
+// HIGH (architect adversarial round-7): without this gate registration,
 // the gate only covered same-swap-group peers via
 // swapGroupMembersForColdLoad. Cross-group contenders slept/stopped by
 // evictCrossGroupGPUContendersLocked inside the cold-load window were
@@ -487,14 +505,14 @@ func (s *Scheduler) swapGroupMembersForColdLoad(target, swapGroup string) []stri
 // from drainInstance, and wedge until the cold-load completed.
 //
 // FIX (pinned-non-swap-group peers dead-locked): the previous
-// implementation pre-registered EVERY admission-tracked peer with GPU
+// implementation registered EVERY admission-tracked peer with GPU
 // overlap, including peers that the eviction filter (pickVictims at
 // admission.go:1219+) refuses to evict — namely pinned-without-
 // swap-group peers (e.g. Qwen3.6-27B / Sparx). Those peers were
 // never evicted by evictCrossGroupGPUContendersLocked, but they STILL
 // got marked as in-cold-load-eviction → every chat request to them
 // returned 503 for the full cold-load wall-clock (5-12 min), even
-// though nothing was actually happening to them. The pre-registration
+// though nothing was actually happening to them. The contender list
 // must mirror the eviction filter exactly:
 //   - Skip peers in non-evictable states (Stopped — holds no VRAM,
 //     won't be touched anyway; Starting/Stopping — transient, eviction
