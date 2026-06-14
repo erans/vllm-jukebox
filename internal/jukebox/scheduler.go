@@ -3,10 +3,12 @@ package jukebox
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vllm-jukebox/internal/config"
@@ -25,14 +27,145 @@ type Scheduler struct {
 	now      func() time.Time
 	new      InstanceFactory
 
+	// admission is the optional VRAM-budget-aware wake coordinator.
+	// nil = legacy behavior (jukebox calls /wake_up unmediated and
+	// any OOM surfaces as a 503 to the client). Set via SetAdmission
+	// after construction.
+	admission *AdmissionController
+
 	// sched is a semaphore (size 1) that serializes scheduling operations.
 	sched chan struct{}
 
 	mu        sync.RWMutex
 	instances map[string]*schedInstance // keyed by resolved model name
 	waiters   map[string]bool           // at most one waiter per resolved model
+	wakeOps   map[string]*wakeOp        // in-flight wake per resolved model (fan-out)
+
+	// coldLoadKicks tracks which models have an in-flight async
+	// cold-load goroutine kicked by KickColdLoad. Used purely to
+	// dedupe goroutine spawns (defense-in-depth — coldLoadStoppedMember
+	// also TOCTOU-rechecks inside the global cold-load lock, so even
+	// without this map only one cold-load would actually run). Cleared
+	// by the goroutine on exit. Guarded by mu.
+	coldLoadKicks map[string]bool
+
+	// coldLoadFailures records the most recent cold-load failure per
+	// model name, used by KickColdLoad to back off re-kicks within a
+	// short window. Without this, a member-container that exits(1) on
+	// startup (e.g. OOM at worker init) gets re-kicked instantly on
+	// every inbound request — each kick re-acquires the GPU-set
+	// cold-load lock and re-runs a doomed docker start. Live-observed
+	// blast radius (2026-06-09): an infinite OOM/retry loop on moe
+	// holding coldLoadMu so requests to the healthy pinned 27B
+	// (Sparx) blocked until they timed out.
+	//
+	// Semantics:
+	//   - Updated by the async cold-load goroutine on failure (after
+	//     NotifyStartFailed / drift-risk paths run, i.e. immediately
+	//     before returning the err).
+	//   - Cleared by the same goroutine on success.
+	//   - Force-cleared by RedeployMember on success — the operator's
+	//     explicit redeploy is the canonical "I am resolving this"
+	//     signal; leaving a stale failure entry would gate a future
+	//     request-triggered KickColdLoad on an ancient failure that
+	//     the operator just resolved.
+	//   - Force-cleared by coldLoadStoppedMemberLocked when a cold-load
+	//     failure rollback could NOT re-wake a pinned peer (admission
+	//     is in a known-inconsistent state; the cooldown's "don't
+	//     wedge the GPU-set lock" purpose doesn't apply, and the
+	//     operator's escape via /admin/redeploy-member or a retry must
+	//     not be blocked by the cooldown).
+	//   - Consulted by KickColdLoad: if the most recent failure is
+	//     within coldLoadFailureCooldown, the kick is suppressed
+	//     (the model stays admissionStopped; a future request after
+	//     the cooldown will re-attempt). This is a per-model cooldown,
+	//     NOT a hard retry cap — once the cooldown expires the next
+	//     kick fires unconditionally. Operators can force-recover via
+	//     /admin/redeploy-member which both bypasses the gate AND
+	//     clears any prior failure record for the redeployed model.
+	//
+	// Guarded by mu.
+	coldLoadFailures map[string]coldLoadFailureRecord
+
+	// coldLoadEvictionMu + coldLoadEviction track models that are
+	// currently mid-eviction as part of an in-flight peer cold-load.
+	// Populated synchronously at coldLoadStoppedMember's WithColdLoadLock
+	// entry (target + every potential peer in the same swap group),
+	// cleared on exit. The handler-side fast-fail gate consults this map
+	// via IsInColdLoadEviction to close the gap between "cold-load
+	// started" and "admission state flipped" — a gap observed live
+	// 2026-06-10 as a 600s hang because admission state remained
+	// admissionAwake throughout sleepInstance's StateReady → Stopping →
+	// Sleeping walk, so the IsModelColdLoading gate (which checks for
+	// admissionStopped) missed the request and it blocked downstream on
+	// coldLoadMu inside performWake. See router.ColdLoadAware docstring.
+	//
+	// Mutex is separate from `mu` (the scheduler's main lock) because
+	// the hot path (handler-side IsInColdLoadEviction) takes RLock once
+	// per request and we don't want it to contend with scheduler
+	// state writes. Read-mostly; writes only fire on cold-load entry +
+	// exit (rare relative to request rate).
+	coldLoadEvictionMu sync.RWMutex
+	coldLoadEviction   map[string]struct{}
+
+	// bootEpoch records the wall-clock time at which this Scheduler
+	// instance was constructed. Used by the startup-adoption path in
+	// external_start.go: if a managed peer container's docker.StartedAt
+	// is BEFORE this timestamp, the container was already running when
+	// JUKEBOX itself restarted — so the running peer is NOT an external
+	// start (the operator didn't `docker start` it on a live jukebox; it
+	// was simply alive across the jukebox bounce). We ADOPT it instead
+	// of SIGKILLing.
+	//
+	// Without this field, every jukebox restart cascade-killed the
+	// already-running vllm-* peers (admission reseeded their state from
+	// the /is_sleeping probe to StateSleeping, then external-start
+	// monitor's "Sleeping + docker-running = external start" rule
+	// SIGKILLed them; observed 3x in 30 minutes 2026-06-14 during
+	// deploy churn).
+	//
+	// Set in NewSchedulerWithFactory (= process boot time for the
+	// scheduler). Never mutated after construction. Compared against
+	// containerState.StartedAt parsed via time.Parse(time.RFC3339Nano).
+	bootEpoch time.Time
 
 	total inflight.Tracker
+
+	// cb is the jukebox-native circuit breaker. Nil when the breaker is
+	// disabled in config or hasn't been wired in yet. See circuit_breaker.go.
+	cb *CircuitBreaker
+}
+
+// coldLoadFailureRecord captures the last cold-load failure for a model
+// so KickColdLoad can suppress immediate re-kicks. Stored by value in
+// the coldLoadFailures map.
+type coldLoadFailureRecord struct {
+	at  time.Time
+	err string
+}
+
+// coldLoadFailureCooldown is the minimum gap between an async cold-load
+// failure and the next eligible re-kick for the same model. Set to 30s
+// to balance two requirements:
+//   - Long enough to prevent a doomed cold-load (e.g. OOM at worker
+//     init) from re-firing on every inbound request, which would wedge
+//     the GPU-set lock and starve healthy peers.
+//   - Short enough that a TRANSIENT failure (docker daemon hiccup,
+//     transient network blip) recovers within an operator-acceptable
+//     window without manual intervention.
+//
+// Test-overridable via SetColdLoadFailureCooldownForTest (see
+// sleep_export_test.go).
+var coldLoadFailureCooldown atomic.Int64
+
+func init() {
+	coldLoadFailureCooldown.Store(int64(30 * time.Second))
+}
+
+// coldLoadFailureCooldownDuration returns the current cooldown as a
+// time.Duration, masking the atomic.Int64-of-nanoseconds storage shape.
+func coldLoadFailureCooldownDuration() time.Duration {
+	return time.Duration(coldLoadFailureCooldown.Load())
 }
 
 type schedInstance struct {
@@ -44,6 +177,13 @@ type schedInstance struct {
 	draining   bool
 	startedAt  time.Time
 	lastUsedAt time.Time
+	// lastWakeAt records the wall-clock time of the most recent
+	// successful /wake_up + /health-ready transition. Consumed by the
+	// post-wake settle barrier in sleepInstance — defense against
+	// vllm-project/vllm#45519 (/wake_up returns 200 before PP workers
+	// settle; a /sleep landing inside the settle window wedges the
+	// engine). Zero value means "never woken" — the gate is a no-op.
+	lastWakeAt time.Time
 
 	state    State
 	mgr      InstanceManager
@@ -74,20 +214,50 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		}
 	}
 	s := &Scheduler{
-		cfg:       cfg,
-		inv:       inv,
-		ports:     portPool,
-		powerMgr:  powerMgr,
-		now:       now,
-		new:       factory,
-		sched:     make(chan struct{}, 1),
-		instances: map[string]*schedInstance{},
-		waiters:   map[string]bool{},
+		cfg:           cfg,
+		inv:           inv,
+		ports:         portPool,
+		powerMgr:      powerMgr,
+		now:           now,
+		new:           factory,
+		sched:         make(chan struct{}, 1),
+		instances:     map[string]*schedInstance{},
+		waiters:       map[string]bool{},
+		wakeOps:       map[string]*wakeOp{},
+		coldLoadKicks:    map[string]bool{},
+		coldLoadFailures: map[string]coldLoadFailureRecord{},
+		bootEpoch:        now(),
 	}
 	s.total.OnChange = func(count int64) {
 		metrics.InFlightRequests.Set(float64(count))
 	}
 	return s
+}
+
+// OnConfigReloaded is wired into the active.yaml hot-reload observer
+// (main.go's config.Watch callback). It propagates the new config
+// view to subsystems that hold per-construction caches the fsnotify
+// atomic pointer swap alone cannot reach — today that is exclusively
+// the AdmissionController's per-model state map.
+//
+// Most per-model fields (cold_load_timeout, evict_action, pinned,
+// swap_group, ...) are read via liveModelCfg() at decision time and
+// pick up changes automatically; only the AdmissionController carries
+// a pre-built per-model record that must be reconciled when the
+// operator adds/removes a model or flips its pinned/group membership.
+//
+// Safe to call concurrently with admission decisions; the controller
+// re-acquires its own mutex.
+func (s *Scheduler) OnConfigReloaded(cfg *config.Config) {
+	if s == nil || cfg == nil {
+		return
+	}
+	s.mu.RLock()
+	a := s.admission
+	s.mu.RUnlock()
+	if a != nil {
+		a.RefreshConfig(cfg)
+	}
 }
 
 func (s *Scheduler) Status() Status {
@@ -125,16 +295,39 @@ func (s *Scheduler) Status() Status {
 	busy := len(s.sched) == cap(s.sched) // held if channel full
 
 	accepting := false
+	anySleeping := false
+	anyStopped := false
 	for _, inst := range s.instances {
 		if inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
 			accepting = true
 			break
+		}
+		if inst.state == StateSleeping {
+			anySleeping = true
+		}
+		if inst.state == StateStopped {
+			anyStopped = true
 		}
 	}
 
 	state := StateIdle
 	if accepting {
 		state = StateReady
+	} else if anySleeping {
+		// Slept instances can be woken on demand, so jukebox is still
+		// effectively accepting work — just at higher latency for the
+		// first request. Report StateSleeping rather than StateIdle so
+		// /health and metrics make this state visible.
+		state = StateSleeping
+	} else if anyStopped {
+		// Stopped instances are warm-on-demand via the async-503 +
+		// KickColdLoad cold-load path (~5min). Report StateStopped so
+		// /health and /status promote accepting_requests=true (the LB
+		// should keep routing traffic so the cold-load recovery loop
+		// can complete on a real consumer request — draining traffic
+		// here would cut off the recovery loop). Mirrors the StateSleeping
+		// branch above for the warm-on-demand category.
+		state = StateStopped
 	} else if busy {
 		state = StateStarting
 	}
@@ -171,13 +364,70 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 		return Route{}, fmt.Errorf("scheduler not configured")
 	}
 
-	resolvedName, modelCfg, err := s.cfg.ResolveModel(requestedModel)
+	resolvedName, modelCfg, err := liveResolveModel(s.cfg, requestedModel)
 	if err != nil {
 		return Route{}, err
 	}
 
+	// ComfyUI readiness gate (T4 502 RCA, fix/comfyui-always-probe-readiness).
+	//
+	// ComfyUIManager.IsSleeping reports an in-memory flag — there is no
+	// /is_sleeping endpoint to authoritatively probe. If ComfyUI was
+	// started/restarted/recreated outside jukebox's view (cron restart,
+	// `docker start` by an operator, container recreation), the manager
+	// believes sleeping=false even though :8188 may not be bound yet
+	// (ComfyUI plugin warm-up runs ~63s post-container-start before
+	// Fiber binds the port). The downstream OpenAI-shape image-gen
+	// handler then opens a TCP connection against an unbound port and
+	// the client sees `connect: refused` surfaced as 502.
+	//
+	// Fix: ALWAYS probe /system_stats for LifecycleComfyUI peers on
+	// every AcquireRoute, decoupled from the in-memory sleep flag. The
+	// probe is bounded by `comfyUIReadyProbeBudget` and ticks at the
+	// internal 100ms cadence inside ComfyUIManager.VerifyReady. On
+	// budget exhaustion we surface a 503 (RejectColdLoading) — honest
+	// "model still loading", not 502 "upstream unreachable".
+	if modelCfg.EffectiveLifecycle() == config.LifecycleComfyUI {
+		s.mu.RLock()
+		inst := s.instances[resolvedName]
+		s.mu.RUnlock()
+		if inst != nil && inst.mgr != nil {
+			probeCtx, cancel := context.WithTimeout(ctx, comfyUIReadyProbeBudget)
+			probeErr := inst.mgr.VerifyReady(probeCtx, resolvedName)
+			cancel()
+			if probeErr != nil {
+				slog.Warn("comfyui_readiness_probe_failed",
+					"model", resolvedName,
+					"url", inst.mgr.BaseURL(),
+					"budget_s", comfyUIReadyProbeBudget.Seconds(),
+					"err", probeErr.Error(),
+				)
+				metrics.ScheduleRejectionsTotal.WithLabelValues(string(RejectColdLoading)).Inc()
+				return Route{}, &RejectError{
+					Reason:     RejectColdLoading,
+					RetryAfter: 5 * time.Second,
+					Message:    fmt.Sprintf("comfyui readiness probe timed out for %q: %v", resolvedName, probeErr),
+				}
+			}
+		}
+	}
+
 	if route, ok := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); ok {
 		return route, nil
+	}
+
+	// Sleep-mode fast path: if there's already a slept instance for this
+	// model, wake it rather than building a new one. Multiple concurrent
+	// requests share a single wakeOp — none get 503'd during wake.
+	if route, handled, err := s.tryRouteFromSleep(ctx, resolvedName, modelCfg); handled {
+		if err != nil {
+			return Route{}, err
+		}
+		if route.BaseURL != "" {
+			return route, nil
+		}
+		// Wake "handled" the path but instance state shifted (e.g. auto-suspend
+		// re-slept it). Fall through to full scheduling.
 	}
 
 	// Scheduling required.
@@ -328,6 +578,82 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 	}
 
 	now := s.now()
+
+	// 2026-06-10 (B-6-rev): drift-recovery probe.
+	//
+	// External sleep-capable instances can transition Ready -> Sleeping
+	// out-of-band — manual /sleep, container restart, or a wake-then-
+	// sleep cycle that completes between checkIdle ticks while the
+	// scheduler is busy with main's heavy load. There is no periodic
+	// /is_sleeping reconcile loop, so jukebox's bookkeeping can drift.
+	//
+	// If we route to a Ready-by-bookkeeping instance that is actually
+	// sleeping, ForwardFiber POSTs to a sleeping vLLM. /v1/chat/completions
+	// auto-wakes there, but /v1/rerank and /v1/embeddings DO NOT — the
+	// server hangs ~60s, the client retries 3x, observed wall-clock 180s
+	// (Phase B-3 live evidence 2026-06-10: rerank to L1-slept reranker
+	// while main concurrent-busy hung 180s; manual /wake_up succeeded in
+	// 226 ms; manual /v1/rerank to woken reranker succeeded in 57 ms).
+	//
+	// Probe budget:
+	//   - lastUsedAt > 30s stale -> only fire when there's been a
+	//     meaningful gap; fresh hot-path requests skip the probe entirely
+	//     (zero added latency under request bursts).
+	//   - 500ms timeout caps worst-case added latency when the probe
+	//     itself is unreachable (we ignore the error and proceed with
+	//     the Ready route — no worse than today's behaviour).
+	//
+	// On confirmed sleep we flip state to StateSleeping and return
+	// (_, false) so the caller (AcquireRoute) falls through to
+	// tryRouteFromSleep, which performs the wake.
+	// Round-2 instrumentation: log probe entry/exit so the handler-side
+	// trace can confirm the path actually fires under repro conditions.
+	staleness := now.Sub(inst.lastUsedAt)
+	sc, scOk := inst.mgr.(SleepCapable)
+	if scOk && staleness > 30*time.Second {
+		slog.Info("drift_probe_entry",
+			"model", resolvedModelName,
+			"staleness_ms", staleness.Milliseconds(),
+		)
+		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		sleeping, perr := sc.IsSleeping(probeCtx)
+		cancel()
+		if perr != nil {
+			slog.Info("drift_probe_error",
+				"model", resolvedModelName,
+				"err", perr.Error(),
+			)
+		} else {
+			slog.Info("drift_probe_result",
+				"model", resolvedModelName,
+				"sleeping", sleeping,
+			)
+		}
+		if perr == nil && sleeping {
+			s.mu.Lock()
+			// Re-check under lock to avoid racing with a concurrent
+			// state transition (NotifyStarted, NotifySleep, etc).
+			if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady {
+				inst.state = StateSleeping
+				slog.Info("drift_probe_flipped_to_sleeping",
+					"model", resolvedModelName,
+				)
+			}
+			s.mu.Unlock()
+			return Route{}, false
+		}
+		// Probe error or sleeping==false -> proceed with Ready route.
+	} else if scOk {
+		// Not stale enough — skip probe, go directly to Ready route.
+	} else {
+		// Manager doesn't implement SleepCapable — log once-per-instance
+		// would be ideal but a per-request log is fine because this is
+		// the unexpected path (every external/sleep-mode manager should
+		// satisfy SleepCapable).
+		slog.Debug("drift_probe_skipped_not_sleepcapable",
+			"model", resolvedModelName,
+		)
+	}
 	s.mu.Lock()
 	// Re-check under lock.
 	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
@@ -534,6 +860,55 @@ func (s *Scheduler) evictConflicts(ctx context.Context, targetGPUs []int) error 
 func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstance, evicted bool) error {
 	if inst == nil {
 		return nil
+	}
+
+	// Sleep-mode branch: if the model opts into sleep, try to sleep
+	// instead of stopping. On success, KEEP the instance in the map
+	// (port, power limits, GPU allocation all retained — wake will
+	// restore the instance without re-scheduling). On failure, fall
+	// through to the hard-stop path.
+	modelCfg, modelOk := liveModelCfg(s.cfg, inst.model)
+	if modelOk {
+		// Pinned + non-evicted = graceful shutdown of a model the operator
+		// declared as always-on. Leave it alone. Without this guard,
+		// StopAll (called when jukebox SIGTERMs) would sleep every pinned
+		// instance, leaving them asleep across an unrelated jukebox
+		// restart — operationally surprising and adds a wake latency
+		// hit to the next request that should not have happened.
+		// Eviction is different: an explicit decision to free GPU memory.
+		if inst.pinned && !evicted {
+			slog.Info("skip sleep on shutdown for pinned instance",
+				"model", inst.model,
+				"hint", "pinned models stay awake across jukebox restarts; explicit eviction still slept",
+			)
+			return nil
+		}
+		// External-lifecycle instances are never hard-stopped by jukebox.
+		if modelCfg.EffectiveLifecycle() == config.LifecycleExternal {
+			if modelCfg.SleepMode {
+				reason := "evict"
+				if !evicted {
+					reason = "manual"
+				}
+				return s.sleepInstance(ctx, inst, modelCfg.EffectiveSleepLevel(), reason)
+			}
+			slog.Warn("cannot drain external instance without sleep_mode (no-op)",
+				"model", inst.model,
+				"hint", "set sleep_mode: true to enable jukebox eviction of external instances",
+			)
+			return nil
+		}
+		// Managed-lifecycle with sleep_mode: try sleep first, fall back to stop.
+		if modelCfg.SleepMode {
+			reason := "evict"
+			if !evicted {
+				reason = "manual"
+			}
+			if err := s.sleepInstance(ctx, inst, modelCfg.EffectiveSleepLevel(), reason); err == nil {
+				return nil
+			}
+			slog.Warn("sleep failed; falling back to hard stop", "model", inst.model)
+		}
 	}
 
 	s.mu.Lock()

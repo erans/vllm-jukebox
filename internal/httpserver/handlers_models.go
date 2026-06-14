@@ -12,7 +12,11 @@ import (
 func listModelsHandler(cfg *config.Config) fiber.Handler {
 	created := time.Now().Unix()
 	return func(c *fiber.Ctx) error {
-		if cfg == nil {
+		live := config.Current()
+		if live == nil {
+			live = cfg
+		}
+		if live == nil {
 			return c.Status(500).JSON(fiber.Map{
 				"error": fiber.Map{
 					"message": "server not configured",
@@ -22,8 +26,8 @@ func listModelsHandler(cfg *config.Config) fiber.Handler {
 			})
 		}
 
-		names := make([]string, 0, len(cfg.Models))
-		for name := range cfg.Models {
+		names := make([]string, 0, len(live.Models))
+		for name := range live.Models {
 			names = append(names, name)
 		}
 		sort.Strings(names)
