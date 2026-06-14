@@ -272,6 +272,12 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 			msg = "Insufficient GPU resources (min uptime), please retry"
 		case jukebox.RejectUpstreamUnreachable:
 			msg = "Upstream model server is unreachable (TCP probe failing); please retry"
+		case jukebox.RejectConcurrencyLimit:
+			// PREVENTION half of vllm#45094: the model is at its
+			// max_concurrent_requests cap. Retryable — a freed slot
+			// admits the request. Retry-After is set above from
+			// rej.RetryAfter (2s).
+			msg = "Model is at its concurrency limit; please retry"
 		}
 		return writeOpenAIError(c, http.StatusServiceUnavailable, msg, "service_unavailable", "model_switching")
 	}

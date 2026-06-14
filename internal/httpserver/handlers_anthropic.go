@@ -148,6 +148,8 @@ func mapAnthropicError(c *fiber.Ctx, err error) error {
 			msg = "insufficient capacity to start requested model, please retry"
 		case jukebox.RejectMinUptime:
 			msg = "insufficient GPU resources (min uptime), please retry"
+		case jukebox.RejectConcurrencyLimit:
+			msg = "model is at its concurrency limit, please retry"
 		}
 		return writeAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", msg)
 	}

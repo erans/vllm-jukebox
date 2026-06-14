@@ -2548,8 +2548,8 @@ func (s *Scheduler) tryRouteFromSleep(ctx context.Context, resolvedName string, 
 				return Route{}, true, mapWakeError(op.err)
 			}
 			// Retry fast path now that wake is done.
-			if route, ok := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); ok {
-				return route, true, nil
+			if route, handled, rerr := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); handled {
+				return route, true, rerr
 			}
 			// Lost the race (e.g. auto-suspend slept it again immediately).
 			return Route{}, false, nil
@@ -2576,8 +2576,8 @@ func (s *Scheduler) tryRouteFromSleep(ctx context.Context, resolvedName string, 
 	if op.err != nil {
 		return Route{}, true, mapWakeError(op.err)
 	}
-	if route, ok := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); ok {
-		return route, true, nil
+	if route, handled, rerr := s.tryRouteReady(ctx, resolvedName, modelCfg.Path); handled {
+		return route, true, rerr
 	}
 	return Route{}, false, nil
 }

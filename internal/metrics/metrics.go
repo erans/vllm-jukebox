@@ -493,8 +493,26 @@ var (
 		[]string{"model", "outcome"},
 	)
 
-	// GPUResidualMB exposes per-GPU L1-sleep residual VRAM from
-	// admission bookkeeping.
+	// DecodeStallsTotal counts decode-stall probe outcomes per model,
+	// labeled by outcome:
+	//   - "tripped"        — the probe observed a sustained /health/decode
+	//                        stall (non-200 for >=2 intervals with in-flight
+	//                        > 0) and fired the circuit-breaker docker
+	//                        restart. DETECTION+RECOVERY half of vllm#45094.
+	//   - "endpoint_absent"— /health/decode 404'd or connection-refused;
+	//                        the probe graceful-degrades and SKIPS (never
+	//                        trips on a missing endpoint).
+	//   - "transient"      — a single non-200 that did NOT persist the
+	//                        sustained window (cleared before the 2nd
+	//                        interval); no trip. Useful to distinguish an
+	//                        honest long prefill from a real wedge.
+	DecodeStallsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jukebox_decode_stalls_total",
+			Help: "Decode-stall probe (/health/decode) outcomes per model+outcome (tripped/endpoint_absent/transient). Detects the vllm#45094 PP cudagraph split-brain wedge that plain /health misses.",
+		},
+		[]string{"model", "outcome"},
+	)
 	GPUResidualMB = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "jukebox_gpu_residual_mb",
@@ -614,6 +632,7 @@ func init() {
 		ContentRoutingEstTokensHistogram,
 		CircuitBreakerObservedTotal,
 		CircuitBreakerTripsTotal,
+		DecodeStallsTotal,
 		GPUResidualMB,
 		PredictiveWarmsTotal,
 		PredictedProbability,

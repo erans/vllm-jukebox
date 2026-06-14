@@ -121,6 +121,16 @@ const (
 	// explicitly disable the probe (caller takes the phantom-wake risk;
 	// recommended only for non-cumem-sleep models).
 	DefaultWakeVerifyTimeout = 5 * time.Second
+	// DefaultDecodeProbeInterval is the cadence applied when a decode
+	// probe is constructed without an explicit interval. Callers treat 0
+	// as "disabled" and only fall back to this when they have a reason to
+	// run the probe. 30s is deliberate: PR vllm#45097's /health/decode
+	// has a known long-prefill false-positive caveat, and the probe also
+	// requires the stall to persist across >=2 intervals before tripping,
+	// so 30s × 2 = ~60s detection latency clears honest long prefills
+	// while still catching a real #45094 wedge promptly. See
+	// BehaviorConfig.DecodeProbeInterval for the full rationale.
+	DefaultDecodeProbeInterval = 30 * time.Second
 )
 
 // Priority controls how the admission controller picks eviction victims.
@@ -359,6 +369,34 @@ type BehaviorConfig struct {
 	// the external sidecar that polls proxy access logs. Default
 	// disabled; opt in via behavior.circuit_breaker.enabled = true.
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+
+	// DecodeProbeInterval is the cadence of the background /health/decode
+	// decode-stall probe (DETECTION + RECOVERY half of the
+	// vllm-project/vllm#45094 fix). When > 0, jukebox periodically GETs
+	// <baseURL>/health/decode on each external-lifecycle instance that is
+	// StateReady with a live PID; a sustained non-200 response indicates
+	// the engine is wedged (the #45094 PP-split-brain manifests as
+	// Running>0 with 0 decode progress, which plain /health misses because
+	// the FastAPI process stays alive and keeps answering 200). On a
+	// sustained stall the probe marks the instance draining and fires the
+	// circuit breaker's docker-restart path.
+	//
+	// 0 (the default) DISABLES the probe entirely — zero behavior change,
+	// so deploying an image carrying this field is a no-op until an
+	// operator opts in.
+	//
+	// Default-when-enabled is 30s (DefaultDecodeProbeInterval), NOT 15s:
+	// PR vllm#45097 (/health/decode) has a documented long-prefill
+	// false-positive caveat (a legitimately long prefill can show as
+	// no-decode-progress for several seconds), and the probe additionally
+	// requires the stall to persist across >=2 intervals before tripping.
+	// 30s × 2 intervals comfortably clears the longest observed honest
+	// prefill while still catching a real wedge within ~1 minute.
+	//
+	// If the upstream lacks /health/decode (older vLLM returns 404, or the
+	// socket connection-refuses), the probe graceful-degrades: it
+	// debug-logs and SKIPS — it never trips on a missing endpoint.
+	DecodeProbeInterval Duration `yaml:"decode_probe_interval"`
 }
 
 // CircuitBreakerConfig configures the jukebox-native circuit breaker.
@@ -609,6 +647,42 @@ type ModelConfig struct {
 	// PredictiveColdLoad opts this model into traffic-histogram-driven
 	// pre-warming. Default: disabled (zero behavior change).
 	PredictiveColdLoad PredictiveColdLoadConfig `yaml:"predictive_cold_load,omitempty"`
+
+	// MaxConcurrentRequests caps how many requests jukebox will allow
+	// in-flight against this model's instance at once. When > 0, the
+	// proxy-dispatch admission point refuses a request that would push
+	// the instance's in-flight count above the cap, returning a 503 +
+	// Retry-After (RejectConcurrencyLimit). When 0 (the default) the cap
+	// is disabled and concurrency is unbounded — byte-for-byte legacy
+	// behavior, so deploying an image carrying this field is a no-op
+	// until an operator sets a positive value.
+	//
+	// PREVENTION half of the vllm-project/vllm#45094 fix. That issue is a
+	// pipeline-parallel cudagraph-vs-eager dispatch split-brain: when too
+	// many long-decode requests are admitted into a single engine step,
+	// the admitted batch shape crosses a cudagraph-bucket boundary that
+	// PP stage 0 and PP stage 1 disagree on (one replays a captured graph
+	// with baked-in P2P send/recv shapes, the other runs eager), and the
+	// cross-stage pipeline P2P never rendezvous — all GPUs pin at 100%
+	// util @ 0 tok/s forever while /health keeps lying 200. py-spy-proven
+	// 2026-06-14: 7 concurrent @ 512 tok drained cleanly; 12 concurrent @
+	// 1500 tok wedged on the first wave, deterministically. Bounding the
+	// admitted concurrency keeps the engine below the batch-shape
+	// threshold that triggers the divergence.
+	//
+	// The cap is per-MODEL (matched against the live in-flight count on
+	// the routed instance), hot-reloadable via the active.yaml fsnotify
+	// watcher (read at dispatch time through liveModelCfg), and
+	// independent of admission-control VRAM tracking — a model with no
+	// expected_vram_mb_per_gpu can still carry a concurrency cap.
+	//
+	// Operator guidance (measured on the TP2×PP2 Qwen3.6-27B stack that
+	// reproduced #45094): 7 concurrent @ 512-tok decode is safe; 12 @
+	// 1500-tok wedges. A cap of ~8 leaves headroom under the observed
+	// wedge threshold. The right value is workload-specific (it scales
+	// with max_tokens / decode length, not just request count) — leave
+	// this 0 and tune empirically per stack.
+	MaxConcurrentRequests int `yaml:"max_concurrent_requests,omitempty"`
 }
 
 func Load(data []byte) (*Config, error) {
@@ -838,6 +912,15 @@ func (c *Config) Validate() error {
 //     while awake)
 func (c *Config) validateAdmission() error {
 	for name, model := range c.Models {
+		// max_concurrent_requests is independent of admission VRAM
+		// tracking (a model with no expected_vram_mb_per_gpu can still
+		// carry a cap), so validate it here for every model regardless of
+		// AdmissionEnabled(). 0 = disabled (default); negatives are an
+		// obvious config bug.
+		if model.MaxConcurrentRequests < 0 {
+			return fmt.Errorf("model %q: max_concurrent_requests must be >= 0 (0 = unlimited); got %d", name, model.MaxConcurrentRequests)
+		}
+
 		switch model.Priority {
 		case "", PriorityCritical, PriorityNormal, PriorityBestEffort:
 			// ok
@@ -1500,6 +1583,28 @@ func (m ModelConfig) EffectiveExpectedVRAMMB(gpu int) int {
 		return v
 	}
 	return m.ExpectedVRAMMBPerGPU
+}
+
+// EffectiveMaxConcurrentRequests returns the configured per-model
+// in-flight concurrency cap. 0 means "unlimited" (the cap is disabled);
+// any positive value is the hard ceiling enforced at the proxy-dispatch
+// admission point. PREVENTION half of vllm#45094. Hot-reloadable.
+func (m ModelConfig) EffectiveMaxConcurrentRequests() int {
+	if m.MaxConcurrentRequests < 0 {
+		return 0
+	}
+	return m.MaxConcurrentRequests
+}
+
+// EffectiveDecodeProbeInterval returns the configured
+// behavior.decode_probe_interval. 0 means "disabled" — callers must not
+// launch the probe. Any positive value is the probe cadence. DETECTION
+// half of vllm#45094.
+func (b BehaviorConfig) EffectiveDecodeProbeInterval() time.Duration {
+	if b.DecodeProbeInterval.Duration <= 0 {
+		return 0
+	}
+	return b.DecodeProbeInterval.Duration
 }
 
 // AdmissionEnabled at the config level reports whether ANY model has
