@@ -2,12 +2,43 @@ package gpu
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+// ErrBinaryNotFound is returned by NvidiaSMIInventory.List when the
+// nvidia-smi binary itself is missing from the environment (e.g. the
+// jukebox container has no GPU userspace installed). Callers should treat
+// this as "GPUs are not introspectable here" and degrade gracefully —
+// hard-failing startup makes the container crash-loop on hosts that
+// intentionally run jukebox without nvidia-smi (CPU-only routing,
+// scheduler-mode with all lifecycle:external members, etc.).
+var ErrBinaryNotFound = errors.New("nvidia-smi binary not found")
+
+// IsBinaryNotFound reports whether err indicates the nvidia-smi binary
+// (or whatever was configured as the inventory binary) does not exist on
+// PATH or at the configured path. Wraps both exec.ErrNotFound (PATH
+// lookup) and fs.ErrNotExist (absolute path that doesn't exist).
+func IsBinaryNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrBinaryNotFound) {
+		return true
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return false
+}
 
 type GPU struct {
 	Index   int
@@ -71,6 +102,12 @@ func (n NvidiaSMIInventory) List(ctx context.Context) ([]GPU, error) {
 	)
 	b, err := cmd.Output()
 	if err != nil {
+		// Normalize "binary missing" into a sentinel callers can match
+		// with errors.Is(err, gpu.ErrBinaryNotFound) — keep the original
+		// error in the chain for diagnostics.
+		if IsBinaryNotFound(err) {
+			return nil, fmt.Errorf("%w: %v", ErrBinaryNotFound, err)
+		}
 		return nil, err
 	}
 	return ParseInventoryCSV(string(b))

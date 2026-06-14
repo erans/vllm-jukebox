@@ -157,6 +157,122 @@ models:
     pinned: true
 ```
 
+### Sleep mode (vLLM 0.22+)
+
+For models marked `sleep_mode: true`, jukebox uses vLLM's sleep/wake API in place of full process stop/start when the instance is evicted or auto-suspended. Wake from L1 sleep is ~5-15s vs ~30-100s for a cold start — and in practice on a small embedding model with weights resident, **as fast as ~200ms** (CPU↔GPU transfer, no model reload).
+
+**What L1 sleep does** (verified on a 4× RTX 3090 host running vLLM with PR #32947 + PR #44778 applied):
+
+| L1 sleep | Behavior |
+|---|---|
+| Weights → CPU RAM | ✓ |
+| KV cache discarded | ✓ |
+| Wake is fast (no disk reload) | ✓ |
+| **GPU VRAM actually freed** | ✓ — measured ~18-19 GiB freed per GPU on a 27B AWQ model with TP=2 PP=2 |
+
+The earlier worry that "L1 keeps cumem reservation" applied to vLLM versions BEFORE PR #32947 (merged Feb 2026) where a `pool_ctx and model_ctx` typo prevented the CuMemAllocator from capturing weight allocations. With #32947 applied, the allocator releases on sleep and reclaims on wake. Verify your vLLM image has it before relying on real VRAM reclaim — see `scripts/check-vllm-sleep.sh`.
+
+`sleep_level: 2` is the heavier option (discards weights entirely; wake reloads from disk). Use it only when CPU RAM is constrained.
+
+Requirements:
+- vLLM 0.22+ (the sleep API)
+- `runtime: vllm` (llama.cpp does not have an equivalent)
+- For `lifecycle: managed` models, jukebox automatically launches vLLM with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1`. For `lifecycle: external` models, the operator must include both in their own command line / env.
+
+```yaml
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8199
+
+models:
+  big:
+    path: "/models/Big-Model"
+    gpus: [0, 1, 2, 3]
+    min_free_mem_mb_per_gpu: 40000
+    pinned: true                  # never auto-sleep
+    sleep_mode: true              # use sleep instead of stop on eviction (n/a when pinned)
+
+  bursty-embeddings:
+    path: "BAAI/bge-m3"
+    runner: pooling               # passes --task embed to vLLM
+    gpus: [1]
+    min_free_mem_mb_per_gpu: 4000
+    sleep_mode: true
+    sleep_level: 1                # 1 = L1 (weights → CPU RAM, fastest wake)
+    wake_timeout: 30s             # max wait for /health=200 after /wake_up
+    idle_timeout: 600s            # auto-sleep after 10 min idle
+```
+
+### Lifecycle: external (jukebox doesn't own the process)
+
+For setups where vLLM runs as a separate container (or systemd service, or whatever — anything jukebox didn't start), declare `lifecycle: external` and point jukebox at its hostname + port. Jukebox proxies requests and, with `sleep_mode: true`, drives sleep/wake — but never starts or stops the process.
+
+```yaml
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8199
+
+models:
+  vllm-main:
+    lifecycle: external
+    host: "vllm-main"             # docker-compose service name, DNS hostname, or IP
+    port: 8000
+    gpus: [0, 1, 2, 3]            # informational only — jukebox does not allocate
+    min_free_mem_mb_per_gpu: 40000
+    pinned: true
+
+  vllm-embeddings:
+    lifecycle: external
+    host: "vllm-embeddings"
+    port: 8000
+    gpus: [1]
+    min_free_mem_mb_per_gpu: 4000
+    sleep_mode: true
+    idle_timeout: 600s
+```
+
+The external vLLM service must include `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1` in its launch arguments / environment for sleep-mode operations to function.
+
+### NVLink topology hints (optional)
+
+If you declare your host's NVLink-bonded GPU pairs, jukebox warns at startup when a multi-GPU model's `gpus` layout would force tensor-parallel collective ops across a non-NVLink hop:
+
+```yaml
+scheduler:
+  nvlink_pairs:
+    - [0, 3]                      # GPU0 ↔ GPU3 NVLink-bonded
+    - [1, 2]                      # GPU1 ↔ GPU2 NVLink-bonded
+```
+
+Models with 2 GPUs whose pair isn't in `nvlink_pairs`, or 4-GPU models that don't span exactly two configured pairs, get a structured warning. Single-GPU models and unusual sizes are ignored. Validation is purely opt-in — leave `nvlink_pairs` unset to disable.
+
+### Model config reference
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | Yes* | Model path or HuggingFace ID. Optional when `lifecycle: external`. |
+| `runtime` | enum | No | `vllm` (default) or `llama_cpp`. |
+| `runner` | enum | No | `generate` (default) or `pooling` (vLLM `--task embed`). vLLM-only. |
+| `alias` | string | No | Point this name at another model. Incompatible with `lifecycle: external`. |
+| `gpus` | []int | Yes** | Exact GPU IDs (informational for external lifecycle). |
+| `min_free_mem_mb_per_gpu` | int | Yes** | Placement guardrail (scheduler mode). |
+| `tensor_parallel_size` / `pipeline_parallel_size` | int | No | Standard vLLM TP/PP. |
+| `max_model_len`, `gpu_memory_utilization`, `dtype`, `quantization` | mixed | No | Passed to vLLM. |
+| `extra_args` | []string | No | Appended to the vLLM `serve` command. |
+| `env` | map | No | Per-model environment variables. |
+| `pinned` | bool | No | Never auto-evict or auto-sleep. |
+| `sleep_mode` | bool | No | Use sleep/wake instead of stop/start on eviction. vLLM-only. |
+| `sleep_level` | int | No | 1 (L1, weights→RAM, fast wake — default) or 2 (L2, discard all, slower). |
+| `wake_timeout` | duration | No | Max wait for `/health=200` after `/wake_up`. Default 120s. |
+| `idle_timeout` | duration | No | Auto-sleep after this much idle. 0 (default) = never. |
+| `lifecycle` | enum | No | `managed` (default — jukebox spawns) or `external` (operator-managed process). |
+| `host` | string | No*** | External service hostname. Defaults to `127.0.0.1`. |
+| `port` | int | Yes*** | External service port. |
+| `power_limit` / `power_limits` | int / map | No | Per-model `nvidia-smi -pl` overrides. |
+| `log_file` | string | No | Override the per-model vLLM log path. |
+
+\* Required unless `alias` or `lifecycle: external`. \*\* Required for non-alias models when `scheduler` is enabled. \*\*\* Required when `lifecycle: external`.
+
 Model naming rules:
 - Client-facing model names are the YAML keys under `models:`.
 - Aliases (`alias: other_name`) let you support multiple names for the same underlying model config.
