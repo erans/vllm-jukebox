@@ -101,6 +101,25 @@ const (
 	// per-model min_time_since_wake_seconds (0 = disable, only if you
 	// have a very strong reason — disabling re-opens the wedge race).
 	DefaultMinTimeSinceWake = 5 * time.Second
+	// DefaultWakeVerifyTimeout is the budget for the post-/wake_up
+	// verification probe — a single-token /v1/completions request issued
+	// AFTER /wake_up returns 200 and BEFORE jukebox routes the user
+	// request. Defends against the "phantom wake" failure mode where
+	// vLLM's cumem_tag wake returns 200 from the API server but one or
+	// more PP/TP workers have wedged on "CUDA Error: invalid argument
+	// at cumem_allocator.cpp:169"; /health continues to return 200
+	// (the FastAPI process is alive) but every subsequent inference
+	// request hangs forever waiting for the shm_broadcast block. The
+	// probe takes ~30-80ms on a healthy wake (one decode step at
+	// max_tokens:1, prefix-cache-defeating prompt) and hard-fails on
+	// a wedged engine inside this budget. 5s is short enough that the
+	// added wake latency is negligible relative to a hot wake (1-2s)
+	// and far below cold-load (5min); long enough to forgive a slow
+	// post-wake cudagraph re-replay on big-context models.
+	// Set per-model via wake_verify_timeout_ms; 0 = use default; -1 =
+	// explicitly disable the probe (caller takes the phantom-wake risk;
+	// recommended only for non-cumem-sleep models).
+	DefaultWakeVerifyTimeout = 5 * time.Second
 )
 
 // Priority controls how the admission controller picks eviction victims.
@@ -482,6 +501,14 @@ type ModelConfig struct {
 	// (5s, default-on). -1 = explicitly disable. Positive = explicit
 	// window. The asymmetry from WakeSettle (opt-in) is deliberate.
 	MinTimeSinceWakeSeconds int `yaml:"min_time_since_wake_seconds,omitempty"`
+	// WakeVerifyTimeoutMs is the budget (milliseconds) for the post-wake
+	// verification probe — a single-token /v1/completions issued after
+	// /wake_up returns 200 to confirm the engine isn't wedged in a
+	// "phantom wake" (cumem-allocator wedge where /health lies 200).
+	// 0 = use DefaultWakeVerifyTimeout (5s); -1 = disable the probe
+	// entirely (NOT recommended for cumem-sleep models — re-opens the
+	// phantom-wake hole). See DefaultWakeVerifyTimeout for rationale.
+	WakeVerifyTimeoutMs int `yaml:"wake_verify_timeout_ms,omitempty"`
 	// IdleTimeout: if > 0 and SleepMode is true and the model is not pinned,
 	// jukebox auto-sleeps the instance after this much idle time. 0 = never
 	// auto-suspend.
@@ -974,6 +1001,25 @@ func (c *Config) validateRuntimes() error {
 			return fmt.Errorf("model %q: min_time_since_wake_seconds must be >= -1 (-1 = disable; 0 = use default %s; positive = explicit window); got %d",
 				name, DefaultMinTimeSinceWake, model.MinTimeSinceWakeSeconds)
 		}
+		// WakeVerifyTimeoutMs: -1 = disable (operator opt-out of the
+		// phantom-wake probe), 0 = use default, positive = explicit
+		// budget. Reject < -1 as an obvious config bug; warn on
+		// suspiciously tiny budgets (< 500ms) — a healthy probe round
+		// trip on a cold-graph model can exceed 200ms and the entire
+		// budget covers both round-trip latency AND the actual decode
+		// step, so anything <500ms risks false-positive phantom
+		// detection on legitimately slow wakes.
+		if model.WakeVerifyTimeoutMs < -1 {
+			return fmt.Errorf("model %q: wake_verify_timeout_ms must be >= -1 (-1 = disable; 0 = use default %s; positive = explicit budget ms); got %d",
+				name, DefaultWakeVerifyTimeout, model.WakeVerifyTimeoutMs)
+		}
+		if model.WakeVerifyTimeoutMs > 0 && model.WakeVerifyTimeoutMs < 500 {
+			slog.Warn("config_wake_verify_timeout_unusually_small",
+				"model", name,
+				"value_ms", model.WakeVerifyTimeoutMs,
+				"note", "values <500ms risk false-positive phantom-wake detection on legitimately slow wakes; verify intentional",
+			)
+		}
 
 		// LifecycleExternal constraints
 		if model.Lifecycle == LifecycleExternal {
@@ -1271,6 +1317,21 @@ func (m ModelConfig) EffectiveWakeTimeout() time.Duration {
 		return DefaultWakeTimeout
 	}
 	return m.WakeTimeout.Duration
+}
+
+// EffectiveWakeVerifyTimeout returns the configured WakeVerifyTimeoutMs
+// as a Duration when explicitly set (>0), DefaultWakeVerifyTimeout when
+// unset (0), or 0 when explicitly disabled (-1). A return of 0 tells the
+// caller to SKIP the verification probe; any positive value is the
+// per-probe deadline.
+func (m ModelConfig) EffectiveWakeVerifyTimeout() time.Duration {
+	if m.WakeVerifyTimeoutMs < 0 {
+		return 0
+	}
+	if m.WakeVerifyTimeoutMs == 0 {
+		return DefaultWakeVerifyTimeout
+	}
+	return time.Duration(m.WakeVerifyTimeoutMs) * time.Millisecond
 }
 
 // EffectiveColdLoadTimeout returns the configured ColdLoadTimeoutSeconds,

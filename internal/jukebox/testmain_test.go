@@ -1,6 +1,7 @@
 package jukebox
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -21,10 +22,25 @@ import (
 // kind of bulk override is possible. Individual tests that want to
 // assert poll-tick behavior can use SetColdLoadPollIntervalForTest to
 // swap to a different value and defer-restore.
+//
+// Also installs a package-default no-op wake-verify probe. The
+// production default (vllmcli.VerifyWakeWithProbe POSTing
+// /v1/completions) would fire on every wake in every test, but most
+// jukebox unit tests either use fake instance managers (BaseURL=="",
+// probe self-skips) or use httptest servers that mock only the
+// /wake_up + /health endpoints (and would 404 the probe, causing
+// every wake test to false-positive as a phantom-wake). The no-op
+// keeps existing tests unaffected; phantom-wake tests opt INTO the
+// production behavior (or inject a deterministic probe) via
+// SetWakeVerifyProbeForTest.
 func TestMain(m *testing.M) {
 	old := coldLoadPollInterval.Load()
 	coldLoadPollInterval.Store(int64(10 * time.Millisecond))
+	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, _ string, _ time.Duration) error {
+		return nil
+	})
 	code := m.Run()
+	restoreProbe()
 	coldLoadPollInterval.Store(old)
 	os.Exit(code)
 }

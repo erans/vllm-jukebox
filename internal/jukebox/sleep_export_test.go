@@ -218,3 +218,43 @@ func SetEvictionLoopPreActionHookForTest(h func(peerName string)) func() {
 	old := evictionLoopPreActionHook.Swap(&h)
 	return func() { evictionLoopPreActionHook.Store(old) }
 }
+
+// SetWakeVerifyProbeForTest installs a hook that replaces
+// vllmcli.VerifyWakeWithProbe in the wake-success path. Tests use this
+// to inject deterministic phantom-vs-healthy probe outcomes without
+// spinning up an httptest server inside every wake test. Pass nil to
+// restore the production probe.
+//
+// Returns a restore func; deferring it scopes the hook to a single test.
+//
+// Implementation: stored via atomic.Pointer so concurrent reads (the
+// wake path under test) and writes (this setter) are race-detector clean.
+func SetWakeVerifyProbeForTest(fn func(ctx context.Context, baseURL, model string, timeout time.Duration) error) func() {
+	var old *wakeVerifyProbeFn
+	if fn == nil {
+		old = wakeVerifyProbe.Swap(nil)
+	} else {
+		wrapped := wakeVerifyProbeFn(fn)
+		old = wakeVerifyProbe.Swap(&wrapped)
+	}
+	return func() { wakeVerifyProbe.Store(old) }
+}
+
+// SetRedeployMemberAsyncForTest installs a hook that replaces the
+// background RedeployMember goroutine spawned by the phantom-wake
+// recovery path. Tests use this to deterministically observe that a
+// recreate WAS scheduled for a given model — without spinning a real
+// docker process or paying the goroutine-timing variance. Pass nil to
+// restore the production async-goroutine behavior.
+//
+// Returns a restore func; deferring it scopes the hook to a single test.
+func SetRedeployMemberAsyncForTest(fn func(model string)) func() {
+	var old *redeployAsyncFn
+	if fn == nil {
+		old = redeployMemberAsyncForTest.Swap(nil)
+	} else {
+		wrapped := redeployAsyncFn(fn)
+		old = redeployMemberAsyncForTest.Swap(&wrapped)
+	}
+	return func() { redeployMemberAsyncForTest.Store(old) }
+}

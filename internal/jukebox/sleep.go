@@ -69,6 +69,33 @@ var sleepDockerCmd atomic.Pointer[sleepDockerCmdFn]
 // race-detector clean. nil load = production no-op.
 var evictionLoopPreActionHook atomic.Pointer[func(string)]
 
+// wakeVerifyProbeFn is the function shape used to issue the post-wake
+// phantom-detection probe. Production code stores a wrapper around
+// vllmcli.VerifyWakeWithProbe; tests override via SetWakeVerifyProbeForTest
+// to inject deterministic phantom-vs-healthy responses without spinning
+// up an httptest server inside every wake test.
+//
+// Contract: nil return = probe succeeded, engine confirmed responsive.
+// Non-nil = phantom wake detected, caller MUST treat the wake as failed.
+type wakeVerifyProbeFn func(ctx context.Context, baseURL, model string, timeout time.Duration) error
+
+// wakeVerifyProbe holds the active probe hook. Stored as atomic.Pointer
+// so concurrent test goroutines (writers) and the wake path (readers)
+// are race-detector clean. nil = use the real vllmcli.VerifyWakeWithProbe.
+var wakeVerifyProbe atomic.Pointer[wakeVerifyProbeFn]
+
+// redeployMemberAsyncForTest, when non-nil, is invoked instead of
+// scheduler.RedeployMember in the phantom-wake recovery path. Tests
+// install this to assert that a phantom-wake detection actually
+// triggered a recreate without spawning a real docker process; it also
+// avoids the WithColdLoadLock re-acquisition path RedeployMember takes
+// (which is fine in production because we spawn the recreate in a
+// fresh goroutine outside the wake-path lock, but adds noise to unit
+// tests). Stored as atomic.Pointer for race-clean test swap-in/swap-out.
+type redeployAsyncFn func(model string)
+
+var redeployMemberAsyncForTest atomic.Pointer[redeployAsyncFn]
+
 func runSleepDocker(ctx context.Context, name string, args ...string) ([]byte, error) {
 	if fn := sleepDockerCmd.Load(); fn != nil {
 		return (*fn)(ctx, name, args...)
@@ -2512,6 +2539,96 @@ func (s *Scheduler) performWakeFromInsideColdLoadLock(ctx context.Context, inst 
 			s.bestEffortRestoreVictims(ctx, evictedVictims, inst.model)
 		}
 		return err
+	}
+
+	// Phantom-wake defense — vllm-project cumem_tag wake_up returns 200
+	// from the API server while one or more PP/TP workers have wedged
+	// during create_and_map ("CUDA Error: invalid argument at
+	// cumem_allocator.cpp:169"). /health continues to return 200 (the
+	// FastAPI process is alive) but every subsequent inference request
+	// hangs forever waiting for the shm_broadcast block. We probe the
+	// decode path end-to-end with a single-token /v1/completions BEFORE
+	// flipping state to Ready so the next consumer request doesn't hit
+	// the wedge with a 30s+ timeout. See vllmcli.VerifyWakeWithProbe
+	// for the request shape and rationale.
+	//
+	// Skip the probe when:
+	//   - WakeVerifyTimeoutMs is -1 (operator opt-out; not recommended
+	//     for cumem-sleep models).
+	//   - inst.mgr.BaseURL() is empty (test fakes return ""; in
+	//     production every InstanceManager is constructed with a real
+	//     URL). Skipping in this case preserves test compatibility
+	//     without compromising production safety.
+	//
+	// On phantom detection: do NOT flip state to Ready, do NOT call
+	// NotifyWakeComplete. Roll back admission via NotifySleep with a
+	// distinct "wake-phantom" reason so the swap-group auto-restore
+	// gate (which keys on reason != "idle") still suppresses an
+	// auto-restore cycle. Restore evicted victims (same as Fix 6).
+	// Spawn an async recreate via RedeployMember in a fresh goroutine
+	// because we are currently INSIDE WithColdLoadLock — calling
+	// RedeployMember synchronously would deadlock on coldLoadMu.
+	verifyBudget := modelCfg.EffectiveWakeVerifyTimeout()
+	baseURL := inst.mgr.BaseURL()
+	if verifyBudget > 0 && strings.TrimSpace(baseURL) != "" {
+		probe := vllmcli.VerifyWakeWithProbe
+		if hook := wakeVerifyProbe.Load(); hook != nil {
+			probe = *hook
+		}
+		probeStart := s.now()
+		if probeErr := probe(ctx, baseURL, inst.model, verifyBudget); probeErr != nil {
+			probeDur := s.now().Sub(probeStart)
+			metrics.SleepFailuresTotal.WithLabelValues(inst.model, "wake_phantom").Inc()
+			slog.Error("wake_phantom_detected",
+				"model", inst.model,
+				"trigger", trigger,
+				"err", probeErr,
+				"probe_budget_ms", verifyBudget.Milliseconds(),
+				"probe_elapsed_ms", probeDur.Milliseconds(),
+				"recovery", "schedule-recreate",
+			)
+			LogLifecycleTransition(LifecycleEvent{
+				Action:   LifecycleWake,
+				Model:    inst.model,
+				Related:  evictedVictims,
+				Reason:   "phantom-wake-detected",
+				GPUs:     modelCfg.GPUs,
+				Duration: s.now().Sub(start),
+			})
+			if s.admission != nil {
+				s.admission.NotifySleep(inst.model, "wake-phantom")
+			}
+			if len(evictedVictims) > 0 {
+				s.bestEffortRestoreVictims(ctx, evictedVictims, inst.model)
+			}
+			// Trigger async recreate. RedeployMember acquires
+			// WithColdLoadLock itself, so we MUST spawn this in a fresh
+			// goroutine — we are currently inside that same lock and
+			// sync.Mutex is non-reentrant. Use background ctx with a
+			// generous bound; the recreate path internally tears down
+			// the wedged container and brings up a fresh one via
+			// docker compose up + health-wait.
+			model := inst.model
+			doRecreate := func(m string) {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				defer cancel()
+				slog.Info("wake_phantom_recreate_start", "model", m)
+				if _, rerr := s.RedeployMember(bgCtx, m); rerr != nil {
+					slog.Error("wake_phantom_recreate_failed", "model", m, "err", rerr)
+					return
+				}
+				slog.Info("wake_phantom_recreate_complete", "model", m)
+			}
+			if testHook := redeployMemberAsyncForTest.Load(); testHook != nil {
+				// Tests inject a synchronous-or-recorded hook so they can
+				// assert recreate was scheduled without spawning a real
+				// docker process or hitting the production async timing.
+				(*testHook)(model)
+			} else {
+				go doRecreate(model)
+			}
+			return fmt.Errorf("wake verification failed (phantom wake on %q): %w", inst.model, probeErr)
+		}
 	}
 
 	s.mu.Lock()
