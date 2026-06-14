@@ -75,9 +75,17 @@ var evictionLoopPreActionHook atomic.Pointer[func(string)]
 // to inject deterministic phantom-vs-healthy responses without spinning
 // up an httptest server inside every wake test.
 //
+// The servedModelName argument is the value sent in the /v1/completions
+// `model` field — this is the vLLM --served-model-name (or the path
+// basename if unset), NOT the jukebox config key. They may differ; see
+// HIGH-3 in PR #27 adversarial review.
+//
 // Contract: nil return = probe succeeded, engine confirmed responsive.
-// Non-nil = phantom wake detected, caller MUST treat the wake as failed.
-type wakeVerifyProbeFn func(ctx context.Context, baseURL, model string, timeout time.Duration) error
+// Non-nil = the wake is suspect. The caller MUST distinguish the
+// vllmcli.ErrWakeVerifyConfigError sentinel (model-name mismatch — do
+// NOT redeploy, log loud) from vllmcli.ErrWakeVerifyPhantom (engine
+// wedged — DO async redeploy).
+type wakeVerifyProbeFn func(ctx context.Context, baseURL, servedModelName string, timeout time.Duration) error
 
 // wakeVerifyProbe holds the active probe hook. Stored as atomic.Pointer
 // so concurrent test goroutines (writers) and the wake path (readers)
@@ -2575,23 +2583,46 @@ func (s *Scheduler) performWakeFromInsideColdLoadLock(ctx context.Context, inst 
 		if hook := wakeVerifyProbe.Load(); hook != nil {
 			probe = *hook
 		}
+		// Use the operator-supplied --served-model-name when set;
+		// otherwise fall back to the jukebox config key (which matches
+		// when extra_args doesn't override --served-model-name). HIGH-3
+		// in PR #27 review: hardcoded inst.model would 404 against any
+		// vLLM that was launched with a non-default served name.
+		servedName := modelCfg.EffectiveServedModelName(inst.model)
 		probeStart := s.now()
-		if probeErr := probe(ctx, baseURL, inst.model, verifyBudget); probeErr != nil {
+		if probeErr := probe(ctx, baseURL, servedName, verifyBudget); probeErr != nil {
 			probeDur := s.now().Sub(probeStart)
-			metrics.SleepFailuresTotal.WithLabelValues(inst.model, "wake_phantom").Inc()
+			// HIGH-3 fix: differentiate config-error from phantom. A
+			// config-error (model-name mismatch) is a structural bug
+			// that redeploying CANNOT fix — the recreated container
+			// will have the same --served-model-name flag and 404
+			// again forever. Log loud, roll back admission, but
+			// SKIP the async RedeployMember.
+			isConfigErr := errors.Is(probeErr, vllmcli.ErrWakeVerifyConfigError)
+			failureClass := "wake_phantom"
+			recovery := "schedule-recreate"
+			reasonAudit := "phantom-wake-detected"
+			if isConfigErr {
+				failureClass = "wake_config_error"
+				recovery = "skip-recreate-config-mismatch"
+				reasonAudit = "wake-config-error"
+			}
+			metrics.SleepFailuresTotal.WithLabelValues(inst.model, failureClass).Inc()
 			slog.Error("wake_phantom_detected",
 				"model", inst.model,
+				"served_model_name", servedName,
 				"trigger", trigger,
 				"err", probeErr,
 				"probe_budget_ms", verifyBudget.Milliseconds(),
 				"probe_elapsed_ms", probeDur.Milliseconds(),
-				"recovery", "schedule-recreate",
+				"recovery", recovery,
+				"config_error", isConfigErr,
 			)
 			LogLifecycleTransition(LifecycleEvent{
 				Action:   LifecycleWake,
 				Model:    inst.model,
 				Related:  evictedVictims,
-				Reason:   "phantom-wake-detected",
+				Reason:   reasonAudit,
 				GPUs:     modelCfg.GPUs,
 				Duration: s.now().Sub(start),
 			})
@@ -2600,6 +2631,12 @@ func (s *Scheduler) performWakeFromInsideColdLoadLock(ctx context.Context, inst 
 			}
 			if len(evictedVictims) > 0 {
 				s.bestEffortRestoreVictims(ctx, evictedVictims, inst.model)
+			}
+			if isConfigErr {
+				// Don't recreate — recreate won't fix a served-model-name
+				// mismatch (flag is baked into the launch command). The
+				// operator must fix served_model_name in config.
+				return fmt.Errorf("wake verification failed (config error — served_model_name mismatch on %q sent %q): %w", inst.model, servedName, probeErr)
 			}
 			// Trigger async recreate. RedeployMember acquires
 			// WithColdLoadLock itself, so we MUST spawn this in a fresh

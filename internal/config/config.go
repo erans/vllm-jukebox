@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -509,6 +510,23 @@ type ModelConfig struct {
 	// entirely (NOT recommended for cumem-sleep models — re-opens the
 	// phantom-wake hole). See DefaultWakeVerifyTimeout for rationale.
 	WakeVerifyTimeoutMs int `yaml:"wake_verify_timeout_ms,omitempty"`
+	// ServedModelName is the name vLLM is actually serving (i.e. what
+	// --served-model-name was set to via extra_args, or what vLLM
+	// defaults to — typically the path basename). The post-wake verify
+	// probe (VerifyWakeWithProbe) sends this in the `model` field of
+	// /v1/completions; if it doesn't match what vLLM is serving, vLLM
+	// returns 404/400 NotFoundError and the probe (pre-fix) treated
+	// that as a phantom wake → infinite redeploy loop.
+	//
+	// When unset, the probe falls back to the jukebox config key
+	// (map key in models{}), which matches when --served-model-name is
+	// not overridden. Set this explicitly any time extra_args contains
+	// --served-model-name <X> where X differs from the config key.
+	//
+	// The validator warns loudly when sleep_mode=true + extra_args has
+	// --served-model-name + this field is unset, since that's the
+	// exact footgun that triggered HIGH-3 in the wake-verify review.
+	ServedModelName string `yaml:"served_model_name,omitempty"`
 	// IdleTimeout: if > 0 and SleepMode is true and the model is not pinned,
 	// jukebox auto-sleeps the instance after this much idle time. 0 = never
 	// auto-suspend.
@@ -1021,6 +1039,24 @@ func (c *Config) validateRuntimes() error {
 			)
 		}
 
+		// HIGH-3 defense: if sleep_mode is on AND extra_args overrides
+		// --served-model-name AND the operator didn't set served_model_name
+		// in the jukebox config, the post-wake verify probe will send the
+		// jukebox config key (e.g. "vllm-main") to vLLM's /v1/completions,
+		// vLLM will return 404 because it's actually serving the
+		// extra_args-supplied name, the probe will classify that as a
+		// config-error and skip redeploy — which is correct but the
+		// peer will never come up at all. Warn loud so the operator
+		// notices BEFORE the next wake instead of staring at a stuck
+		// model wondering why every wake reports
+		// ErrWakeVerifyConfigError.
+		if model.SleepMode && extraArgsHasServedModelName(model.ExtraArgs) && strings.TrimSpace(model.ServedModelName) == "" {
+			slog.Warn("config_served_model_name_missing_with_extra_args_override",
+				"model", name,
+				"note", "extra_args sets --served-model-name but served_model_name field is unset; post-wake verify probe will 404 → ErrWakeVerifyConfigError on every wake; set served_model_name to match the --served-model-name value",
+			)
+		}
+
 		// LifecycleExternal constraints
 		if model.Lifecycle == LifecycleExternal {
 			if model.Alias != "" {
@@ -1332,6 +1368,36 @@ func (m ModelConfig) EffectiveWakeVerifyTimeout() time.Duration {
 		return DefaultWakeVerifyTimeout
 	}
 	return time.Duration(m.WakeVerifyTimeoutMs) * time.Millisecond
+}
+
+// EffectiveServedModelName returns the served model name to use when
+// addressing the post-wake verification probe. If ServedModelName is
+// set in config, returns it verbatim. Otherwise returns the fallback
+// (which the caller passes as the jukebox config key). The probe will
+// 404 if the fallback doesn't match what vLLM is actually serving —
+// see HIGH-3 in the PR #27 review.
+func (m ModelConfig) EffectiveServedModelName(fallback string) string {
+	if s := strings.TrimSpace(m.ServedModelName); s != "" {
+		return s
+	}
+	return fallback
+}
+
+// extraArgsHasServedModelName reports whether the model's extra_args
+// contains a --served-model-name override. Used by the validator to
+// detect the HIGH-3 footgun where the operator overrode the vLLM
+// served name but forgot to mirror it in jukebox's served_model_name
+// field.
+func extraArgsHasServedModelName(args []string) bool {
+	for _, a := range args {
+		if a == "--served-model-name" {
+			return true
+		}
+		if strings.HasPrefix(a, "--served-model-name=") {
+			return true
+		}
+	}
+	return false
 }
 
 // EffectiveColdLoadTimeout returns the configured ColdLoadTimeoutSeconds,

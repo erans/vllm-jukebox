@@ -3,12 +3,14 @@ package jukebox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/vllmcli"
 )
 
 // phantomFakeMgr is a fakeRedeployMgr variant that returns a non-empty
@@ -324,5 +326,134 @@ models:
 	}
 	if st, ok := s.InstanceStateForTest("vllm-main"); !ok || st != StateReady {
 		t.Errorf("expected StateReady when probe disabled; got %v ok=%v", st, ok)
+	}
+}
+
+// TestPerformWake_ConfigErrorSkipsRedeploy covers HIGH-3 from PR #27
+// adversarial review: when the verify probe returns
+// vllmcli.ErrWakeVerifyConfigError (model-name mismatch — 404/400
+// from vLLM because --served-model-name doesn't match what jukebox
+// sent), the wake path MUST:
+//  1. Roll back admission (same as phantom).
+//  2. NOT flip state to Ready.
+//  3. NOT schedule a RedeployMember — recreating the container won't
+//     change --served-model-name, so we'd loop forever.
+//  4. Emit a wake-config-error lifecycle audit (distinct from
+//     phantom-wake-detected) so dashboards can route differently.
+//
+// Without this branch, an operator typo in served_model_name +
+// extra_args mismatch produces an infinite redeploy storm — every
+// 1-2s the phantom-wake detector recreates the container, vLLM
+// re-binds the same wrong served name, the probe 404s again,
+// recreate fires again, ad infinitum.
+func TestPerformWake_ConfigErrorSkipsRedeploy(t *testing.T) {
+	cfgYAML := `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8199
+vllm:
+  port: 8000
+  startup_timeout: 1s
+  drain_timeout: 100ms
+models:
+  vllm-main:
+    lifecycle: external
+    host: vllm-main
+    port: 8002
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    sleep_mode: true
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 0
+    wake_verify_timeout_ms: 1000
+    served_model_name: "Qwen/Qwen3-32B-AWQ"
+`
+	if _, err := config.Load([]byte(cfgYAML)); err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	totals := map[int]int{0: 8000}
+	s, _, _ := makeRedeployScheduler(t, cfgYAML, nil, totals)
+
+	mgr := &phantomFakeMgr{
+		fakeRedeployMgr: fakeRedeployMgr{port: 8002},
+		url:             "http://configerr-target.test:8002",
+	}
+	mgr.pid.Store(int64(7000 + 8002))
+	mgr.isSleeping.Store(true)
+	s.SeedInstanceForTest("vllm-main", 8002, []int{0}, false, StateSleeping, mgr)
+
+	// Inject config-error from the probe — simulates vLLM returning
+	// 404 because --served-model-name differs from what we sent.
+	probeFired := atomic.Int32{}
+	var seenServedName string
+	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, served string, _ time.Duration) error {
+		probeFired.Add(1)
+		seenServedName = served
+		return fmt.Errorf("simulated 404: %w", vllmcli.ErrWakeVerifyConfigError)
+	})
+	defer restoreProbe()
+
+	// Recreate counter — MUST stay zero (skip-redeploy on config-error
+	// is the whole point of this branch).
+	recreates := atomic.Int32{}
+	restoreRedeploy := SetRedeployMemberAsyncForTest(func(_ string) {
+		recreates.Add(1)
+	})
+	defer restoreRedeploy()
+
+	// Distinguish phantom-wake vs wake-config-error in audits.
+	var phantomAudits atomic.Int32
+	var configErrAudits atomic.Int32
+	prevAudit := SetLifecycleAuditSinkForTest(func(ev LifecycleEvent) {
+		if ev.Action != LifecycleWake || ev.Model != "vllm-main" {
+			return
+		}
+		switch ev.Reason {
+		case "phantom-wake-detected":
+			phantomAudits.Add(1)
+		case "wake-config-error":
+			configErrAudits.Add(1)
+		}
+	})
+	defer SetLifecycleAuditSinkForTest(prevAudit)
+
+	targetInst := s.instances["vllm-main"]
+	targetCfg := s.cfg.Models["vllm-main"]
+
+	err := s.performWake(context.Background(), targetInst, targetCfg, "test-config-err")
+	if err == nil {
+		t.Fatalf("expected wake to return error on config-error probe; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyConfigError) {
+		t.Errorf("expected returned error to wrap ErrWakeVerifyConfigError; got %v", err)
+	}
+
+	if got := probeFired.Load(); got != 1 {
+		t.Errorf("expected probe to fire exactly once; got %d", got)
+	}
+	// HIGH-3: probe MUST receive the served name from config, not the
+	// jukebox config key. served_model_name in test cfg = Qwen/...
+	if seenServedName != "Qwen/Qwen3-32B-AWQ" {
+		t.Errorf("expected probe to receive served_model_name override; got %q", seenServedName)
+	}
+
+	// State must NOT be Ready.
+	if st, ok := s.InstanceStateForTest("vllm-main"); !ok {
+		t.Fatalf("instance lookup failed")
+	} else if st == StateReady {
+		t.Errorf("expected state != StateReady on config-error; got %s", st)
+	}
+
+	// CRITICAL: NO redeploy fired (otherwise infinite loop).
+	if got := recreates.Load(); got != 0 {
+		t.Errorf("expected zero redeploys on config-error (recreating same container won't fix served-model-name mismatch); got %d", got)
+	}
+
+	// Audit routing: config-error path, not phantom-wake.
+	if got := configErrAudits.Load(); got != 1 {
+		t.Errorf("expected exactly one wake-config-error audit; got %d", got)
+	}
+	if got := phantomAudits.Load(); got != 0 {
+		t.Errorf("expected zero phantom-wake-detected audits on config-error path; got %d", got)
 	}
 }

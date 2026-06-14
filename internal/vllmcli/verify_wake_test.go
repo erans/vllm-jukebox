@@ -3,6 +3,7 @@ package vllmcli_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -124,6 +125,57 @@ func TestVerifyWakeWithProbe_PhantomOnTimeout(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Errorf("returned too slow (%s) — timeout budget exceeded by >> 1.75s", elapsed)
 	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("expected ErrWakeVerifyPhantom sentinel on timeout; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_PhantomOnHeadersThenHang covers HIGH-2 from
+// the adversarial review: a wedged vLLM that sends HTTP 200 status +
+// headers, then never sends a body. http.DefaultClient has Timeout=0;
+// context cancellation does NOT reliably interrupt body reads across
+// all HTTP/1.1 paths (the server can flush headers and hold the
+// connection open well past ctx.Done()). The fix uses a per-call
+// http.Client with Timeout = budget + 500ms slack, which DOES bound
+// the entire request lifecycle including the body read.
+//
+// Without the fix this test takes ~60s and would fail the elapsed
+// budget. With the fix, the probe must return within budget + slack
+// (~1.5s for a 1s budget).
+func TestVerifyWakeWithProbe_PhantomOnHeadersThenHang(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Flush 200 OK + headers immediately, then hang on body write
+		// for 60s. Mimics a wedged vLLM that accepts the request,
+		// returns control to the FastAPI handler shell which writes
+		// the response start, then deadlocks before any body bytes
+		// can be produced by the wedged decode worker.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(60 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", 1*time.Second)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("expected error on headers-then-hang wedge; got nil")
+	}
+	// MUST return within budget + http.Client.Timeout slack (1s + 500ms)
+	// plus a little scheduling jitter. If this exceeds 2s, the
+	// http.DefaultClient regression is back.
+	if elapsed > 2*time.Second {
+		t.Errorf("probe took %s for headers-then-hang — http.Client.Timeout not enforcing (HIGH-2 regression?)", elapsed)
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("expected ErrWakeVerifyPhantom sentinel on headers-then-hang; got %v", err)
+	}
 }
 
 // TestVerifyWakeWithProbe_PhantomOn5xx proves a 5xx from /v1/completions
@@ -148,6 +200,9 @@ func TestVerifyWakeWithProbe_PhantomOn5xx(t *testing.T) {
 	if got := hits.Load(); got != 1 {
 		t.Errorf("expected exactly one POST; got %d", got)
 	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("expected ErrWakeVerifyPhantom sentinel on 500; got %v", err)
+	}
 }
 
 // TestVerifyWakeWithProbe_PhantomOnEmptyChoices proves that an HTTP 200
@@ -168,6 +223,112 @@ func TestVerifyWakeWithProbe_PhantomOnEmptyChoices(t *testing.T) {
 	if !strings.Contains(err.Error(), "zero choices") {
 		t.Errorf("expected 'zero choices' in error message; got %v", err)
 	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("expected ErrWakeVerifyPhantom sentinel on empty choices; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_ConfigErrorOn404ModelNotFound covers HIGH-3
+// from the adversarial review: if the probe's `model` field doesn't
+// match what vLLM is serving (--served-model-name mismatch), vLLM
+// returns 404 with a model-not-found error body. The pre-fix behavior
+// classified this as a phantom and triggered RedeployMember, which
+// recreates the container with the SAME --served-model-name flag,
+// hits the same 404, redeploys again — infinite loop.
+//
+// Post-fix: this MUST return ErrWakeVerifyConfigError so the caller
+// can log loud + suppress redeploy.
+func TestVerifyWakeWithProbe_ConfigErrorOn404ModelNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"message":"The model 'vllm-main' does not exist.","type":"NotFoundError","code":404}}`)
+	}))
+	defer srv.Close()
+
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", 2*time.Second)
+	if err == nil {
+		t.Fatalf("expected error on 404 model-not-found; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyConfigError) {
+		t.Errorf("expected ErrWakeVerifyConfigError sentinel on 404 model-not-found; got %v", err)
+	}
+	if errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("config error MUST NOT also be classified as phantom (would trigger redeploy loop); got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_ConfigErrorOn400ModelNotFound covers the
+// vLLM-actually-returns-400-not-404 path. The OpenAI-compat layer in
+// vLLM returns 400 with NotFoundError in the body for unknown models
+// (this is observed behavior, despite 404 being more semantically
+// correct).
+func TestVerifyWakeWithProbe_ConfigErrorOn400ModelNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"object":"error","message":"The model `+"`"+`vllm-main`+"`"+` does not exist.","type":"NotFoundError","code":404}`)
+	}))
+	defer srv.Close()
+
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", 2*time.Second)
+	if err == nil {
+		t.Fatalf("expected error on 400 NotFoundError; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyConfigError) {
+		t.Errorf("expected ErrWakeVerifyConfigError sentinel on 400 NotFoundError; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_4xxWithoutModelHintIsPhantom proves the
+// conservative fall-through: a 400 that doesn't look like a model-name
+// mismatch is treated as a phantom (the safer default — redeploy at
+// worst costs a cold-load; ignoring a real wedge keeps requests hanging).
+func TestVerifyWakeWithProbe_4xxWithoutModelHintIsPhantom(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":"malformed request: expected field foo"}`)
+	}))
+	defer srv.Close()
+
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", 2*time.Second)
+	if err == nil {
+		t.Fatalf("expected error on generic 400; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("expected ErrWakeVerifyPhantom (conservative fall-through for 4xx without model hint); got %v", err)
+	}
+	if errors.Is(err, vllmcli.ErrWakeVerifyConfigError) {
+		t.Errorf("generic 400 must NOT be classified as config-error; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_ServedNameUsedInRequest proves the
+// servedModelName parameter is actually what's sent on the wire (not
+// some stale internal name). HIGH-3 fix: jukebox config key may differ
+// from --served-model-name; caller passes the served name through.
+func TestVerifyWakeWithProbe_ServedNameUsedInRequest(t *testing.T) {
+	var seenModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var decoded struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(body, &decoded)
+		seenModel = decoded.Model
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"text":"x"}]}`)
+	}))
+	defer srv.Close()
+
+	const served = "Qwen/Qwen3-32B-AWQ"
+	if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, served, time.Second); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if seenModel != served {
+		t.Errorf("expected vLLM to receive served-model-name %q in body; got %q", served, seenModel)
+	}
 }
 
 // TestVerifyWakeWithProbe_EmptyBaseURLRejected proves the input
@@ -185,8 +346,8 @@ func TestVerifyWakeWithProbe_EmptyBaseURLRejected(t *testing.T) {
 // TestVerifyWakeWithProbe_EmptyModelRejected proves model name is required.
 func TestVerifyWakeWithProbe_EmptyModelRejected(t *testing.T) {
 	err := vllmcli.VerifyWakeWithProbe(context.Background(), "http://example.test", "", time.Second)
-	if err == nil || !strings.Contains(err.Error(), "model") {
-		t.Fatalf("expected model validation error; got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "servedModelName") {
+		t.Fatalf("expected servedModelName validation error; got %v", err)
 	}
 }
 
