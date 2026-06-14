@@ -1,0 +1,93 @@
+# Jukebox config for a 4-GPU host running one pinned LLM plus three
+# burstable co-tenants (embedding / reranker / OCR) via lifecycle: external.
+#
+# Points at four already-running vLLM services. Jukebox proxies requests
+# and drives sleep/wake; it does NOT spawn any vLLM process — the operator
+# manages those via docker-compose.
+#
+# To use this config:
+#   1. The corresponding vllm-* services in docker-compose.yml MUST be
+#      launched with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1`.
+#      (If you launched the services without those flags, jukebox can
+#      still proxy, but Sleep/Wake/IsSleeping API calls will 404.)
+#   2. Add a `jukebox` service to the same compose file. See the
+#      docker-compose snippet shipped alongside this YAML.
+#   3. Update your OpenAI-compatible client (whatever sits in front) to
+#      send all vLLM-bound traffic to jukebox:9000 as a single endpoint.
+
+server:
+  host: "0.0.0.0"
+  port: 9000
+  read_timeout: 30s
+  write_timeout: 600s          # SSE streams need a long write window
+  log_requests: true
+
+vllm:
+  # Required by config.Validate even though jukebox doesn't spawn vLLM
+  # in this deployment (every model is lifecycle: external).
+  port: 8000
+  binary: "uvx"
+  startup_timeout: 300s
+  drain_timeout: 60s
+  swap_cooldown: 0s            # n/a for external lifecycle
+  swap_wait_timeout: 60s
+
+scheduler:
+  port_range_start: 18100      # unused (no managed instances), but required
+  port_range_end: 18109
+  min_instance_uptime: 1s
+  nvlink_pairs:
+    # T630-style layout: GPU0↔GPU3, GPU1↔GPU2 are NVLink-bonded
+    - [0, 3]
+    - [1, 2]
+
+behavior:
+  rewrite_model_name: false
+
+models:
+  # Always-on primary model — pinned, never auto-suspended.
+  Qwen3.6-27B:
+    lifecycle: external
+    host: "vllm-main"
+    port: 8000
+    gpus: [0, 3, 1, 2]         # informational; matches CUDA_VISIBLE_DEVICES order
+    min_free_mem_mb_per_gpu: 1 # n/a for external
+    pinned: true
+
+  # Burstable embedding co-tenant.
+  bge-m3:
+    lifecycle: external
+    host: "vllm-embeddings"
+    port: 8000
+    gpus: [1]
+    min_free_mem_mb_per_gpu: 1
+    runner: pooling
+    sleep_mode: true
+    sleep_level: 1
+    wake_timeout: 30s
+    idle_timeout: 600s         # auto-sleep after 10 min idle
+
+  # Burstable reranker co-tenant.
+  mxbai-rerank-base-v2:
+    lifecycle: external
+    host: "vllm-reranker"
+    port: 8000
+    gpus: [2]
+    min_free_mem_mb_per_gpu: 1
+    runner: pooling
+    sleep_mode: true
+    sleep_level: 1
+    wake_timeout: 30s
+    idle_timeout: 600s
+
+  # Burstable OCR / vision co-tenant.
+  GLM-OCR:
+    lifecycle: external
+    host: "vllm-ocr"
+    port: 8000
+    gpus: [3]
+    min_free_mem_mb_per_gpu: 1
+    sleep_mode: true
+    sleep_level: 1
+    wake_timeout: 60s          # vision models tend to wake slower
+    idle_timeout: 900s         # 15 min — OCR is rarer
