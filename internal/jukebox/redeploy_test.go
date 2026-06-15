@@ -37,17 +37,23 @@ type fakeRedeployMgr struct {
 	wakeCalls  atomic.Int32
 
 	wakeErr error
+	// verifyErr, when set, is returned by VerifyReady to simulate an
+	// unreachable / unhealthy external peer (consumed by the Issue #5c
+	// healthy-start-adopt tests in external_start_test.go).
+	verifyErr error
 }
 
 func (m *fakeRedeployMgr) Start(_ context.Context, _ string) (int, error) {
 	m.pid.Store(int64(7000 + m.port))
 	return int(m.pid.Load()), nil
 }
-func (m *fakeRedeployMgr) Stop(_ context.Context) error                            { m.pid.Store(0); return nil }
-func (m *fakeRedeployMgr) VerifyReady(_ context.Context, _ string) error           { return nil }
-func (m *fakeRedeployMgr) CurrentPID() int                                         { return int(m.pid.Load()) }
-func (m *fakeRedeployMgr) BaseURL() string                                         { return "" }
-func (m *fakeRedeployMgr) IsSleeping(_ context.Context) (bool, error)              { return m.isSleeping.Load(), nil }
+func (m *fakeRedeployMgr) Stop(_ context.Context) error                  { m.pid.Store(0); return nil }
+func (m *fakeRedeployMgr) VerifyReady(_ context.Context, _ string) error { return m.verifyErr }
+func (m *fakeRedeployMgr) CurrentPID() int                               { return int(m.pid.Load()) }
+func (m *fakeRedeployMgr) BaseURL() string                               { return "" }
+func (m *fakeRedeployMgr) IsSleeping(_ context.Context) (bool, error) {
+	return m.isSleeping.Load(), nil
+}
 func (m *fakeRedeployMgr) Sleep(_ context.Context, _ int) error {
 	m.sleepCalls.Add(1)
 	m.isSleeping.Store(true)

@@ -2,6 +2,7 @@ package jukebox
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -45,8 +46,8 @@ func TestStartupAdopt_PreExistingSleepingPeer_NotKilled(t *testing.T) {
 	s, _, _ := makeExternalStartScheduler(t, StateReady, StateSleeping)
 
 	rec := newDockerInspectRecorder()
-	rec.setStatus("vllm-holder", "running")  // pinned holder, alive
-	rec.setStatus("vllm-target", "running")  // pre-existing sleeping peer
+	rec.setStatus("vllm-holder", "running") // pinned holder, alive
+	rec.setStatus("vllm-target", "running") // pre-existing sleeping peer
 	// Explicitly set StartedAt 1 hour BEFORE bootEpoch (default is 1h
 	// FUTURE, which would not trigger adoption). Use UTC RFC3339Nano.
 	preBoot := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339Nano)
@@ -143,10 +144,15 @@ func TestStartupAdopt_PreExistingStoppedPeer_ReconciledToReady(t *testing.T) {
 // TestStartupAdopt_PostBootExternalStart_StillKilled is the negative
 // regression: we must NOT have accidentally disabled the original
 // Issue #5 fix. A container whose StartedAt is AFTER jukebox bootEpoch
-// is a genuine external start — the SIGKILL + KickColdLoad path must
-// still fire.
+// AND which fails its /health probe is a genuine rogue external start
+// (racing for VRAM at init) — the SIGKILL + KickColdLoad path must
+// still fire. (A post-boot start that comes up HEALTHY is adopted by
+// the Issue #5c healthy-start path — covered in external_start_test.go.)
 func TestStartupAdopt_PostBootExternalStart_StillKilled(t *testing.T) {
-	s, _, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Unhealthy: the rogue init has not come up on /health, so the
+	// healthy-start-adopt path (Issue #5c) declines and we reach SIGKILL.
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: init racing for VRAM")
 
 	rec := newDockerInspectRecorder()
 	rec.setStatus("vllm-holder", "running")
@@ -176,10 +182,10 @@ func TestShouldAdoptOnBoot_Matrix(t *testing.T) {
 	bootEpoch := time.Date(2026, 6, 14, 1, 0, 0, 0, time.UTC)
 
 	cases := []struct {
-		name        string
-		startedAt   string
-		wantAdopt   bool
-		wantReason  string
+		name       string
+		startedAt  string
+		wantAdopt  bool
+		wantReason string
 	}{
 		{
 			name:       "empty_started_at_fail_closed",

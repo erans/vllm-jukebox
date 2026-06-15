@@ -36,7 +36,21 @@ import (
 // peer's docker container state every externalStartCheckInterval. When
 // it observes a container in `running` state while admission still
 // records it as Stopped or Sleeping (i.e. the start did NOT come
-// through jukebox's lifecycle), it:
+// through jukebox's lifecycle), it first checks whether the container
+// is actually healthy:
+//
+//   0. HEALTHY-START ADOPT (Issue #5c): probe the same /health signal
+//      the boot-adopt path trusts (VerifyReady). If the externally-
+//      started container is reachable + healthy, it is NOT a doomed
+//      OOM-racing init — it is a recovered peer (e.g. jukebox booted
+//      while the peer was DOWN, latched it Stopped, then an operator
+//      `docker start <peer>` brought it up healthy). ADOPT it: reconcile
+//      admission to reality, leave the container alone, NO SIGKILL. Only
+//      a genuinely unhealthy/unreachable container falls through to the
+//      rogue-start handling below.
+//
+// For a confirmed rogue start (container running but NOT healthy — racing
+// for VRAM at init), it then:
 //
 //   1. Logs `external_start_detected` at WARN with full context for
 //      operator visibility / postmortem.
@@ -84,6 +98,13 @@ import (
 // committed), long enough that the docker-inspect overhead stays
 // negligible.
 const defaultExternalStartCheckInterval = 2 * time.Second
+
+// externalStartAdoptHealthBudget bounds the /health probe used by the
+// healthy-start adopt path (Issue #5c). Short enough that a wedged peer
+// can't stall the monitor tick; generous enough that a peer that came up
+// cleanly answers within it. Mirrors the per-instance budget the boot
+// probe (RegisterExternalInstances) effectively grants each VerifyReady.
+const externalStartAdoptHealthBudget = 3 * time.Second
 
 // externalStartPollInterval is the live cadence read by the monitor
 // (allows test overrides without test-only fields on the production
@@ -256,8 +277,10 @@ func (s *Scheduler) checkOneExternalStart(ctx context.Context, name string, mode
 	s.mu.RLock()
 	inst := s.instances[name]
 	var currentState State
+	var instMgr InstanceManager
 	if inst != nil {
 		currentState = inst.state
+		instMgr = inst.mgr
 	}
 	s.mu.RUnlock()
 	if inst == nil {
@@ -300,6 +323,77 @@ func (s *Scheduler) checkOneExternalStart(ctx context.Context, name string, mode
 		s.bootAdoptedPeers[name] = struct{}{}
 		s.mu.Unlock()
 		return
+	}
+
+	// HEALTHY-START ADOPT (Issue #5c): the container started AFTER
+	// jukebox's bootEpoch (so the boot-adopt path above declined), and
+	// admission has it latched Stopped/Sleeping. The original Issue #5
+	// behavior assumes this is always a rogue bare `docker start` that
+	// bypassed cross-group eviction and is mid-OOM — so it SIGKILLs and
+	// re-routes through cold-load. But that assumption is FALSE when the
+	// stale latch is jukebox's own: if jukebox booted while this peer was
+	// DOWN, the boot probe seeded admission Stopped; a later operator
+	// `docker start <peer>` then surfaces here as "Stopped admission +
+	// running container", StartedAt > bootEpoch — and the SIGKILL path
+	// destroys a perfectly healthy container the operator just brought up,
+	// then kicks an orphaning cold-load that leaves the peer `exited`.
+	// Live-RCA'd 2026-06-15 against bge-m3 / vllm-embeddings.
+	//
+	// The discriminator is the SAME health signal the boot-adopt path
+	// trusts (RegisterExternalInstances → VerifyReady, i.e. /health). If
+	// the externally-started container is reachable + healthy, it is NOT
+	// a doomed OOM-racing init — it is a recovered peer to ADOPT, exactly
+	// like the pre-existing-across-bounce case. Reconcile admission to
+	// reality, leave the container alone, NO SIGKILL, NO cold-load. Only a
+	// genuinely unhealthy/unreachable container (the real rogue-start case
+	// that Issue #5 targets) falls through to the stop + cold-load path
+	// below.
+	//
+	// The health probe runs OUTSIDE s.mu (VerifyReady does HTTP I/O) under
+	// a short budget so a hung peer can't stall the monitor tick.
+	if instMgr != nil {
+		healthCtx, healthCancel := context.WithTimeout(ctx, externalStartAdoptHealthBudget)
+		healthErr := instMgr.VerifyReady(healthCtx, name)
+		healthCancel()
+		if healthErr == nil {
+			// Reachable + healthy → adopt, identical reconciliation to the
+			// boot-adopt path (admission booked, container untouched).
+			settled := s.adoptPreExistingPeer(name, currentState, modelCfg)
+			slog.Warn("external_start_adopted_healthy_peer",
+				"model", name,
+				"container", container,
+				"observed_admission_state", string(observedState),
+				"current_admission_state", string(currentState),
+				"settled_admission_state", string(settled),
+				"docker_status", st.Status,
+				"started_at", st.StartedAt,
+				"jukebox_boot_epoch", s.bootEpoch.Format(time.RFC3339Nano),
+				"action", "adopt_no_sigkill",
+				"runbook", "external-start-healthy-adopt-Issue-5c",
+			)
+			metrics.AdmissionStartupAdoptedTotal.WithLabelValues(name).Inc()
+			LogLifecycleTransition(LifecycleEvent{
+				Action: LifecycleColdLoad, // reuse cold-load audit verb, same
+				// rationale as logAndCountAdoption: "adopted" is novel and we
+				// don't want adoption to undercount in cold-load dashboards.
+				Model:  name,
+				Reason: "external-start-healthy-adopt",
+				GPUs:   s.gpusForModel(name),
+			})
+			s.mu.Lock()
+			s.bootAdoptedPeers[name] = struct{}{}
+			s.mu.Unlock()
+			return
+		}
+		// Unhealthy/unreachable → fall through to the SIGKILL + cold-load
+		// path. This is the genuine rogue-start case: a container racing
+		// for VRAM at init that has not (yet) come up healthy.
+		slog.Info("external_start_health_probe_unhealthy",
+			"model", name,
+			"container", container,
+			"err", healthErr,
+			"action", "fall_through_to_stop_and_cold_load",
+		)
 	}
 
 	// Confirmed external start. Log at WARN — operators want this in

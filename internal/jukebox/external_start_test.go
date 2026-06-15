@@ -119,10 +119,10 @@ func makeExternalStartScheduler(t *testing.T, holderState, targetState State) (*
 // stop/start call sequence.
 type dockerInspectRecorder struct {
 	mu       sync.Mutex
-	calls    []string                     // every "docker <args...>" string
-	stops    []string                     // container names passed to "docker stop"
-	starts   []string                     // container names passed to "docker start"
-	statusBy map[string]string            // container → status string returned by `docker inspect -f '{{json .State}}'`
+	calls    []string          // every "docker <args...>" string
+	stops    []string          // container names passed to "docker stop"
+	starts   []string          // container names passed to "docker start"
+	statusBy map[string]string // container → status string returned by `docker inspect -f '{{json .State}}'`
 	// startedAtBy lets tests override the StartedAt value reported per
 	// container. Empty/unset → falls back to the recorder's default
 	// (1h in the future from time.Now()), which is AFTER the scheduler's
@@ -131,7 +131,7 @@ type dockerInspectRecorder struct {
 	// startup-adopt tests explicitly set a value PRIOR to bootEpoch to
 	// exercise the adopt path.
 	startedAtBy map[string]string
-	stopErr  func(container string) error // optional: per-container stop failure
+	stopErr     func(container string) error // optional: per-container stop failure
 }
 
 func newDockerInspectRecorder() *dockerInspectRecorder {
@@ -249,7 +249,12 @@ func (r *dockerInspectRecorder) stopsContains(container string) bool {
 // stop fires, KickColdLoad fires, the cold-load goroutine runs the
 // cross-group eviction before its own docker start.
 func TestExternalStart_DetectsRunningStoppedPeer_StopsAndKicks(t *testing.T) {
-	s, _, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Issue #5c: the rogue-start case this test models is a container
+	// racing for VRAM at init that has NOT come up healthy. Make the
+	// health probe fail so we exercise the SIGKILL + cold-load path
+	// (a healthy externally-started container is now adopted instead).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: vLLM init racing for VRAM")
 
 	rec := newDockerInspectRecorder()
 	rec.setStatus("vllm-holder", "running") // holder legitimately Ready
@@ -343,7 +348,10 @@ func TestExternalStart_IgnoresStoppedAndExited(t *testing.T) {
 // "container is stopped" — but the same fix applies: SIGKILL and
 // re-route through cold-load to restore invariants.
 func TestExternalStart_DetectsRunningSleepingPeer(t *testing.T) {
-	s, _, _ := makeExternalStartScheduler(t, StateReady, StateSleeping)
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateSleeping)
+	// Rogue start, not a healthy recovery: fail the health probe so the
+	// SIGKILL + cold-load path runs (Issue #5c adopts healthy peers).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused")
 
 	rec := newDockerInspectRecorder()
 	rec.setStatus("vllm-holder", "running")
@@ -421,7 +429,10 @@ models:
 // (the still-running container would race with the cold-load's
 // docker start). It bumps the failure counter and returns.
 func TestExternalStart_StopFailureSurfacesMetricAndSkipsKick(t *testing.T) {
-	s, _, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Rogue start (unhealthy): drive the SIGKILL path so the stop-failure
+	// branch is reachable (Issue #5c adopts healthy peers before this).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused")
 
 	rec := newDockerInspectRecorder()
 	rec.setStatus("vllm-holder", "running")
@@ -448,6 +459,98 @@ func TestExternalStart_StopFailureSurfacesMetricAndSkipsKick(t *testing.T) {
 		if c == "vllm-target" {
 			t.Fatalf("KickColdLoad must NOT run when stop failed; saw docker start %s", c)
 		}
+	}
+}
+
+// TestExternalStart_AdoptsHealthyExternallyStartedPeer is the Issue #5c
+// regression: jukebox booted while an aux peer was DOWN, so the boot
+// probe latched admission Stopped. Later an operator runs
+// `docker start <peer>` and the container comes up HEALTHY. Because the
+// container's StartedAt is AFTER jukebox's bootEpoch, the boot-adopt
+// path (Issue #5b) declines. The PRE-FIX behavior then SIGKILLs the
+// healthy container and kicks an orphaning cold-load — destroying a peer
+// the operator just brought up. POST-FIX: the monitor probes /health
+// (VerifyReady), sees the peer is healthy, and ADOPTS it (state→Ready,
+// admission booked, NO docker stop, NO cold-load).
+//
+// Pre-fix: docker stop vllm-target fires → test FAILS on the no-stop
+// assertion. Post-fix: no stop, state reconciled to Ready → PASSES.
+func TestExternalStart_AdoptsHealthyExternallyStartedPeer(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Healthy externally-started container (the operator's `docker start`
+	// succeeded; vLLM came up clean).
+	mgrs["target"].verifyErr = nil
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "running") // operator just started it
+	// StartedAt AFTER bootEpoch (default recorder behavior is +1h) so the
+	// boot-adopt path declines and we reach the healthy-start-adopt path.
+	// Be explicit for clarity.
+	rec.setStartedAt("vllm-target", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Guard: if the fix regressed and a cold-load kicked, don't let it
+	// run a 5-minute poll loop in the test.
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	// CORE ASSERTION: the healthy container must NOT have been SIGKILLed.
+	if rec.stopsContains("vllm-target") {
+		t.Fatalf("PRE-FIX BUG REPRODUCED: monitor SIGKILL'd a healthy externally-started peer; stops=%v", rec.stops)
+	}
+
+	// And no cold-load docker start should have fired for it (adopt path
+	// leaves the container alone; it does not re-route through cold-load).
+	rec.mu.Lock()
+	for _, c := range rec.starts {
+		if c == "vllm-target" {
+			rec.mu.Unlock()
+			t.Fatalf("adopt path must NOT kick a cold-load (docker start) for a healthy peer; starts=%v", rec.starts)
+		}
+	}
+	rec.mu.Unlock()
+
+	// State must have been reconciled away from the stale Stopped latch.
+	// adoptPreExistingPeer flips a StateStopped peer to StateReady (the
+	// boot probe transiently failed; the container is alive now).
+	got, ok := s.InstanceStateForTest("target")
+	if !ok {
+		t.Fatalf("target instance gone from scheduler")
+	}
+	if got != StateReady {
+		t.Fatalf("expected stale Stopped latch reconciled to StateReady after healthy adopt, got %v", got)
+	}
+}
+
+// TestExternalStart_UnhealthyExternalStartStillSigkills is the negative
+// control for Issue #5c: a container that is running but NOT healthy
+// (the genuine rogue start racing for VRAM at init) must STILL be
+// SIGKILLed + re-routed through cold-load. Confirms the health probe
+// only diverts the healthy case and leaves the original Issue #5
+// protection intact for the unhealthy case.
+func TestExternalStart_UnhealthyExternalStartStillSigkills(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Unhealthy: VerifyReady fails (vLLM init in-flight / racing for VRAM).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: init in flight")
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	if !rec.stopsContains("vllm-target") {
+		t.Fatalf("unhealthy rogue start MUST still be SIGKILLed; got calls=%v", rec.calls)
 	}
 }
 
