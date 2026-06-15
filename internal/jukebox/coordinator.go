@@ -35,7 +35,22 @@ const (
 	RejectNoCapacity     RejectReason = "no_capacity"
 	RejectInsufficient   RejectReason = "insufficient_resources"
 	RejectMinUptime      RejectReason = "min_uptime"
+	// RejectCircuitOpen means the model has failed verification/startup so many
+	// consecutive times that auto-retry is suspended to stop GPU-thrashing on a
+	// persistently-poisoned engine. It clears once maxConsecutiveFailures-many
+	// failures has elapsed by the long backoff, or on a successful swap of any
+	// model (which resets failureCount).
+	RejectCircuitOpen RejectReason = "circuit_open"
 )
+
+// maxConsecutiveFailures is the point at which the coordinator stops
+// auto-retrying a failing swap. Each retry is a full cold-load (3-5 min of GPU
+// time), so an engine that fails verification N times in a row is almost
+// certainly persistently poisoned, not transiently slow — hammering it just
+// thrashes the GPU. After this many consecutive failures the circuit opens and
+// requests are rejected with a long Retry-After until a manual intervention or
+// a successful swap resets the counter.
+const maxConsecutiveFailures = 5
 
 type RejectError struct {
 	Reason     RejectReason
@@ -299,12 +314,30 @@ func (c *Coordinator) handleEnsure(req ensureReq) {
 	}
 
 	if state == StateError && failures > 0 {
+		// Circuit breaker: once we've failed this many times in a row, stop
+		// auto-retrying (each retry is a 3-5 min cold-load). A persistently
+		// poisoned engine should not be hammered — reject with a long
+		// Retry-After until a successful swap resets failureCount or an
+		// operator intervenes.
+		if failures >= maxConsecutiveFailures {
+			metrics.SwapRejectionsTotal.WithLabelValues(string(RejectCircuitOpen)).Inc()
+			req.resp <- ensureReply{err: &RejectError{
+				Reason:     RejectCircuitOpen,
+				RetryAfter: backoffDelay(failures),
+				Message:    fmt.Sprintf("model startup failed %d times consecutively; auto-retry suspended", failures),
+			}}
+			return
+		}
 		delay := backoffDelay(failures)
 		if delay > 0 {
 			until := lastFailure.Add(delay)
-			if remaining := time.Until(until); remaining > 0 {
+			// Use the injectable clock (c.now), consistent with the cooldown
+			// check below — NOT time.Until, which compares against the real
+			// wall clock and would ignore lastFailure entirely under a test
+			// clock (and is the seam that made the backoff unenforceable).
+			if now := c.now(); now.Before(until) {
 				metrics.SwapRejectionsTotal.WithLabelValues(string(RejectBackoff)).Inc()
-				req.resp <- ensureReply{err: &RejectError{Reason: RejectBackoff, RetryAfter: remaining}}
+				req.resp <- ensureReply{err: &RejectError{Reason: RejectBackoff, RetryAfter: until.Sub(now)}}
 				return
 			}
 		}
@@ -482,17 +515,25 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 	return nil
 }
 
+// backoffDelay returns the minimum delay before the next swap attempt is
+// allowed, given the consecutive-failure count. The first failure already
+// earns a real delay (NOT zero) — a verify-fail at failureCount==1 used to
+// return 0, which let the coordinator immediately cold-reload, re-fail, and
+// loop, GPU-thrashing on 3-5 min cold-loads. Every retry costs a full
+// cold-load, so even the first backoff is meaningful.
 func backoffDelay(failureCount int) time.Duration {
 	switch {
-	case failureCount <= 1:
+	case failureCount <= 0:
 		return 0
-	case failureCount == 2:
+	case failureCount == 1:
 		return 5 * time.Second
-	case failureCount == 3:
+	case failureCount == 2:
 		return 15 * time.Second
-	case failureCount == 4:
+	case failureCount == 3:
 		return 30 * time.Second
-	default:
+	case failureCount == 4:
 		return 60 * time.Second
+	default:
+		return 120 * time.Second
 	}
 }

@@ -1,9 +1,13 @@
 package runtime_test
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/runtime"
@@ -78,5 +82,42 @@ func TestRuntimeFor_UnknownName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "tgi") {
 		t.Fatalf("expected error to mention %q, got: %v", "tgi", err)
+	}
+}
+
+func TestRuntimes_VerifyForwardPass_Delegate(t *testing.T) {
+	// Both the vllm and llama.cpp runtimes expose the OpenAI-compatible
+	// /v1/completions surface, so VerifyForwardPass must hit it and treat a
+	// healthy generation as a pass and a 5xx as a failure for each runtime.
+	for _, rtName := range []string{"vllm", "llama_cpp"} {
+		t.Run(rtName, func(t *testing.T) {
+			rt, err := runtime.For(rtName)
+			if err != nil {
+				t.Fatalf("For(%q): %v", rtName, err)
+			}
+
+			okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/completions" {
+					http.NotFound(w, r)
+					return
+				}
+				_, _ = w.Write([]byte(`{"choices":[{"text":"x","finish_reason":"length"}]}`))
+			}))
+			defer okSrv.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := rt.VerifyForwardPass(ctx, okSrv.URL, "m"); err != nil {
+				t.Fatalf("%s VerifyForwardPass healthy: %v", rtName, err)
+			}
+
+			badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer badSrv.Close()
+			if err := rt.VerifyForwardPass(ctx, badSrv.URL, "m"); err == nil {
+				t.Fatalf("%s VerifyForwardPass expected failure on 500", rtName)
+			}
+		})
 	}
 }

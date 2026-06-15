@@ -2,6 +2,7 @@ package vllm_test
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -345,6 +346,102 @@ models:
 	if err := mgr.Stop(stopCtx); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
+}
+
+// TestManager_VerifyReady_SkipsForwardPassForNonGenerative proves HIGH #3: the
+// generate-style forward-pass probe (POST /v1/completions) is only run for
+// generative models. A pooling/embedding/reranker model serves /v1/embeddings
+// or /v1/rerank and 404/500s on /v1/completions — running the probe against it
+// would fail every cold-start and wake of those aux engines. So for a
+// non-generative task VerifyReady must SKIP the probe (and pass on /health +
+// /v1/models alone), while for a generative task it must RUN the probe (and
+// here FAIL, because the fake server poisons /v1/completions).
+func TestManager_VerifyReady_SkipsForwardPassForNonGenerative(t *testing.T) {
+	// Pick a free port, then bind a fake "engine" to it. /health and
+	// /v1/models are healthy; /v1/completions is poisoned (500) to stand in
+	// for an engine that does not serve generate.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	tmp := t.TempDir()
+	scriptPath := filepath.Join(tmp, "fake_engine.py")
+	script := `import http.server, json, sys
+PORT = ` + strconv.Itoa(port) + `
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+        if self.path.startswith("/v1/models"):
+            self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+            self.wfile.write(json.dumps({"data":[{"id":"m"}]}).encode()); return
+        self.send_response(404); self.end_headers()
+    def do_POST(self):
+        # Poison the generate surface: a non-generative engine has no
+        # /v1/completions, and a poisoned generative engine 500s here.
+        self.send_response(500); self.end_headers(); self.wfile.write(b'{"error":"no completions"}')
+http.server.HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	// A wrapper that ignores the vllm serve args and just runs our server.
+	wrapper := filepath.Join(tmp, "wrapper.sh")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec python3 "+scriptPath+"\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+
+	mkMgr := func(task string) *vllm.Manager {
+		cfgLoaded, err := config.Load([]byte(`
+vllm:
+  port: ` + strconv.Itoa(port) + `
+  binary: "` + wrapper + `"
+  startup_timeout: 5s
+  verify_forward_pass_timeout: 3s
+models:
+  m:
+    path: "/models/m"
+    task: "` + task + `"
+`))
+		if err != nil {
+			t.Fatalf("load (task=%q): %v", task, err)
+		}
+		return vllm.NewManager(cfgLoaded)
+	}
+
+	run := func(t *testing.T, task string) error {
+		mgr := mkMgr(task)
+		startCtx, startCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer startCancel()
+		if _, err := mgr.Start(startCtx, "m"); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		t.Cleanup(func() {
+			stopCtx, c := context.WithTimeout(context.Background(), 2*time.Second)
+			defer c()
+			_ = mgr.Stop(stopCtx)
+		})
+		readyCtx, readyCancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer readyCancel()
+		return mgr.VerifyReady(readyCtx, "m")
+	}
+
+	t.Run("embed task skips probe and passes", func(t *testing.T) {
+		if err := run(t, "embed"); err != nil {
+			t.Fatalf("non-generative VerifyReady must skip the /v1/completions probe and pass, got: %v", err)
+		}
+	})
+
+	t.Run("generate task runs probe and fails on poisoned completions", func(t *testing.T) {
+		if err := run(t, "generate"); err == nil {
+			t.Fatalf("generative VerifyReady must run the probe and fail on a poisoned /v1/completions")
+		}
+	})
 }
 
 func bytesTrimSpace(b []byte) []byte {

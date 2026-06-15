@@ -41,6 +41,11 @@ type fakeInstance struct {
 	ctrl *fakeInstanceController
 	port int
 
+	// verifyReadyFn, when set, supplies the VerifyReady result (used to
+	// simulate a poisoned post-wake engine that passes /health but fails the
+	// real forward-pass probe). nil means "ready".
+	verifyReadyFn func() error
+
 	mu  sync.Mutex
 	pid int
 
@@ -79,7 +84,12 @@ func (f *fakeInstance) Stop(_ context.Context) error {
 	return nil
 }
 
-func (f *fakeInstance) VerifyReady(_ context.Context, _ string) error { return nil }
+func (f *fakeInstance) VerifyReady(_ context.Context, _ string) error {
+	if f.verifyReadyFn != nil {
+		return f.verifyReadyFn()
+	}
+	return nil
+}
 
 func (f *fakeInstance) CurrentPID() int {
 	f.mu.Lock()
@@ -557,5 +567,108 @@ models:
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("timed out waiting for second request")
+	}
+}
+
+// TestScheduler_VerifyReadyGatesReadyState proves that the result of the
+// instance VerifyReady probe (which on a real Manager culminates in a 1-token
+// forward-pass against the engine) gates ready-state. A poisoned post-wake
+// engine — /health 200 and model registered, but the first real forward pass
+// crashes — surfaces as a VerifyReady error, and the scheduler must tear the
+// instance down (stop + release the port) and propagate the failure rather
+// than mark it ready and route user traffic into it.
+func TestScheduler_VerifyReadyGatesReadyState(t *testing.T) {
+	cfgYAML := `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8100
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 2s
+  shutdown_timeout: 1s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+`
+	tests := []struct {
+		name        string
+		verifyErr   error
+		wantErr     bool
+		wantReady   bool
+		wantStopped bool
+	}{
+		{
+			name:        "verify pass marks ready",
+			verifyErr:   nil,
+			wantErr:     false,
+			wantReady:   true,
+			wantStopped: false,
+		},
+		{
+			name:        "verify fail recovers (stop + not ready)",
+			verifyErr:   errors.New("forward-pass verification failed (engine not serving): poisoned"),
+			wantErr:     true,
+			wantReady:   false,
+			wantStopped: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := mustLoadSchedulerCfg(t, cfgYAML)
+			inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100, FreeMB: 100}}}
+			// Single-port pool: if the failed instance does not release its
+			// port, the follow-up acquire below would be starved, doubling as
+			// a port-leak assertion.
+			pool := ports.New(8100, 8100)
+			ctrl := &fakeInstanceController{}
+			factory := func(port int, _ string) jukebox.InstanceManager {
+				return &fakeInstance{
+					ctrl:          ctrl,
+					port:          port,
+					verifyReadyFn: func() error { return tc.verifyErr },
+				}
+			}
+			s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, factory, nil)
+
+			_, err := s.AcquireRoute(context.Background(), "a", "req-1")
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected AcquireRoute to fail when verify fails")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected AcquireRoute to succeed, got %v", err)
+			}
+
+			st := s.Status()
+			gotReady := false
+			for _, inst := range st.Instances {
+				if inst.State == jukebox.StateReady {
+					gotReady = true
+				}
+			}
+			if gotReady != tc.wantReady {
+				t.Fatalf("ready=%v, want %v (instances=%+v)", gotReady, tc.wantReady, st.Instances)
+			}
+
+			ctrl.mu.Lock()
+			stopped := len(ctrl.stopOrder) > 0
+			ctrl.mu.Unlock()
+			if stopped != tc.wantStopped {
+				t.Fatalf("stopped=%v, want %v", stopped, tc.wantStopped)
+			}
+
+			if tc.wantErr {
+				// The failed instance must have released its single port so a
+				// subsequent schedule can proceed (proves recovery, no leak).
+				p, ok := pool.Acquire()
+				if !ok {
+					t.Fatalf("expected port to be released after verify failure (leak)")
+				}
+				pool.Release(p)
+			}
+		})
 	}
 }

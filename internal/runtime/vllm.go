@@ -20,3 +20,7 @@ func (vllmRuntime) BuildArgs(cfg *config.Config, _ config.ModelConfig, resolvedN
 func (vllmRuntime) VerifyModelLoaded(ctx context.Context, baseURL, expectedID, expectedPath string) error {
 	return vllmcli.VerifyModelLoaded(ctx, baseURL, expectedID, expectedPath)
 }
+
+func (vllmRuntime) VerifyForwardPass(ctx context.Context, baseURL, expectedID string) error {
+	return vllmcli.VerifyForwardPass(ctx, baseURL, expectedID)
+}

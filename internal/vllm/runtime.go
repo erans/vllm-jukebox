@@ -26,19 +26,19 @@ type Manager struct {
 	// extraEnv is applied after default and model env, overriding on conflict.
 	extraEnv map[string]string
 
-	mu            sync.Mutex
-	cmd           *exec.Cmd
-	pid           int
-	waitCh        chan error
-	exitCh        chan struct{}
-	exitInfo      *processExitInfo
-	stopRequested bool
-	currentModel  string
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	pid            int
+	waitCh         chan error
+	exitCh         chan struct{}
+	exitInfo       *processExitInfo
+	stopRequested  bool
+	currentModel   string
 	currentRuntime string
-	startedAt     time.Time
-	stderrTail    *tailBuffer
-	stdoutTail    *tailBuffer
-	logWriter     *RotatingFileWriter
+	startedAt      time.Time
+	stderrTail     *tailBuffer
+	stdoutTail     *tailBuffer
+	logWriter      *RotatingFileWriter
 }
 
 type processExitInfo struct {
@@ -383,7 +383,43 @@ func (m *Manager) VerifyReady(ctx context.Context, expectedModel string) error {
 		return err
 	}
 
-	return runtimeImpl.VerifyModelLoaded(ctx, base, expectedModel, modelCfg.Path)
+	if err := runtimeImpl.VerifyModelLoaded(ctx, base, expectedModel, modelCfg.Path); err != nil {
+		return err
+	}
+
+	// /health and /v1/models only prove the HTTP server and model registry are
+	// up. They do NOT exercise the inference engine, which can be silently
+	// poisoned after a cumem sleep/wake cycle — the first real forward pass
+	// then crashes (illegal-address from a CUDA graph replaying against
+	// remapped pointers) and the client gets a 500. Run a real generation (with
+	// a genuine decode step) so a poisoned engine fails verification here,
+	// letting the scheduler tear the instance down and recover instead of
+	// routing user traffic into it.
+	//
+	// Only generative models serve /v1/completions. Pooling / embedding /
+	// reranker models (vllm-embeddings, vllm-reranker, etc.) serve
+	// /v1/embeddings or /v1/rerank and would 404/405 on the generate probe —
+	// breaking every cold-start and wake of those engines — so skip the probe
+	// for them. /health + model-loaded is the readiness gate for non-generative
+	// engines.
+	if (m.cfg.VLLM.VerifyForwardPass == nil || *m.cfg.VLLM.VerifyForwardPass) && modelCfg.IsGenerative() {
+		// Carve a dedicated probe budget separate from the inbound ctx (which
+		// is bounded by StartupTimeout and may already be near-exhausted after
+		// a slow-but-healthy large-model health-wait). Without this, a healthy
+		// 32B wake that ate most of StartupTimeout could get a near-zero
+		// deadline for its one decode step and be falsely torn down.
+		probeTimeout := m.cfg.VLLM.VerifyForwardPassTimeout.Duration
+		if probeTimeout <= 0 {
+			probeTimeout = 30 * time.Second
+		}
+		probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		defer cancel()
+		if err := runtimeImpl.VerifyForwardPass(probeCtx, base, expectedModel); err != nil {
+			return fmt.Errorf("forward-pass verification failed (engine not serving): %w", err)
+		}
+	}
+
+	return nil
 }
 
 type tailBuffer struct {
