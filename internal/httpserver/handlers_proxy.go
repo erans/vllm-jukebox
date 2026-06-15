@@ -104,6 +104,8 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 			msg = "Insufficient GPU resources to start requested model, please retry"
 		case jukebox.RejectMinUptime:
 			msg = "Insufficient GPU resources (min uptime), please retry"
+		case jukebox.RejectCircuitOpen:
+			msg = "Model startup is failing repeatedly; auto-retry suspended, please retry later"
 		}
 		return writeOpenAIError(c, http.StatusServiceUnavailable, msg, "service_unavailable", "model_switching")
 	}

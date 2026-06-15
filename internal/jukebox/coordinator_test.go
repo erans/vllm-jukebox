@@ -262,3 +262,81 @@ models:
 		t.Fatalf("expected 1 stop call after verify failure, got %d", mgr.stopCalls)
 	}
 }
+
+// TestCoordinator_BoundedRetryBackoffAndCircuitOpen proves HIGH #2: a verify
+// failure does NOT lead to an immediate retry (backoff > 0 even at the first
+// failure), and after enough consecutive failures the circuit opens and stops
+// auto-retrying entirely instead of looping on 3-5 min cold-loads.
+func TestCoordinator_BoundedRetryBackoffAndCircuitOpen(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+  shutdown_timeout: 1s
+  swap_cooldown: 0s
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load cfg: %v", err)
+	}
+
+	var tr inflight.Tracker
+	mgr := &fakeManager{verifyErr: errors.New("forward-pass verification failed (engine not serving): poisoned")}
+
+	// Mutable clock so we can advance past each backoff window to drive the
+	// failure count up deterministically.
+	now := time.Unix(0, 0)
+	clock := func() time.Time { return now }
+
+	c := jukebox.NewCoordinator(cfg, mgr, &tr, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	// First attempt actually runs the swap and fails verification.
+	if err := c.EnsureModel(context.Background(), "m", "req_1"); err == nil {
+		t.Fatalf("expected first EnsureModel to fail verification")
+	}
+	if mgr.startCalls != 1 {
+		t.Fatalf("expected exactly 1 start call after first failure, got %d", mgr.startCalls)
+	}
+
+	// HIGH #2 core: the immediate follow-up must be rejected with a NON-ZERO
+	// backoff (the old backoffDelay(1)==0 let it cold-reload instantly → loop).
+	err2 := c.EnsureModel(context.Background(), "m", "req_2")
+	var rej *jukebox.RejectError
+	if !errors.As(err2, &rej) || rej.Reason != jukebox.RejectBackoff {
+		t.Fatalf("expected backoff rejection at failureCount==1, got %v", err2)
+	}
+	if rej.RetryAfter <= 0 {
+		t.Fatalf("backoff RetryAfter must be > 0 at first failure, got %v", rej.RetryAfter)
+	}
+	// No new swap should have been attempted while backing off.
+	if mgr.startCalls != 1 {
+		t.Fatalf("backoff must NOT trigger another cold-load, start calls=%d", mgr.startCalls)
+	}
+
+	// Drive consecutive failures up by advancing past each backoff window.
+	// Each successful re-entry runs the swap (which fails again).
+	for i := 0; i < 10; i++ {
+		now = now.Add(10 * time.Minute) // past any backoff window
+		err := c.EnsureModel(context.Background(), "m", "req_loop")
+		var r *jukebox.RejectError
+		if errors.As(err, &r) && r.Reason == jukebox.RejectCircuitOpen {
+			// Circuit opened: from here on, NO further cold-loads happen.
+			startsAtOpen := mgr.startCalls
+			now = now.Add(10 * time.Minute)
+			err3 := c.EnsureModel(context.Background(), "m", "req_after_open")
+			var r3 *jukebox.RejectError
+			if !errors.As(err3, &r3) || r3.Reason != jukebox.RejectCircuitOpen {
+				t.Fatalf("expected circuit to stay open, got %v", err3)
+			}
+			if mgr.startCalls != startsAtOpen {
+				t.Fatalf("circuit-open must stop cold-loads: starts went %d -> %d", startsAtOpen, mgr.startCalls)
+			}
+			return // success: bounded
+		}
+	}
+	t.Fatalf("circuit never opened after repeated failures (start calls=%d) — retry loop is unbounded", mgr.startCalls)
+}

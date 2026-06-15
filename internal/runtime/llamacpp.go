@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/vllmcli"
 )
 
 type llamaCppRuntime struct{}
@@ -96,6 +97,12 @@ func (llamaCppRuntime) VerifyModelLoaded(ctx context.Context, baseURL, expectedI
 		}
 	}
 	return fmt.Errorf("expected model %q (or path %q) not found in /v1/models", expectedID, expectedPath)
+}
+
+func (llamaCppRuntime) VerifyForwardPass(ctx context.Context, baseURL, expectedID string) error {
+	// llama-server exposes the same OpenAI-compatible /v1/completions surface,
+	// so the shared probe applies unchanged.
+	return vllmcli.VerifyForwardPass(ctx, baseURL, expectedID)
 }
 
 // looksLikeLocalGGUF matches the heuristic from scripts/llama-server-wrapper.sh:

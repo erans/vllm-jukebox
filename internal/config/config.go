@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -69,6 +70,24 @@ type VLLMConfig struct {
 	LogDir       string `yaml:"log_dir"`
 	LogMaxSizeMB int    `yaml:"log_max_size_mb"`
 	LogMaxFiles  int    `yaml:"log_max_files"`
+
+	// VerifyForwardPass, when true (the default), runs a short real generation
+	// (a genuine decode step, not just a prefill) against the backend before an
+	// instance is marked ready. This catches a poisoned engine that passes
+	// /health and /v1/models but crashes on the first real forward pass
+	// (notably after a cumem sleep/wake cycle). Set to false only to opt out of
+	// the extra probe. The probe is only run for generative models — pooling /
+	// embedding / reranker models don't serve /v1/completions and are skipped
+	// (see ModelConfig.Task).
+	VerifyForwardPass *bool `yaml:"verify_forward_pass"`
+
+	// VerifyForwardPassTimeout bounds the forward-pass probe specifically,
+	// separately from StartupTimeout. The whole VerifyReady path (health-wait +
+	// model-loaded + forward-pass) shares StartupTimeout; carving a dedicated
+	// per-probe budget here means a slow-but-healthy large-model wake that
+	// already consumed most of StartupTimeout still gets a full window to do its
+	// one decode step instead of being torn down on a near-exhausted deadline.
+	VerifyForwardPassTimeout Duration `yaml:"verify_forward_pass_timeout"`
 }
 
 type SchedulerConfig struct {
@@ -113,6 +132,32 @@ type ModelConfig struct {
 	PowerLimit           *int              `yaml:"power_limit"`
 	PowerLimits          map[int]int       `yaml:"power_limits"`
 	LogFile              string            `yaml:"log_file"`
+
+	// Task declares what the served model does. It mirrors vLLM's --task flag.
+	// Empty (the default) means a generative model that serves /v1/completions
+	// and /v1/chat/completions. Non-generative tasks (embed / embedding /
+	// rerank / classify / score / reward / pooling) serve /v1/embeddings or
+	// /v1/rerank instead and do NOT expose /v1/completions, so the
+	// generate-style forward-pass probe must be skipped for them (it would
+	// 404/405 on every cold-start and wake).
+	Task string `yaml:"task"`
+}
+
+// IsGenerative reports whether the model serves the OpenAI /v1/completions /
+// /v1/chat/completions surface (the only surface the forward-pass probe knows
+// how to exercise). Pooling models — embeddings, rerankers, classifiers —
+// serve /v1/embeddings or /v1/rerank instead and must not be probed with a
+// generate request. Empty Task defaults to generative for backward
+// compatibility with existing configs.
+func (m ModelConfig) IsGenerative() bool {
+	switch strings.ToLower(strings.TrimSpace(m.Task)) {
+	case "", "generate", "generation", "draft", "transcription":
+		return true
+	default:
+		// embed, embedding, embeddings, classify, score, reward, rerank,
+		// reranker, pooling, etc. — non-generative.
+		return false
+	}
 }
 
 func Load(data []byte) (*Config, error) {
@@ -169,6 +214,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.VLLM.SwapWaitTimeout.Duration == 0 {
 		c.VLLM.SwapWaitTimeout = Duration{Duration: 60 * time.Second}
+	}
+	if c.VLLM.VerifyForwardPass == nil {
+		// Default on: a short real generate (with a genuine decode step)
+		// catches a poisoned post-wake engine that /health and /v1/models miss.
+		v := true
+		c.VLLM.VerifyForwardPass = &v
+	}
+	if c.VLLM.VerifyForwardPassTimeout.Duration == 0 {
+		// Dedicated per-probe budget, independent of StartupTimeout. 30s is
+		// generous for a 2-token generate even on a large model that just woke.
+		c.VLLM.VerifyForwardPassTimeout = Duration{Duration: 30 * time.Second}
 	}
 	if c.VLLM.DefaultEnv == nil {
 		c.VLLM.DefaultEnv = map[string]string{}

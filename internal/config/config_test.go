@@ -796,3 +796,46 @@ func TestLoad_QwenLlamaCppExampleParses(t *testing.T) {
 		t.Fatalf("expected example to parse, got: %v", err)
 	}
 }
+
+func TestModelConfig_IsGenerative(t *testing.T) {
+	cases := map[string]bool{
+		"":              true, // default = generative (backward compatible)
+		"generate":      true,
+		"GENERATE":      true, // case-insensitive
+		" generate ":    true, // trimmed
+		"transcription": true,
+		"embed":         false,
+		"embedding":     false,
+		"rerank":        false,
+		"reranker":      false,
+		"classify":      false,
+		"score":         false,
+		"reward":        false,
+		"pooling":       false,
+	}
+	for task, want := range cases {
+		got := config.ModelConfig{Task: task}.IsGenerative()
+		if got != want {
+			t.Fatalf("IsGenerative(task=%q)=%v, want %v", task, got, want)
+		}
+	}
+}
+
+func TestLoad_VerifyForwardPassDefaults(t *testing.T) {
+	cfg, err := loadFromYAML(t, `
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.VLLM.VerifyForwardPass == nil || !*cfg.VLLM.VerifyForwardPass {
+		t.Fatalf("VerifyForwardPass should default to true")
+	}
+	if cfg.VLLM.VerifyForwardPassTimeout.Duration != 30*time.Second {
+		t.Fatalf("VerifyForwardPassTimeout should default to 30s, got %v", cfg.VLLM.VerifyForwardPassTimeout.Duration)
+	}
+}
