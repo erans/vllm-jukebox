@@ -16,31 +16,36 @@ type Tracker struct {
 func (t *Tracker) Track(_ context.Context) (done func()) {
 	t.mu.Lock()
 	t.count++
-	count := t.count
+	// Emit the change WHILE holding the lock so the observed sequence of
+	// OnChange values can never diverge from the sequence of counter
+	// mutations. If we snapshotted under the lock but called notify() after
+	// unlocking (the original design), two concurrent Track/done callers
+	// could swap their notify order and latch the gauge at a stale value
+	// while the true count is something else — a wrong Prometheus gauge
+	// under concurrency. OnChange is a single Gauge.Set, so holding the
+	// (uncontended-in-the-common-case) lock across it is cheap.
+	t.notify(t.count)
 	t.mu.Unlock()
-	t.notify(count)
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			t.mu.Lock()
+			defer t.mu.Unlock()
 			if t.count <= 0 {
 				t.count = 0
-				t.mu.Unlock()
 				t.notify(0)
 				return
 			}
 
 			t.count--
-			count := t.count
 			if t.count == 0 {
 				for _, ch := range t.waiters {
 					close(ch)
 				}
 				t.waiters = nil
 			}
-			t.mu.Unlock()
-			t.notify(count)
+			t.notify(t.count)
 		})
 	}
 }

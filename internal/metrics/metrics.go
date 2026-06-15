@@ -610,6 +610,21 @@ var (
 		},
 		[]string{"target", "direction"},
 	)
+
+	// Counter: streaming responses aborted by the proxy's idle watchdog —
+	// an upstream SSE stream that made ZERO read progress for longer than
+	// the idle timeout (a wedged/dead engine: #45094-style running>0 with
+	// 0 decode progress, where /health lies 200). The watchdog cancels the
+	// upstream request to unblock the stalled read so its load-bearing
+	// inflight token + vLLM decode slot are released in bounded time rather
+	// than pinned forever. A non-zero rate means streams are stalling — a
+	// signal of an engine wedge or a pathologically slow decode under load.
+	StreamIdleTimeoutsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "jukebox_stream_idle_timeouts_total",
+			Help: "Total streaming responses aborted by the proxy idle watchdog (no read progress within the idle timeout).",
+		},
+	)
 )
 
 func init() {
@@ -664,6 +679,7 @@ func init() {
 		UpstreamTransportErrorsTotal,
 		UpstreamTCPAlive,
 		UpstreamTCPTransitionsTotal,
+		StreamIdleTimeoutsTotal,
 	)
 }
 
