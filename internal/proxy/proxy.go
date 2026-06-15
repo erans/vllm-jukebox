@@ -279,10 +279,29 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 			defer cancel()       // stop the watchdog + free reqCtx
 			defer stopWatchdog() // ensure the watchdog goroutine exits
 			defer resp.Body.Close()
+			var copyErr error
 			if opts.RewriteModelName && opts.RequestedModel != "" {
-				_ = RewriteSSEModel(ar, w, opts.RequestedModel)
+				copyErr = RewriteSSEModel(ar, w, opts.RequestedModel)
 			} else {
-				_, _ = copyWithFlush(ar, w)
+				_, copyErr = copyWithFlush(ar, w)
+			}
+			// Watchdog-attributable abort: the idle watchdog cancels reqCtx
+			// when an upstream SSE stream makes ZERO read progress for longer
+			// than streamIdleTimeout (the #45094 wedge signature). That cancel
+			// surfaces here as a read error on resp.Body. The HTTP status +
+			// headers were already flushed to the client at stream start, so
+			// we CANNOT change the status. A bare Flush of a partial body
+			// looks IDENTICAL to a complete response on the wire (no terminal
+			// data: [DONE], no error) — silent truncation: the client (and
+			// openwebui RAG) treats a truncated reasoning/answer stream as a
+			// finished one. An in-band SSE error frame is the only honest
+			// terminal signal available once headers are sent. We attribute
+			// via reqCtx.Err(): during the stream the watchdog goroutine is
+			// the ONLY caller of cancel() before these defers run, so a
+			// non-nil reqCtx error here means the watchdog fired (not a
+			// normal EOF, which leaves reqCtx live until the deferred cancel).
+			if copyErr != nil && reqCtx.Err() != nil {
+				writeStreamStallErrorFrame(w)
 			}
 			_ = w.Flush()
 		})
@@ -294,7 +313,22 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	cancel()
 	if readErr != nil {
 		release()
-		return readErr
+		// Mid-body read failure on a BUFFERED response: the upstream sent
+		// response headers (so c.Status was already Set to the real upstream
+		// code) but then the body read failed — connection reset, upstream
+		// crash mid-flight, declared Content-Length never satisfied, etc.
+		// Returning the raw Go error to Fiber's default error handler is the
+		// silent-truncation bug for buffered responses: the status stays at
+		// whatever upstream sent (commonly 200), and the raw error string —
+		// which can carry the internal upstream host/port — escapes into the
+		// body. A consumer (openwebui RAG) treats that partial/garbage as a
+		// complete 200. We never wrote any body bytes yet (io.ReadAll buffers
+		// before c.Send), so it is safe to discard the upstream status and
+		// emit the same sanitized 503 + Retry-After the pre-response transport
+		// path uses, and bump the transport-error metric. We do NOT re-fire
+		// OnComplete: it already fired above with the REAL upstream status, and
+		// a body-copy failure is a transport problem, not a second engine verdict.
+		return writeTransportError(c, readErr, opts)
 	}
 
 	if opts.RewriteModelName && opts.RequestedModel != "" && strings.Contains(strings.ToLower(contentType), "application/json") {
@@ -470,6 +504,27 @@ func startIdleWatchdog(ar *activityReader, timeout time.Duration, cancel context
 	}()
 	var once sync.Once
 	return func() { once.Do(func() { close(done) }) }
+}
+
+// streamStallErrorFrame is the verbatim in-band SSE payload the proxy writes
+// to a streaming response that the idle watchdog aborted mid-flight. Because
+// the HTTP status + headers were already sent when the stream opened, this
+// terminal frame is the ONLY way to tell the client the stream did NOT
+// complete normally — without it, a truncated stream is byte-indistinguishable
+// from a finished one (silent truncation on an engine wedge). The shape mirrors
+// the OpenAI streaming error convention (a `data:` line carrying an `error`
+// object) so SDK stream parsers surface it as an error rather than swallowing
+// it as content. It is intentionally NOT followed by a `data: [DONE]` line:
+// [DONE] signals successful completion, which is exactly the false signal we
+// are correcting. The code "upstream_stalled" is the in-band analogue of the
+// transport path's "model_unavailable".
+const streamStallErrorFrame = "data: {\"error\":{\"message\":\"Upstream model server stopped producing output (stream stalled); the response is incomplete.\",\"type\":\"upstream_error\",\"code\":\"upstream_stalled\"}}\n\n"
+
+// writeStreamStallErrorFrame writes the terminal stall error frame to the SSE
+// body writer. A write error is ignored: if the client already hung up there
+// is nobody to inform, and the caller flushes immediately after.
+func writeStreamStallErrorFrame(w *bufio.Writer) {
+	_, _ = w.WriteString(streamStallErrorFrame)
 }
 
 func copyWithFlush(r io.Reader, w *bufio.Writer) (int64, error) {

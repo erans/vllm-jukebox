@@ -68,9 +68,11 @@ func TestForwardFiber_StreamIdleWatchdogReleasesOnStall(t *testing.T) {
 	// app.Test drains the body; the watchdog should fire ~streamIdleTimeout
 	// after the last chunk, ending the body copy and firing Release.
 	resp, err := app.Test(req, 5000)
+	var bodyStr string
 	if err == nil && resp != nil {
-		_, _ = io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		bodyStr = string(b)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -81,6 +83,28 @@ func TestForwardFiber_StreamIdleWatchdogReleasesOnStall(t *testing.T) {
 		t.Fatalf("idle watchdog must release the inflight token on a stalled "+
 			"stream; release fired %d times (phantom inflight leak)",
 			atomic.LoadInt64(&released))
+	}
+
+	// P2: the watchdog-aborted stream MUST carry a terminal in-band SSE error
+	// frame. The HTTP status + headers were already flushed when the stream
+	// opened, so a bare partial body looks byte-identical to a completed
+	// response (silent truncation on an engine wedge). The in-band error
+	// frame is the only honest terminal signal. It must NOT be accompanied by
+	// a `data: [DONE]` (that would re-assert false success).
+	if !strings.Contains(bodyStr, "upstream_stalled") {
+		t.Errorf("watchdog-aborted stream must emit a terminal upstream_stalled "+
+			"error frame (silent-truncation guard); body=%q", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"error"`) {
+		t.Errorf("terminal frame must carry an OpenAI-style error object; body=%q", bodyStr)
+	}
+	if strings.Contains(bodyStr, "[DONE]") {
+		t.Errorf("a stalled/aborted stream must NOT emit data: [DONE] (false success); body=%q", bodyStr)
+	}
+	// The earlier successfully-copied chunks should still be present (the frame
+	// is appended, it does not replace delivered content).
+	if !strings.Contains(bodyStr, "chunk") {
+		t.Errorf("pre-stall chunks should still be delivered before the error frame; body=%q", bodyStr)
 	}
 }
 

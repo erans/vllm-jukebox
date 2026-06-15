@@ -262,6 +262,141 @@ models:
 	}
 }
 
+// TestPerformWake_ClientCancelDuringProbeNotPhantom is the P1-A regression
+// guard. A post-wake verify probe that fails with a transport error
+// (vllmcli classifies ANY transport error as ErrWakeVerifyPhantom) WHILE
+// the inbound request ctx has been cancelled by a client disconnect MUST
+// NOT be treated as a phantom wedge:
+//   - /wake_up already returned 200 (sc.Wake reported nil).
+//   - The probe error is an artifact of the CLIENT going away, not the
+//     engine wedging.
+//
+// Pre-fix the wake path ran the probe under the inbound request ctx, so a
+// client hangup canceled it mid-probe → context.Canceled surfaced as a
+// transport error → ErrWakeVerifyPhantom → admission rolled back + a
+// 10-minute RedeployMember of a healthy engine fired. This is the spurious
+// recreate on the HOT PATH.
+//
+// Post-fix: the probe is detached from request cancellation and, as a
+// belt-and-suspenders guard, a probe error observed while ctx.Err() != nil
+// is reclassified as a healthy wake. Assertions:
+//  1. NO RedeployMember scheduled (the spurious-recreate bug).
+//  2. inst.state == StateReady (wake completed; /wake_up returned 200).
+//  3. Admission still booked (NOT rolled back) — the awake footprint
+//     stays on the books so a concurrent peer can't double-book the GPU.
+//  4. performWake returns nil (consumer-facing: not a 503).
+func TestPerformWake_ClientCancelDuringProbeNotPhantom(t *testing.T) {
+	cfgYAML := `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8199
+vllm:
+  port: 8000
+  startup_timeout: 1s
+  drain_timeout: 100ms
+models:
+  vllm-main:
+    lifecycle: external
+    host: vllm-main
+    port: 8002
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    sleep_mode: true
+    expected_vram_mb_per_gpu: 5000
+    sleep_l1_residual_mb: 0
+    wake_verify_timeout_ms: 1000
+`
+	if _, err := config.Load([]byte(cfgYAML)); err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	totals := map[int]int{0: 8000}
+	s, a, _ := makeRedeployScheduler(t, cfgYAML, nil, totals)
+
+	mgr := &phantomFakeMgr{
+		fakeRedeployMgr: fakeRedeployMgr{port: 8002},
+		url:             "http://clientcancel-target.test:8002",
+	}
+	mgr.pid.Store(int64(7000 + 8002))
+	mgr.isSleeping.Store(true)
+	s.SeedInstanceForTest("vllm-main", 8002, []int{0}, false, StateSleeping, mgr)
+
+	// The probe returns the SAME error vllmcli emits when a client hangup
+	// cancels the in-flight HTTP request: a transport error wrapped in
+	// ErrWakeVerifyPhantom, with context.Canceled at the root. Pre-fix this
+	// is indistinguishable from a real wedge and triggers a recreate.
+	probeFired := atomic.Int32{}
+	restoreProbe := SetWakeVerifyProbeForTest(func(probeCtx context.Context, _, _, _ string, _ time.Duration) error {
+		probeFired.Add(1)
+		return fmt.Errorf("%w: POST /v1/completions: %v",
+			vllmcli.ErrWakeVerifyPhantom, context.Canceled)
+	})
+	defer restoreProbe()
+
+	// Recreate recorder — MUST stay zero. A scheduled recreate here is the
+	// exact bug: a 10-minute teardown+rebuild of a healthy engine because a
+	// browser tab closed.
+	recreates := atomic.Int32{}
+	restoreRedeploy := SetRedeployMemberAsyncForTest(func(_ string) {
+		recreates.Add(1)
+	})
+	defer restoreRedeploy()
+
+	var phantomAudits atomic.Int32
+	prevAudit := SetLifecycleAuditSinkForTest(func(ev LifecycleEvent) {
+		if ev.Action == LifecycleWake && ev.Reason == "phantom-wake-detected" && ev.Model == "vllm-main" {
+			phantomAudits.Add(1)
+		}
+	})
+	defer SetLifecycleAuditSinkForTest(prevAudit)
+
+	targetInst := s.instances["vllm-main"]
+	targetCfg := s.cfg.Models["vllm-main"]
+
+	// Inbound request ctx that the "client" has already cancelled — the
+	// hangup happened mid-wake (after /wake_up returned 200, during the
+	// verify probe). This is the load-bearing precondition.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := s.performWake(ctx, targetInst, targetCfg, "test-client-cancel")
+	if err != nil {
+		t.Fatalf("expected wake to succeed (client hangup is NOT a wedge); got %v", err)
+	}
+
+	if got := probeFired.Load(); got != 1 {
+		t.Errorf("expected verify probe to fire exactly once; got %d", got)
+	}
+
+	// CRITICAL (the bug): NO recreate scheduled for a client disconnect.
+	if got := recreates.Load(); got != 0 {
+		t.Errorf("expected ZERO redeploys on client-disconnect-during-probe (healthy engine, /wake_up returned 200); got %d", got)
+	}
+
+	// State flips Ready — /wake_up returned 200, the decode-probe monitor
+	// owns catching any genuine post-wake wedge.
+	if st, ok := s.InstanceStateForTest("vllm-main"); !ok {
+		t.Fatalf("instance lookup failed")
+	} else if st != StateReady {
+		t.Errorf("expected StateReady after client-cancel wake; got %s", st)
+	}
+
+	// Admission still booked — NOT rolled back. A rollback here would let a
+	// concurrent GPU-overlapping wake double-book the VRAM this engine holds.
+	// expected_vram_mb_per_gpu is 5000 on GPU 0; a successful (healthy)
+	// wake books that as AwakeMB. A rollback (NotifySleep) would zero it.
+	snap := a.SnapshotBudgets()
+	if len(snap) == 0 {
+		t.Fatalf("SnapshotBudgets returned no GPUs")
+	}
+	if snap[0].AwakeMB != 5000 {
+		t.Errorf("expected admission to remain booked awake (AwakeMB==5000) after client-cancel wake; got %d (rolled-back?)", snap[0].AwakeMB)
+	}
+
+	if got := phantomAudits.Load(); got != 0 {
+		t.Errorf("expected NO phantom-wake-detected audit on client disconnect; got %d", got)
+	}
+}
+
 // TestPerformWake_VerifyProbeDisabledByConfig proves that setting
 // wake_verify_timeout_ms: -1 in the model config skips the probe
 // entirely — preserves the pre-defense behavior for operators who

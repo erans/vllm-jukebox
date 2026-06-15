@@ -3063,7 +3063,50 @@ func (s *Scheduler) performWakeFromInsideColdLoadLock(ctx context.Context, inst 
 		// vLLM that was launched with a non-default served name.
 		servedName := modelCfg.EffectiveServedModelName(inst.model)
 		probeStart := s.now()
-		if probeErr := probe(ctx, baseURL, servedName, modelCfg.Runner, verifyBudget); probeErr != nil {
+		// HOT-PATH FIX (P1-A): the verify probe is a FLEET-CORRECTNESS check,
+		// not a request-scoped operation. /wake_up has already returned 200;
+		// this probe decides whether to flip Ready or to roll admission back
+		// and recreate a (possibly healthy) engine. If we ran it under the
+		// inbound request ctx, a CLIENT DISCONNECT (browser tab closed, proxy
+		// hangup) cancels ctx mid-probe → the transport error surfaces as
+		// context.Canceled → vllmcli classifies ANY transport error as
+		// ErrWakeVerifyPhantom → we roll back admission, re-wake victims, and
+		// fire a 10-minute RedeployMember of a perfectly healthy engine. That
+		// is a spurious recreate triggered by a client that simply went away.
+		//
+		// Detach the probe from request cancellation via context.WithoutCancel
+		// (mirrors the context.Background() pattern used for wake-from-Stopped
+		// at ~973) so the probe runs to its own verify budget regardless of
+		// the inbound request's fate. The probe's internal WithTimeout still
+		// bounds it; we ALSO bound the detached ctx here as defense-in-depth.
+		//
+		// Belt-and-suspenders: even with the detached ctx, if the inbound ctx
+		// was already cancelled by the time the probe returns an error, we
+		// know the client went away — so we do NOT classify a probe error as
+		// phantom. /wake_up returned 200; flip Ready, keep admission booked,
+		// and let the decode-probe monitor catch a real wedge later. This
+		// guards the case where the hook/probe still observes ctx (e.g. a
+		// shared transport) or returns before WithoutCancel fully insulates.
+		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), verifyBudget)
+		probeErr := probe(probeCtx, baseURL, servedName, modelCfg.Runner, verifyBudget)
+		probeCancel()
+		if probeErr != nil && ctx.Err() != nil {
+			// Client disconnected (request ctx cancelled). /wake_up already
+			// returned 200 — this is NOT a wedge, it's a hangup. Do NOT
+			// redeploy a healthy engine. Fall through to the Ready transition
+			// exactly as if the probe had succeeded; the decode-probe monitor
+			// remains responsible for catching a genuine post-wake wedge.
+			slog.Warn("wake_verify_probe_client_canceled",
+				"model", inst.model,
+				"trigger", trigger,
+				"ctx_err", ctx.Err(),
+				"probe_err", probeErr,
+				"probe_elapsed_ms", s.now().Sub(probeStart).Milliseconds(),
+				"note", "client disconnected during verify probe; /wake_up returned 200, treating wake as healthy (no redeploy)",
+			)
+			probeErr = nil
+		}
+		if probeErr != nil {
 			probeDur := s.now().Sub(probeStart)
 			// Endpoint-unsupported is NOT a wake failure. Embedding /
 			// reranker models (runner: pooling, launched --task embed) do

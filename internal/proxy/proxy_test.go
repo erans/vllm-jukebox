@@ -309,3 +309,92 @@ func TestForwardFiber_NonRewrittenStatusesPassThrough(t *testing.T) {
 		})
 	}
 }
+
+// TestForwardFiber_BufferedMidBodyReadErrorReturns503 is the regression test
+// for the buffered-response silent-truncation bug. The upstream sends a 200
+// with a Content-Length larger than the bytes it actually writes, then hangs
+// up the connection. io.ReadAll on the proxy side fails mid-body with
+// io.ErrUnexpectedEOF. Pre-fix the proxy returned that raw Go error to
+// Fiber's default error handler: the status stayed at the upstream's 200
+// (already Set before the body read) and the raw error string escaped into
+// the body — a partial/garbage response that openwebui RAG treats as a
+// complete 200. The fix routes the mid-body read error through the same
+// sanitizer the pre-response transport path uses: a clean 503 +
+// model_unavailable envelope + Retry-After, with no raw error / internal
+// detail leaked.
+func TestForwardFiber_BufferedMidBodyReadErrorReturns503(t *testing.T) {
+	// httptest's handler can't easily close mid-body with a declared
+	// Content-Length, so hijack the conn and write a raw HTTP/1.1 response
+	// whose Content-Length lies, then close the socket before satisfying it.
+	const internalMarker = "vllm-main-internal-secret"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("ResponseWriter does not support hijacking")
+			return
+		}
+		conn, bufrw, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		// Declare 4096 bytes, then write far fewer and slam the connection.
+		// The marker stands in for any internal detail the read error might
+		// otherwise carry — it must not leak to the client.
+		_, _ = bufrw.WriteString("HTTP/1.1 200 OK\r\n")
+		_, _ = bufrw.WriteString("Content-Type: application/json\r\n")
+		_, _ = bufrw.WriteString("Content-Length: 4096\r\n")
+		_, _ = bufrw.WriteString("\r\n")
+		_, _ = bufrw.WriteString(`{"partial":"` + internalMarker + `"`)
+		_ = bufrw.Flush()
+		_ = conn.Close() // hang up before the declared body is complete
+	}))
+	defer upstream.Close()
+
+	app := fiber.New()
+	app.Post("/v1/chat/completions", func(c *fiber.Ctx) error {
+		return ForwardFiber(c, ForwardOptions{
+			BaseURL:        upstream.URL,
+			RequestedModel: "vllm-main",
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"vllm-main"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, 5000)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("buffered mid-body read error must surface as 503, got status=%d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got != upstream429RetryAfterSeconds {
+		t.Errorf("expected Retry-After=%q on sanitized 503, got %q", upstream429RetryAfterSeconds, got)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Must be the clean JSON error envelope, not the partial upstream body
+	// or a raw Go error.
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("503 body must be valid JSON error envelope; got %q (unmarshal err: %v)", bodyStr, err)
+	}
+	if env.Error.Code != "model_unavailable" {
+		t.Errorf("expected error.code=model_unavailable, got %q (body=%q)", env.Error.Code, bodyStr)
+	}
+	// Neither the partial upstream payload nor any raw read-error text may leak.
+	for _, leak := range []string{internalMarker, "partial", "unexpected EOF", "io."} {
+		if strings.Contains(bodyStr, leak) {
+			t.Errorf("internal/partial detail %q leaked into client-facing body: %q", leak, bodyStr)
+		}
+	}
+}

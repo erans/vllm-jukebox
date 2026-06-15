@@ -217,8 +217,25 @@ func (s *Scheduler) adoptPreExistingPeer(name string, observedState State, model
 		// Container is alive — must have been a transient probe
 		// failure at boot. Reconcile to Ready + tell admission the
 		// container is started so it accounts for the running VRAM.
+		//
+		// P1-B fix (#314 residual-booking gap → OOM): we flip the
+		// schedInstance to StateReady below, which makes tryRouteReady
+		// route 100% of traffic to this peer with NO RequestWake gate
+		// (a Ready instance is treated as already-awake). The admission
+		// books MUST therefore reflect the FULL awake VRAM footprint, not
+		// the L1 residual. NotifyStarted (→ markStartedLocked) books only
+		// L1ResidualMB and transitions the model to admissionSleeping —
+		// which is correct for the cold-load-settle path (a peer that
+		// came up slept-L1 and will take the wake path on first demand),
+		// but WRONG here: we are routing it as awake immediately. With
+		// only the residual booked, a concurrent GPU-overlapping wake of
+		// a sibling sees ~full free VRAM, admits, and both engines map
+		// VRAM on the same GPU → OOM. Book the full awake footprint via
+		// NotifyStartedAwake (→ markStartedAwakeLocked) so the budget
+		// matches the routing decision. This mirrors how the Sleeping
+		// branch + RegisterExternalInstances correctly book reality.
 		if s.admission != nil {
-			s.admission.NotifyStarted(name)
+			s.admission.NotifyStartedAwake(name)
 		}
 		s.mu.Lock()
 		if inst := s.instances[name]; inst != nil {
