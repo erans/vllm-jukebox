@@ -332,12 +332,19 @@ func (e *SchedulerEvictor) StopForEviction(ctx context.Context, victim, reason s
 	inst.draining = true
 	prevState := inst.state
 	inst.state = StateStopping
+	// Seal the inflight tracker in the same critical section as the
+	// StateStopping flip — closes the drain-barrier TOCTOU window on the
+	// docker-stop path exactly as sleepInstance does it for /sleep. Without
+	// the seal a request could Track() in after WaitForDrain returns 0 and
+	// then be torn down mid-decode by `docker stop`.
+	_ = inst.inflight.Seal()
 	e.S.mu.Unlock()
 	defer func() {
-		// On error, restore previous state — admission's bookkeeping
-		// rollback is its caller's responsibility.
+		// On error/panic, restore previous state and re-open admission —
+		// admission's bookkeeping rollback is its caller's responsibility.
 		if r := recover(); r != nil {
 			e.S.mu.Lock()
+			inst.inflight.Unseal()
 			inst.state = prevState
 			inst.draining = false
 			e.S.mu.Unlock()
@@ -360,6 +367,7 @@ func (e *SchedulerEvictor) StopForEviction(ctx context.Context, victim, reason s
 	out, err := runSleepDocker(stopCtx, "docker", "stop", "-t", "60", modelCfg.Host)
 	if err != nil {
 		e.S.mu.Lock()
+		inst.inflight.Unseal()
 		inst.state = prevState
 		inst.draining = false
 		e.S.mu.Unlock()
@@ -369,6 +377,12 @@ func (e *SchedulerEvictor) StopForEviction(ctx context.Context, victim, reason s
 	e.S.mu.Lock()
 	inst.state = StateStopped
 	inst.draining = false
+	// The container is stopped; re-open admission so a later wake-from-Stopped
+	// (KickColdLoad / performWake) re-admits cleanly. tryRouteReady gates on
+	// state != StateReady, so a sealed-but-Stopped instance never receives a
+	// Track until it is cold-loaded back to Ready — but a missed Unseal would
+	// perma-seal across the eventual restart.
+	inst.inflight.Unseal()
 	e.S.mu.Unlock()
 
 	// Stops are tracked in jukebox_vllm_stops_total; not double-counted
@@ -2494,7 +2508,44 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 	inst.draining = true
 	prevState := inst.state
 	inst.state = StateStopping
+	// Seal the inflight tracker in the SAME critical section that flips
+	// StateStopping. The seal lives on the tracker's own mutex — the only
+	// lock atomic across both Track and the WaitForDrain observation below
+	// — so it closes the drain-barrier TOCTOU window (vllm#45520): once we
+	// observe a zero drain, no request can Track() in between that
+	// observation and sc.Sleep(). Without the seal, routeForInstance gates
+	// only on the concurrency cap and could admit a request mid-decode that
+	// then races /sleep into cudaErrorIllegalAddress.
+	alreadyDrained := inst.inflight.Seal()
 	s.mu.Unlock()
+	_ = alreadyDrained // observed atomically with the seal; the drain wait
+	// below is the authoritative gate, captured here per the seal contract.
+
+	// rollback unwinds the seal + state mutation. It MUST run on every exit
+	// path that does NOT leave the instance successfully slept: drain-timeout
+	// reject, sc.Sleep error, host-unresolvable reconcile (which sets its own
+	// terminal state), and the wedge-recovery branches. The success path
+	// (state→StateSleeping) calls Unseal explicitly so parked/future requests
+	// re-route via the wake path and discover StateSleeping — a missed Unseal
+	// would perma-seal the instance and wedge every future request.
+	rollback := func(restore State) {
+		s.mu.Lock()
+		inst.inflight.Unseal()
+		inst.state = restore
+		inst.draining = false
+		s.mu.Unlock()
+	}
+	// Panic-safety: every explicit return below unseals via rollback or the
+	// success-path Unseal, but a panic between Seal and a normal exit would
+	// leave the tracker sealed and perma-wedge the instance. Unseal on panic,
+	// then re-panic so the failure still surfaces. Unseal is idempotent, so
+	// this is a no-op on the (already-unsealed) normal paths.
+	defer func() {
+		if r := recover(); r != nil {
+			inst.inflight.Unseal()
+			panic(r)
+		}
+	}()
 
 	// Guard A (drain barrier — defends vllm#45520). Strict drain wait
 	// before the existing best-effort drain. Calling /sleep while
@@ -2525,10 +2576,7 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 				"trigger_reason", reason,
 				"upstream_ref", "vllm#45520",
 			)
-			s.mu.Lock()
-			inst.state = prevState
-			inst.draining = false
-			s.mu.Unlock()
+			rollback(prevState)
 			return fmt.Errorf("%w: model %q has %d in-flight requests after %s drain wait",
 				ErrSleepRejectedInflight, inst.model, remaining, cumemDrainTimeout)
 		}
@@ -2634,6 +2682,7 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 			s.mu.Lock()
 			inst.state = StateStopped
 			inst.draining = false
+			inst.inflight.Unseal()
 			s.mu.Unlock()
 			if s.admission != nil {
 				s.admission.NotifyStopped(inst.model)
@@ -2661,6 +2710,7 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 			s.mu.Lock()
 			inst.state = StateSleeping
 			inst.draining = false
+			inst.inflight.Unseal()
 			s.mu.Unlock()
 			// Mirror the success-path bookkeeping (subset — we don't have a
 			// duration to record because the API call errored). Use the
@@ -2689,10 +2739,7 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 		}
 		// Probes say vLLM is NOT sleeping (or all probes errored): safe
 		// to roll back to prevState so callers can fall back to a hard stop.
-		s.mu.Lock()
-		inst.state = prevState
-		inst.draining = false
-		s.mu.Unlock()
+		rollback(prevState)
 		return fmt.Errorf("sleep API: %w", err)
 	}
 
@@ -2721,6 +2768,15 @@ func (s *Scheduler) sleepInstance(ctx context.Context, inst *schedInstance, leve
 	s.mu.Lock()
 	inst.state = StateSleeping
 	inst.draining = false
+	// Unseal on the SUCCESS path too: the instance is now slept, and
+	// parked/future requests must re-route via the wake-coalesced path
+	// (tryRouteFromSleep) where they discover StateSleeping and block on a
+	// wakeOp. A missed Unseal here would perma-seal the instance — every
+	// future request would be refused by Track and wedge. Track's own
+	// StateSleeping gate (routeForInstance never reaches a sealed slept
+	// instance because tryRouteReady short-circuits on state != StateReady)
+	// means re-opening admission here is safe.
+	inst.inflight.Unseal()
 	s.mu.Unlock()
 
 	dur := s.now().Sub(start)

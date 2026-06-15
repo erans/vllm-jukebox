@@ -2,6 +2,7 @@ package jukebox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -18,6 +19,14 @@ import (
 	"vllm-jukebox/internal/ports"
 	"vllm-jukebox/internal/vllm"
 )
+
+// errSealedRetryViaWake is returned by routeForInstance when the target
+// instance's inflight tracker has been sealed by an in-progress sleep
+// (drain-barrier TOCTOU fix, vllm#45520). It is NOT a client-facing
+// rejection: AcquireRoute (and tryRouteReady) treat it as "not handled" so
+// the request falls through to the wake-coalesced path (tryRouteFromSleep),
+// which blocks on the wakeOp and succeeds on the woken instance with no 503.
+var errSealedRetryViaWake = errors.New("instance sealed for sleep; retry via wake path")
 
 type Scheduler struct {
 	cfg      *config.Config
@@ -583,6 +592,12 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	_, startErr := mgr.Start(startCtx, resolvedName)
 	cancel()
 	if startErr != nil {
+		// Revert any per-GPU watt cap we applied above — otherwise a failed
+		// cold-load leaves the override pinned (RevertModelLimits is a no-op
+		// if no override was applied).
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		s.ports.Release(port)
 		return Route{}, startErr
 	}
@@ -594,6 +609,10 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), s.cfg.VLLM.ShutdownTimeout.Duration)
 		_ = mgr.Stop(stopCtx)
 		stopCancel()
+		// Same power-cap revert as the start-fail branch above.
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		s.ports.Release(port)
 		return Route{}, verifyErr
 	}
@@ -741,6 +760,13 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 
 	route, err := s.routeForInstance(ctx, inst, upstreamModel)
 	if err != nil {
+		if errors.Is(err, errSealedRetryViaWake) {
+			// Instance is sealed by an in-progress sleep. Report
+			// handled=false so AcquireRoute falls through to
+			// tryRouteFromSleep (wake-coalesced, no 503) rather than
+			// surfacing a rejection.
+			return Route{}, false, nil
+		}
 		// Instance was the route target (handled) but admission refused
 		// (concurrency cap). Surface handled=true + err so AcquireRoute
 		// returns the RejectError rather than falling through to a
@@ -781,9 +807,19 @@ func (s *Scheduler) routeForInstance(ctx context.Context, inst *schedInstance, u
 
 	var instDone func()
 	if inst != nil {
-		instDone = inst.inflight.Track(ctx)
+		var ok bool
+		instDone, ok = inst.inflight.Track(ctx)
+		if !ok {
+			// The instance is sealed by an in-progress sleep (drain-barrier
+			// TOCTOU fix). Refuse to admit onto a backend about to /sleep —
+			// the caller re-routes via the wake-coalesced path instead of
+			// 503'ing. No counter was incremented, so nothing to release.
+			return Route{}, errSealedRetryViaWake
+		}
 	}
-	totalDone := s.total.Track(ctx)
+	// total is never sealed (no Seal() is ever called on it), so ok is
+	// always true here — discard it.
+	totalDone, _ := s.total.Track(ctx)
 
 	return Route{
 		BaseURL:       inst.mgr.BaseURL(),

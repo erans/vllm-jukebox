@@ -119,7 +119,7 @@ func TestSleepRejectsOnInflightCumemSafety(t *testing.T) {
 	// Leak one in-flight tracker — never call done(). This simulates an
 	// active streaming/decoding request that has NOT completed by the
 	// time admission decides to evict.
-	_ = inst.inflight.Track(context.Background())
+	_, _ = inst.inflight.Track(context.Background())
 
 	pre := counterValue(metrics.SleepRejectedInflightTotal, model, reason)
 
@@ -260,7 +260,7 @@ func TestSleepGuardsDisabledByDefault(t *testing.T) {
 	s.mu.Unlock()
 
 	// Leak an in-flight — should NOT block when cumem_drain = 0.
-	_ = inst.inflight.Track(context.Background())
+	_, _ = inst.inflight.Track(context.Background())
 
 	err := s.sleepInstance(context.Background(), inst, 1, reason)
 	if err != nil {

@@ -50,7 +50,7 @@ func (s *Scheduler) SetInstanceInflightForTest(model string, n int) bool {
 		return false
 	}
 	for i := 0; i < n; i++ {
-		_ = inst.inflight.Track(context.Background())
+		_, _ = inst.inflight.Track(context.Background())
 	}
 	return true
 }

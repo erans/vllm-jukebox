@@ -131,7 +131,9 @@ func (r *LegacyRouter) AcquireRoute(ctx context.Context, requestedModel, request
 
 	var done func()
 	if r.tr != nil {
-		done = r.tr.Track(ctx)
+		// Legacy single-instance router never seals its tracker, so ok is
+		// always true here — discard it.
+		done, _ = r.tr.Track(ctx)
 	}
 
 	_, modelCfg, err := liveResolveModel(r.cfg, requestedModel)

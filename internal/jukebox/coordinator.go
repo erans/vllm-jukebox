@@ -517,6 +517,12 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 	_, err = c.mgr.Start(startCtx, model)
 	cancel()
 	if err != nil {
+		// Revert any per-GPU watt cap we applied above — a failed start
+		// would otherwise leave the override pinned (idempotent no-op if
+		// no override was applied).
+		if c.powerMgr != nil && len(modelCfg.GPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return err
 	}
 
@@ -528,6 +534,10 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), c.cfg.VLLM.ShutdownTimeout.Duration)
 		_ = c.mgr.Stop(stopCtx)
 		stopCancel()
+		// Same power-cap revert as the start-fail branch above.
+		if c.powerMgr != nil && len(modelCfg.GPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return err
 	}
 
