@@ -506,6 +506,10 @@ var (
 	//                        sustained window (cleared before the 2nd
 	//                        interval); no trip. Useful to distinguish an
 	//                        honest long prefill from a real wedge.
+	//   - "recovered"      — a previously-tripped (draining) instance probed
+	//                        /health/decode=200 again after the breaker's
+	//                        docker-restart; its drain flag was cleared and
+	//                        it was returned to routing. RECOVERY half.
 	DecodeStallsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jukebox_decode_stalls_total",

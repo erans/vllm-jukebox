@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -41,6 +42,36 @@ type ForwardOptions struct {
 	// circuit breaker to observe per-model 5xx streams; safe to leave
 	// nil for callers that don't need post-flight notification.
 	OnComplete func(status int)
+
+	// Release, if non-nil, is invoked EXACTLY ONCE when the response
+	// has been fully delivered to the downstream client — i.e. when the
+	// upstream resource backing this request is no longer in use. For
+	// buffered responses that is just before ForwardFiber returns. For
+	// STREAMING (text/event-stream) responses, Fiber runs the body copy
+	// in a SetBodyStreamWriter callback that executes AFTER the handler
+	// returns; Release therefore fires from INSIDE that callback once the
+	// stream EOFs (or the copy errors / the client hangs up), NOT when
+	// ForwardFiber returns.
+	//
+	// This is the load-bearing hook for in-flight accounting: the
+	// scheduler's per-model inflight counter (which gates the drain
+	// barrier before sleep/eviction AND the per-model concurrency cap)
+	// MUST stay incremented for the entire lifetime of a streaming
+	// response. A handler that instead `defer`s its release would
+	// decrement the counter the instant the handler returns — before a
+	// single SSE token has been copied — making an active stream
+	// invisible to the drain barrier (the scheduler observes inflight==0
+	// and sleeps/evicts the instance mid-stream, killing the client's
+	// stream and freeing VRAM the stream still needs). That mid-stream
+	// sleep is exactly the cumem drain-barrier the fix is defending
+	// (vllm#45520): inflight==0 lets /sleep fire during active decode and
+	// corrupts the cumem allocator (cudaErrorIllegalAddress).
+	//
+	// Pass the route's Done/release closure here INSTEAD of deferring it
+	// in the handler. Idempotent at this layer via a sync.Once; the
+	// handler keeps a sync.Once-guarded defer as a belt-and-suspenders
+	// safety net for any error path that never reaches the proxy.
+	Release func()
 }
 
 // fire invokes opts.OnComplete with the given status if set. Safe to
@@ -52,6 +83,20 @@ func (opts ForwardOptions) fire(status int) {
 }
 
 func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
+	// release is the exactly-once wrapper around opts.Release. Every exit
+	// path MUST call it (early transport errors, buffered success,
+	// streaming success). For streaming, the SetBodyStreamWriter callback
+	// owns the release so the inflight token survives until the stream
+	// EOFs — see ForwardOptions.Release for the full rationale.
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			if opts.Release != nil {
+				opts.Release()
+			}
+		})
+	}
+
 	targetURL := strings.TrimRight(opts.BaseURL, "/") + c.OriginalURL()
 
 	var body io.Reader
@@ -67,6 +112,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	req, err := http.NewRequestWithContext(requestContext(c), c.Method(), targetURL, body)
 	if err != nil {
 		opts.fire(0)
+		release()
 		return writeTransportError(c, err, opts)
 	}
 
@@ -93,6 +139,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		opts.fire(0)
+		release()
 		return writeTransportError(c, err, opts)
 	}
 
@@ -161,6 +208,15 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			// CRITICAL: release fires from INSIDE this callback, which Fiber
+			// runs AFTER the handler returns. Holding the inflight token
+			// until the stream EOFs (or the copy errors / client hangs up)
+			// keeps an active SSE stream visible to the scheduler's drain
+			// barrier + concurrency cap. Deferring release in the handler
+			// instead would decrement inflight before the first token copies,
+			// letting the cumem drain barrier fire /sleep mid-decode
+			// (vllm#45520).
+			defer release()
 			defer resp.Body.Close()
 			if opts.RewriteModelName && opts.RequestedModel != "" {
 				_ = RewriteSSEModel(resp.Body, w, opts.RequestedModel)
@@ -175,6 +231,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 	data, readErr := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if readErr != nil {
+		release()
 		return readErr
 	}
 
@@ -184,6 +241,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 		}
 	}
 
+	release()
 	return c.Send(data)
 }
 

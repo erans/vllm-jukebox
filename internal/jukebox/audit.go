@@ -42,6 +42,14 @@ const (
 	// fired a `docker restart` (or suppressed/failed equivalent) for a
 	// model. Emitted by internal/jukebox/circuit_breaker.go.
 	LifecycleCircuitBreakerTrip LifecycleAction = "circuit_breaker_trip"
+
+	// LifecycleCircuitBreakerReset — a previously-tripped model has
+	// recovered and been returned to routing. Emitted by the decode-stall
+	// probe (decode_probe.go) when a drained-but-Ready instance probes
+	// /health/decode=200 again after the breaker's docker-restart, so its
+	// drain flag is cleared. The recovery counterpart to
+	// LifecycleCircuitBreakerTrip.
+	LifecycleCircuitBreakerReset LifecycleAction = "circuit_breaker_reset"
 )
 
 // LifecycleEvent is the unified shape for every model state transition

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -87,9 +88,17 @@ func anthropicProxyHandler(opts Options) fiber.Handler {
 		if err != nil {
 			return mapAnthropicError(c, err)
 		}
-		if route.Done != nil {
-			defer route.Done()
+		// Hand release to the proxy so the inflight token survives the
+		// streaming body copy (which Fiber runs after this handler
+		// returns). The deferred call is a sync.Once-guarded safety net.
+		// See handlers_proxy.go for the full rationale.
+		var releaseOnce sync.Once
+		release := func() {
+			if route.Done != nil {
+				releaseOnce.Do(route.Done)
+			}
 		}
+		defer release()
 
 		return proxy.ForwardFiber(c, proxy.ForwardOptions{
 			BaseURL:          route.BaseURL,
@@ -97,6 +106,7 @@ func anthropicProxyHandler(opts Options) fiber.Handler {
 			RequestedModel:   modelName,
 			UpstreamModel:    route.UpstreamModel,
 			RequestID:        requestID,
+			Release:          release,
 		})
 	}
 }

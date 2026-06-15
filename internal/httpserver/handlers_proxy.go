@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -171,9 +172,23 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 		if err != nil {
 			return mapEnsureError(c, err)
 		}
-		if route.Done != nil {
-			defer route.Done()
+		// release decrements the per-model + total inflight counters. It
+		// MUST stay held for the full lifetime of the response — including
+		// streaming responses, whose body copy runs in a Fiber
+		// SetBodyStreamWriter callback AFTER this handler returns. We
+		// therefore hand release to the proxy (via ForwardOptions.Release),
+		// which fires it from inside the stream writer once the stream
+		// EOFs. The deferred call here is a sync.Once-guarded safety net:
+		// it's a no-op once the proxy has released, but guarantees the
+		// token is freed even on an error path that never reaches the
+		// proxy's release (e.g. a future early return after this point).
+		var releaseOnce sync.Once
+		release := func() {
+			if route.Done != nil {
+				releaseOnce.Do(route.Done)
+			}
 		}
+		defer release()
 
 		// When the classifier rewrote the target, force response-rewriting
 		// so the client sees the original requested model name in the
@@ -207,6 +222,7 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			RequestedModel:   requestedForRewrite,
 			UpstreamModel:    upstreamForBody,
 			RequestID:        requestID,
+			Release:          release,
 			OnComplete: func(status int) {
 				// Hand every upstream response status to the circuit
 				// breaker so it can decide whether to docker-restart

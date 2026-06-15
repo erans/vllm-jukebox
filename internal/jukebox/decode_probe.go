@@ -208,12 +208,27 @@ func (s *Scheduler) decodeProbeInterval() time.Duration {
 
 // checkDecodeStalls probes every eligible external-lifecycle Ready
 // instance once and advances/clears its sustained-stall counter.
+//
+// It ALSO probes instances that are StateReady but currently `draining`
+// because a previous tick tripped them (tripDecodeStall set draining=true
+// and fired the circuit-breaker docker-restart). Nothing else ever clears
+// that drain flag: the routing fast-paths all skip draining instances
+// (scheduler.go AcquireRoute / tryRouteReady / Status), so once the
+// restarted engine self-heals and answers /health/decode=200 again, the
+// model would otherwise stay black-holed out of routing FOREVER (until a
+// full jukebox process restart). When a drained instance probes healthy
+// here we clear the drain via clearDecodeStallDrain, returning it to
+// routing — the recovery half of the trip-and-recover loop.
 func (s *Scheduler) checkDecodeStalls(ctx context.Context) {
 	// Snapshot eligible instances under the read lock.
 	type probeTarget struct {
 		model    string
 		baseURL  string
 		inflight int64
+		// draining is true when this instance was previously tripped (taken
+		// out of routing) and is being probed ONLY to detect recovery — a
+		// healthy probe clears the drain; it is never re-tripped here.
+		draining bool
 	}
 	var targets []probeTarget
 
@@ -222,7 +237,12 @@ func (s *Scheduler) checkDecodeStalls(ctx context.Context) {
 		if inst == nil || inst.mgr == nil {
 			continue
 		}
-		if inst.state != StateReady || inst.draining {
+		// Probe StateReady instances whether or not they're draining: a
+		// non-draining Ready instance is probed to DETECT a stall; a
+		// draining Ready instance is probed to detect RECOVERY (so the
+		// post-restart self-heal returns it to routing instead of leaving
+		// it permanently black-holed).
+		if inst.state != StateReady {
 			continue
 		}
 		if inst.mgr.CurrentPID() == 0 {
@@ -245,6 +265,7 @@ func (s *Scheduler) checkDecodeStalls(ctx context.Context) {
 			model:    inst.model,
 			baseURL:  baseURL,
 			inflight: inst.inflight.Count(),
+			draining: inst.draining,
 		})
 	}
 	s.mu.RUnlock()
@@ -252,6 +273,22 @@ func (s *Scheduler) checkDecodeStalls(ctx context.Context) {
 	for _, t := range targets {
 		status, err := runDecodeProbe(ctx, t.baseURL)
 		result := classifyDecodeProbe(status, err)
+
+		// Drained-but-Ready instance: we only care whether it has RECOVERED.
+		// A healthy probe (the engine answers /health/decode=200 again after
+		// the circuit-breaker docker-restart) clears the drain and returns
+		// the model to routing. A still-stalled / endpoint-absent probe is a
+		// no-op — the restart is still in flight or the engine is still sick;
+		// we never re-trip a draining instance (the breaker already owns the
+		// restart) and we never route to it until it's provably healthy.
+		if t.draining {
+			if result == decodeHealthy {
+				s.clearDecodeStallDrain(t.model)
+				s.resetDecodeStall(t.model)
+				metrics.DecodeStallsTotal.WithLabelValues(t.model, "recovered").Inc()
+			}
+			continue
+		}
 
 		switch result {
 		case decodeEndpointAbsent:
@@ -329,6 +366,40 @@ func (s *Scheduler) tripDecodeStall(_ context.Context, model string) {
 	if cb != nil {
 		cb.ForceTrip(model)
 	}
+}
+
+// clearDecodeStallDrain returns a previously-tripped instance to routing
+// once it has recovered (probed /health/decode=200 after the circuit
+// breaker's docker-restart). Idempotent: clearing a non-draining /
+// missing instance is a no-op, so it's safe to call on every healthy
+// probe of a drained instance. This is the RECOVERY half of the
+// trip-and-recover loop — without it, tripDecodeStall's draining=true is
+// never undone and the model stays black-holed out of routing
+// (AcquireRoute / tryRouteReady / Status all skip draining instances)
+// until a full jukebox process restart.
+func (s *Scheduler) clearDecodeStallDrain(model string) {
+	s.mu.Lock()
+	inst := s.instances[model]
+	wasDraining := inst != nil && inst.draining
+	if wasDraining {
+		inst.draining = false
+	}
+	s.mu.Unlock()
+
+	if !wasDraining {
+		return
+	}
+
+	slog.Info("decode_probe_recovered",
+		"model", model,
+		"action", "clear drain + return to routing",
+		"ref", "vllm#45094",
+	)
+	LogLifecycleTransition(LifecycleEvent{
+		Action: LifecycleCircuitBreakerReset,
+		Reason: "decode_stall_45094_recovered",
+		Model:  model,
+	})
 }
 
 func (s *Scheduler) bumpDecodeStall(model string) int {
