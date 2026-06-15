@@ -27,6 +27,21 @@ import (
 )
 
 func main() {
+	// Subcommand dispatch. Keep this above flag.Parse so the subcommand
+	// gets its own arg slice — the default daemon mode still parses
+	// flags exactly as before. Currently `health` is the only
+	// subcommand; it short-circuits and exits with the probe's result.
+	//
+	// IMPORTANT: subcommand detection ONLY fires when the first
+	// non-program arg does not start with "-", so existing invocations
+	// like `jukebox -config foo.yaml` keep working unchanged.
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		switch os.Args[1] {
+		case "health":
+			os.Exit(runHealthCheck(os.Args[2:]))
+		}
+	}
+
 	var configPath string
 	flag.StringVar(&configPath, "config", "", "Path to YAML config file")
 	flag.Parse()
@@ -55,11 +70,62 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Install the validated config in the package-level atomic pointer
+	// so subsystems that opt into hot-reload (via config.Current()) start
+	// with a non-nil view. Subsystems instantiated below capture the
+	// initial *Config by value for their construction params; for those
+	// reads, hot-reload only takes effect on next process restart.
+	// Future opt-in callers (future feature flags, soft thresholds,
+	// log-level toggles, etc.) can read the live view via config.Current()
+	// and pick up changes within ~500ms of an active.yaml write.
+	config.SetCurrent(cfg)
+
 	metrics.SetState("idle")
 	metrics.ConsecutiveFailures.Set(0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start the active.yaml hot-reload watcher. Failures here log loud
+	// but are NOT fatal — the existing parse-crash safety net (operator
+	// fixes the file + restarts the container) still works.
+	//
+	// onReload is set AFTER subsystem construction below, so this
+	// closure dispatches into a (later-populated) reloadSubscribers
+	// slice. Until subsystems register, the watcher just records the
+	// metric — the atomic Current() pointer swap already happened
+	// inside config.Watch's doReload.
+	var (
+		reloadMu          sync.Mutex
+		reloadSubscribers []func(*config.Config)
+	)
+	subscribeReload := func(fn func(*config.Config)) {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		reloadSubscribers = append(reloadSubscribers, fn)
+	}
+	dispatchReload := func() {
+		reloadMu.Lock()
+		fns := append([]func(*config.Config){}, reloadSubscribers...)
+		reloadMu.Unlock()
+		live := config.Current()
+		if live == nil {
+			return
+		}
+		for _, fn := range fns {
+			fn(live)
+		}
+	}
+	if err := config.Watch(ctx, configPath, func(result config.ReloadResult, _ error) {
+		metrics.ConfigReloadsTotal.WithLabelValues(string(result)).Inc()
+		if result == config.ReloadSuccess {
+			dispatchReload()
+		}
+	}); err != nil {
+		slog.Warn("active.yaml hot-reload watcher disabled", "err", err, "path", configPath)
+	} else {
+		slog.Info("active.yaml hot-reload watcher started", "path", configPath)
+	}
 
 	// Create PowerManager if power limits are configured
 	var powerMgr *gpu.PowerManager
@@ -110,7 +176,10 @@ func main() {
 		mgr := vllm.NewManager(cfg)
 		coord := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, time.Now, powerMgr)
 		go coord.Run(ctx)
-		router = jukebox.NewLegacyRouter(cfg, coord, &tr)
+		go coord.IdleMonitor(ctx)
+		legacyRouter := jukebox.NewLegacyRouter(cfg, coord, &tr)
+		legacyRouter.StartLiveness(ctx)
+		router = legacyRouter
 
 		stopOnce := sync.Once{}
 		stop = func() {
@@ -150,33 +219,149 @@ func main() {
 		sched := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, nil, powerMgr)
 		router = sched
 
-		// Fail fast if configured GPU IDs do not exist.
-		{
+		// Fail fast if configured GPU IDs do not exist. SKIPPED entirely
+		// when every non-alias model is lifecycle: external — those don't
+		// allocate local GPUs and nvidia-smi may not even be installed in
+		// the jukebox container.
+		anyManaged := false
+		for _, model := range cfg.Models {
+			if model.Alias != "" {
+				continue
+			}
+			if model.EffectiveLifecycle() != config.LifecycleExternal {
+				anyManaged = true
+				break
+			}
+		}
+		if anyManaged {
 			checkTimeout := 5 * time.Second
 			checkCtx, checkCancel := context.WithTimeout(context.Background(), checkTimeout)
 			defer checkCancel()
 
 			gpus, err := inv.List(checkCtx)
-			if err != nil {
+			switch {
+			case err != nil && gpu.IsBinaryNotFound(err):
+				// nvidia-smi is not installed in this environment. Operators
+				// run jukebox in CPU-only / external-routing setups where
+				// nvidia-smi may legitimately be absent. Hard-failing here
+				// crash-loops the container. Degrade: skip the GPU-id
+				// existence check and let the scheduler boot. Admission
+				// control (below) will independently degrade for the same
+				// reason and log its own warning.
+				slog.Warn("scheduler_mode_no_nvidia_smi",
+					"err", err,
+					"msg", "nvidia-smi not found; skipping GPU id validation and degrading to legacy routing (no admission VRAM tracking). Operators who want admission MUST make nvidia-smi available to the jukebox container.",
+				)
+			case err != nil:
 				slog.Error("failed to read GPU inventory (scheduler mode)", "err", err)
 				os.Exit(1)
-			}
-			exists := map[int]bool{}
-			for _, g := range gpus {
-				exists[g.Index] = true
-			}
-			for name, model := range cfg.Models {
-				if model.Alias != "" {
-					continue
+			default:
+				exists := map[int]bool{}
+				for _, g := range gpus {
+					exists[g.Index] = true
 				}
-				for _, id := range model.GPUs {
-					if !exists[id] {
-						slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
-						os.Exit(1)
+				for name, model := range cfg.Models {
+					if model.Alias != "" {
+						continue
+					}
+					// External-lifecycle instances may declare GPUs that live on
+					// a different host (jukebox doesn't own the process). Skip
+					// the local nvidia-smi check for them — the gpus field on an
+					// external model is informational.
+					if model.EffectiveLifecycle() == config.LifecycleExternal {
+						continue
+					}
+					for _, id := range model.GPUs {
+						if !exists[id] {
+							slog.Error("configured GPU id not found (scheduler mode)", "model", name, "gpu", id)
+							os.Exit(1)
+						}
 					}
 				}
 			}
+		} else {
+			slog.Info("all scheduler models are lifecycle: external — skipping local nvidia-smi GPU check")
 		}
+
+		// Build admission controller if any model has it enabled. Requires
+		// a live nvidia-smi to read per-GPU TotalMB. If the probe fails
+		// (e.g. jukebox container has no nvidia-smi, host driver
+		// unreachable), log a loud warning and DEGRADE — the scheduler
+		// runs without admission. Operators who want admission MUST make
+		// nvidia-smi available to the jukebox container.
+		if cfg.AdmissionEnabled() {
+			probeTimeout := 5 * time.Second
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
+			gpus, err := inv.List(probeCtx)
+			probeCancel()
+			if err != nil {
+				slog.Warn("admission_control_disabled_no_nvidia_smi",
+					"err", err,
+					"hint", "expected_vram_mb_per_gpu was set on at least one model but nvidia-smi probe failed — admission control will NOT be active",
+				)
+			} else {
+				totalsByGPU := map[int]int{}
+				for _, g := range gpus {
+					totalsByGPU[g.Index] = g.TotalMB
+				}
+				evictor := &jukebox.SchedulerEvictor{S: sched}
+				adm := jukebox.NewAdmissionController(cfg, totalsByGPU, evictor)
+				sched.SetAdmission(adm)
+				slog.Info("admission_control_attached",
+					"tracked_models", adm.TrackedModels(),
+					"gpus", len(totalsByGPU),
+				)
+			}
+		}
+
+		// Bootstrap lifecycle: external instances + start the auto-suspend
+		// idle monitor.
+		if err := sched.RegisterExternalInstances(ctx); err != nil {
+			slog.Error("failed to register external instances", "err", err)
+			os.Exit(1)
+		}
+		go sched.IdleMonitor(ctx)
+		// Issue #5: detect external `docker start <peer>` that bypasses
+		// jukebox's coldLoadStoppedMember → evictCrossGroupGPUContenders
+		// pipeline. Without this monitor, a bare `docker start vllm-vision`
+		// while vllm-main holds an overlapping GPU OOMs the vision peer
+		// at vLLM worker init. The monitor observes the misordered start,
+		// SIGKILLs the half-initialized container, and re-routes through
+		// KickColdLoad which runs cross-group eviction first.
+		go sched.ExternalStartMonitor(ctx)
+		// Issue #8: periodic reconciliation between admission's recorded
+		// state and the actual docker container state. Sibling of
+		// ExternalStartMonitor — that one handles the SPECIFIC
+		// {admission Stopped/Sleeping + docker running} fault by
+		// SIGKILLing. This one handles the BROADER
+		// {admission Ready/Sleeping + docker NOT running} drift by
+		// reconciling admission down to Stopped (and re-kicking a
+		// cold-load for pinned peers that should always be live).
+		go sched.StateReconciler(ctx)
+
+		// Enable the jukebox-native circuit breaker. It observes upstream
+		// response statuses (5xx auto-restart) AND backs the decode-stall
+		// probe's docker-restart trip path. Both the 5xx breaker and the
+		// decode probe self-gate on their respective config kill-switches
+		// (behavior.circuit_breaker.enabled / behavior.decode_probe_interval),
+		// so enabling it here is a no-op until an operator opts in — but
+		// the wiring must exist so a hot-reload that flips either switch
+		// takes effect without a process restart. liveCfg is config.Current
+		// so behavior.circuit_breaker.* hot-reloads are picked up.
+		sched.EnableCircuitBreaker(config.Current)
+
+		// Decode-stall probe (DETECTION + RECOVERY half of vllm#45094).
+		// Background goroutine; ticks at behavior.decode_probe_interval
+		// (0 = disabled, the default). On a sustained /health/decode stall
+		// it drains the instance + fires the circuit breaker's docker
+		// restart, recovering the silent PP-cudagraph-split-brain wedge
+		// that plain /health misses.
+		go sched.DecodeProbeMonitor(ctx)
+
+		// Subscribe the scheduler to active.yaml hot-reloads so its
+		// admission controller picks up per-model field edits without
+		// requiring a process restart.
+		subscribeReload(sched.OnConfigReloaded)
 
 		stopOnce := sync.Once{}
 		stop = func() {

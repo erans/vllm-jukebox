@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 
+	"vllm-jukebox/internal/config"
 	"vllm-jukebox/internal/jukebox"
+	"vllm-jukebox/internal/metrics"
 	"vllm-jukebox/internal/proxy"
 )
 
@@ -30,8 +33,69 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 
 		c.Locals(requestedModelLocal, modelName)
 
+		// Resolve against the live config so a mid-flight active.yaml
+		// reload that adds / removes a model is reflected immediately.
+		liveCfg := config.Current()
+		if liveCfg == nil {
+			liveCfg = opts.Config
+		}
+
+		// === Stage J — content-aware routing (kill-switch default off) ===
+		//
+		// Only triggers on POST /v1/chat/completions (this handler is only
+		// wired to chat / completions / responses; embeddings/rerank/
+		// tokenize endpoints use the same dispatcher but the classifier
+		// returns DecisionForward in zero time when ContentRouting is off,
+		// AND a request without messages[].content[].image_url won't match
+		// any reroute rule, so /embeddings traffic with content routing
+		// ON is also harmless).
+		//
+		// The classifier reads the body once via json.Unmarshal — same
+		// cost as extractModel above. When ContentRouting is false, the
+		// classifier short-circuits at the first config check and adds
+		// no measurable latency.
+		originalModel := modelName
+		rewroteByContent := false
+		isChatPath := strings.HasSuffix(c.OriginalURL(), "/v1/chat/completions")
+		if isChatPath && liveCfg.Behavior.ContentRouting {
+			cls := ClassifyContent(c.Body(), modelName, liveCfg)
+			if cls.EstTokens > 0 {
+				metrics.ContentRoutingEstTokensHistogram.Observe(float64(cls.EstTokens))
+			}
+			switch cls.Decision {
+			case DecisionForward:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("forward", originalModel, "").Inc()
+			case DecisionRerouteImage:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reroute_image", originalModel, cls.NewModel).Inc()
+				modelName = cls.NewModel
+				rewroteByContent = true
+			case DecisionRerouteOverflow:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reroute_overflow", originalModel, cls.NewModel).Inc()
+				modelName = cls.NewModel
+				rewroteByContent = true
+			case DecisionRejectNoVision:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reject_no_vision", originalModel, "").Inc()
+				return writeOpenAIError(
+					c,
+					http.StatusServiceUnavailable,
+					cls.Reason+" — configure behavior.vision_model",
+					"service_unavailable",
+					"vision_model_unavailable",
+				)
+			case DecisionRejectTooLong:
+				metrics.ContentRoutingDecisionsTotal.WithLabelValues("reject_too_long", originalModel, "").Inc()
+				return writeOpenAIError(
+					c,
+					http.StatusBadRequest,
+					cls.Reason,
+					"invalid_request_error",
+					"context_length_exceeded",
+				)
+			}
+		}
+
 		// Ensure unknown models fail fast with a 400 (per spec), before touching the coordinator.
-		_, _, err = opts.Config.ResolveModel(modelName)
+		_, _, err = liveCfg.ResolveModel(modelName)
 		if err != nil {
 			return writeOpenAIError(
 				c,
@@ -47,20 +111,129 @@ func switchingProxyHandler(opts Options) fiber.Handler {
 			requestID = c.Get(requestIDHeader)
 		}
 
+		// Async-503 contract for wake-from-Stopped (per Kagi PATCH 16).
+		// If admission has the model in admissionStopped (its container is
+		// `docker compose stop`'d because a previous admission cycle picked
+		// it as an evict_action: stop victim), the synchronous wake path
+		// would block this request for ~5 min (moe/longctx) — way past
+		// downstream HTTP-client timeouts. Kick the cold-load on
+		// a background goroutine (using context.Background() with a
+		// generous timeout — NOT the inbound ctx which dies when the
+		// client gives up) and return 503 + Retry-After: 60 immediately.
+		// The client retries against another 503 ("still warming") or hits
+		// a Sleeping → Awake fast path once cold-load completes.
+		//
+		// admissionSleeping (the other not-Awake state) is NOT 503'd —
+		// /wake_up takes ~10-30s and fits comfortably in client timeouts.
+		//
+		// Type-assert to the OPTIONAL ColdLoadAware interface. Routers
+		// that don't implement it (e.g. LegacyRouter for swap mode) skip
+		// this branch entirely and fall through to AcquireRoute, which
+		// still works correctly — swap mode has no admissionStopped state
+		// so the async-503 path is structurally inapplicable there.
+		if cl, ok := opts.Router.(jukebox.ColdLoadAware); ok && (cl.IsModelColdLoading(modelName) || cl.IsInColdLoadEviction(modelName)) {
+			// Bug #3: before fast-failing with a (possibly stale)
+			// "warming_up" 503, give the model an on-request health
+			// re-probe. If admission thinks the model is Stopped but its
+			// external container is in fact healthy (recreated out-of-band
+			// and now answering /health=200), ReprobeStoppedExternal
+			// reconciles admission to Sleeping and returns true — we then
+			// fall through to AcquireRoute below, which wakes + routes
+			// normally instead of leaving the consumer stuck on a stale
+			// 503 with no re-probe until the next 30s reconcile tick.
+			//
+			// `reprobed` short-circuits the 503 block entirely. It only
+			// fires for the IsModelColdLoading (admission-Stopped) case; a
+			// model that's merely IsInColdLoadEviction is a healthy peer
+			// being slept for someone else's cold-load and must still 503.
+			reprobed := cl.IsModelColdLoading(modelName) && cl.ReprobeStoppedExternal(c.UserContext(), modelName)
+			if !reprobed {
+				// IsInColdLoadEviction-only path (model is a peer being slept
+				// for an in-flight cold-load, not the cold-load target itself):
+				// don't KickColdLoad here — the peer's own cold-load isn't
+				// what's needed; the target's cold-load is in flight. Just
+				// fast-fail with the same 503 + Retry-After contract.
+				if cl.IsModelColdLoading(modelName) {
+					cl.KickColdLoad(modelName)
+				}
+				c.Set("Retry-After", "60")
+				return writeOpenAIError(
+					c,
+					http.StatusServiceUnavailable,
+					"Model is cold-starting (~5 min for large models). Please retry.",
+					"service_unavailable",
+					"warming_up",
+				)
+			}
+			// reprobed==true → fall through to AcquireRoute (normal wake).
+		}
+
 		route, err := opts.Router.AcquireRoute(c.UserContext(), modelName, requestID)
 		if err != nil {
 			return mapEnsureError(c, err)
 		}
-		if route.Done != nil {
-			defer route.Done()
+		// release decrements the per-model + total inflight counters. It
+		// MUST stay held for the full lifetime of the response — including
+		// streaming responses, whose body copy runs in a Fiber
+		// SetBodyStreamWriter callback AFTER this handler returns. We
+		// therefore hand release to the proxy (via ForwardOptions.Release),
+		// which fires it from inside the stream writer once the stream
+		// EOFs. The deferred call here is a sync.Once-guarded safety net:
+		// it's a no-op once the proxy has released, but guarantees the
+		// token is freed even on an error path that never reaches the
+		// proxy's release (e.g. a future early return after this point).
+		var releaseOnce sync.Once
+		release := func() {
+			if route.Done != nil {
+				releaseOnce.Do(route.Done)
+			}
+		}
+		defer release()
+
+		// When the classifier rewrote the target, force response-rewriting
+		// so the client sees the original requested model name in the
+		// completion. UpstreamModel rewrites the REQUEST body to the new
+		// served-name so vLLM accepts it; RequestedModel + RewriteModelName
+		// rewrites the RESPONSE back to the originally-requested name so
+		// the client never sees the swap.
+		//
+		// External-lifecycle gotcha: route.UpstreamModel is sourced from
+		// modelCfg.Path which is EMPTY for `lifecycle: external` models
+		// (vllm-main, vllm-vision, etc — they're remote URLs, no on-disk
+		// path). When the classifier rewrote, we MUST set UpstreamModel
+		// explicitly to the rewritten served-name; otherwise the body
+		// rewrite in proxy.RewriteJSONModel skips (the cond is
+		// `UpstreamModel != ""`) and vision sees the OLD model name in
+		// the body → 404 NotFoundError.
+		rewriteModelName := opts.Config.Behavior.RewriteModelName
+		requestedForRewrite := modelName
+		upstreamForBody := route.UpstreamModel
+		if rewroteByContent {
+			rewriteModelName = true
+			requestedForRewrite = originalModel
+			if upstreamForBody == "" {
+				upstreamForBody = modelName // the rewritten served-name
+			}
 		}
 
 		return proxy.ForwardFiber(c, proxy.ForwardOptions{
 			BaseURL:          route.BaseURL,
-			RewriteModelName: opts.Config.Behavior.RewriteModelName,
-			RequestedModel:   modelName,
-			UpstreamModel:    route.UpstreamModel,
+			RewriteModelName: rewriteModelName,
+			RequestedModel:   requestedForRewrite,
+			UpstreamModel:    upstreamForBody,
 			RequestID:        requestID,
+			Release:          release,
+			OnComplete: func(status int) {
+				// Hand every upstream response status to the circuit
+				// breaker so it can decide whether to docker-restart
+				// a hung container. status==0 means proxy never
+				// reached upstream (network err/timeout/ctx cancel) —
+				// breaker treats that as 5xx. Routers that don't
+				// implement ResponseRecorder no-op.
+				if recorder, ok := opts.Router.(jukebox.ResponseRecorder); ok {
+					recorder.RecordResponse(modelName, status)
+				}
+			},
 		})
 	}
 }
@@ -101,9 +274,26 @@ func mapEnsureError(c *fiber.Ctx, err error) error {
 		case jukebox.RejectNoCapacity:
 			msg = "Insufficient capacity to start requested model, please retry"
 		case jukebox.RejectInsufficient:
-			msg = "Insufficient GPU resources to start requested model, please retry"
+			// Non-retryable: structural infeasibility (model exceeds the
+			// pinned-adjusted GPU budget no matter what we evict). The
+			// header omits Retry-After so retry-aware SDKs don't loop.
+			// Body must NOT contradict by saying "please retry".
+			msg = "Model exceeds available GPU budget; reconfigure or add capacity"
+		case jukebox.RejectAdminIntervention:
+			// Non-retryable: admission books may have drifted from
+			// physical container state because a cleanup `docker stop`
+			// failed. Operator intervention is required (see audit log).
+			msg = "Resource state inconsistent; operator intervention required (see audit log)"
 		case jukebox.RejectMinUptime:
 			msg = "Insufficient GPU resources (min uptime), please retry"
+		case jukebox.RejectUpstreamUnreachable:
+			msg = "Upstream model server is unreachable (TCP probe failing); please retry"
+		case jukebox.RejectConcurrencyLimit:
+			// PREVENTION half of vllm#45094: the model is at its
+			// max_concurrent_requests cap. Retryable — a freed slot
+			// admits the request. Retry-After is set above from
+			// rej.RetryAfter (2s).
+			msg = "Model is at its concurrency limit; please retry"
 		}
 		return writeOpenAIError(c, http.StatusServiceUnavailable, msg, "service_unavailable", "model_switching")
 	}
