@@ -282,14 +282,27 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 
 	s.mu.Lock()
 	// If a previous instance exists for this model (e.g., crashed), replace it.
-	if old := s.instances[resolvedName]; old != nil {
-		// Best-effort cleanup of the old instance without blocking.
+	if old := s.instances[resolvedName]; old != nil && old != inst {
+		// Seal the old instance: flag draining under the lock so no new route
+		// can Track() onto it, then tear it down asynchronously off the held
+		// lock. drainAndStopInstance re-reads draining/inflight under s.mu and
+		// also calls mgr.Stop() + ports.Release(), so this both prevents the
+		// subprocess/port leak (it previously only set draining=true) and
+		// honors the drain barrier for any in-flight requests on the old one.
 		old.draining = true
+		old.state = StateStopping
+		go func(victim *schedInstance) {
+			_ = s.drainAndStopInstance(context.Background(), victim, false)
+		}(old)
 	}
 	s.instances[resolvedName] = inst
+	// Seal the increment for the just-started instance under the same lock that
+	// publishes it, identical to the tryRouteReady barrier.
+	instDone := inst.inflight.Track(ctx)
 	s.mu.Unlock()
 
-	return s.routeForInstance(ctx, inst, modelCfg.Path), nil
+	totalDone := s.total.Track(ctx)
+	return s.buildRoute(inst, modelCfg.Path, instDone, totalDone), nil
 }
 
 func (s *Scheduler) StopAll(ctx context.Context) error {
@@ -317,34 +330,41 @@ func (s *Scheduler) StopAll(ctx context.Context) error {
 }
 
 func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstreamModel string) (Route, bool) {
-	s.mu.RLock()
-	inst := s.instances[resolvedModelName]
-	s.mu.RUnlock()
-	if inst == nil {
-		return Route{}, false
-	}
-	if inst.state != StateReady || inst.draining || inst.mgr == nil || inst.mgr.CurrentPID() == 0 {
-		return Route{}, false
-	}
-
 	now := s.now()
+
+	// Atomically re-check readiness AND increment the inflight counter under
+	// s.mu. This is the route side of the drain barrier: because the evictor
+	// flips inst.draining to true under this same lock (see
+	// drainAndStopInstance) and only decides to skip WaitForDrain after
+	// re-reading the inflight count under the lock, holding s.mu across the
+	// readiness check + Track() guarantees a route can never increment the
+	// counter after the instance has begun draining. Without this, the
+	// readiness check and the increment were two separate critical sections
+	// (a TOCTOU): a request could pass the check, the evictor could drain
+	// (observe count 0), stop the engine, and only then would the request
+	// increment and forward into the dying subprocess.
 	s.mu.Lock()
-	// Re-check under lock.
-	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
-		inst.lastUsedAt = now
+	inst := s.instances[resolvedModelName]
+	if inst == nil || inst.state != StateReady || inst.draining || inst.mgr == nil || inst.mgr.CurrentPID() == 0 {
+		s.mu.Unlock()
+		return Route{}, false
 	}
+	inst.lastUsedAt = now
+	// Track() while still holding s.mu so the increment is sealed against a
+	// concurrent drain. The inflight tracker has its own mutex; it never
+	// re-acquires s.mu (its OnChange callback only touches metrics), so this
+	// nesting introduces no lock-order inversion.
+	instDone := inst.inflight.Track(ctx)
 	s.mu.Unlock()
 
-	return s.routeForInstance(ctx, inst, upstreamModel), true
+	totalDone := s.total.Track(ctx)
+	return s.buildRoute(inst, upstreamModel, instDone, totalDone), true
 }
 
-func (s *Scheduler) routeForInstance(ctx context.Context, inst *schedInstance, upstreamModel string) Route {
-	var instDone func()
-	if inst != nil {
-		instDone = inst.inflight.Track(ctx)
-	}
-	totalDone := s.total.Track(ctx)
-
+// buildRoute assembles a Route from an already-tracked instance. Callers MUST
+// have already incremented inst.inflight (and optionally s.total) under s.mu so
+// the increment is atomic with the readiness check.
+func (s *Scheduler) buildRoute(inst *schedInstance, upstreamModel string, instDone, totalDone func()) Route {
 	return Route{
 		BaseURL:       inst.mgr.BaseURL(),
 		UpstreamModel: upstreamModel,
@@ -536,14 +556,23 @@ func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstanc
 		return nil
 	}
 
+	// Seal the drain decision: set draining=true AND read the inflight count in
+	// the SAME s.mu critical section. Because every route increments
+	// inst.inflight under s.mu only after observing !draining (see
+	// tryRouteReady), once we have set draining=true here, no new Track() can
+	// have slipped in before we read the count. The count we read is therefore
+	// authoritative: if it is 0, no request is or will be in flight on this
+	// instance, so skipping WaitForDrain is safe (no black-hole). This replaces
+	// the previous TOCTOU where draining and the count were read in separate
+	// critical sections, allowing a request to Track() into a dying engine.
 	s.mu.Lock()
-	// Mark draining so new routes won't use it.
 	inst.draining = true
 	inst.state = StateStopping
+	drained := inst.inflight.Count() == 0
 	s.mu.Unlock()
 
 	if inst.mgr != nil {
-		if !inst.inflightIsDrained() {
+		if !drained {
 			drainTimeout := s.cfg.VLLM.DrainTimeout.Duration
 			if drainTimeout <= 0 {
 				drainTimeout = 60 * time.Second
@@ -582,10 +611,6 @@ func (s *Scheduler) drainAndStopInstance(ctx context.Context, inst *schedInstanc
 		s.ports.Release(inst.port)
 	}
 	return nil
-}
-
-func (inst *schedInstance) inflightIsDrained() bool {
-	return inst.inflight.Count() == 0
 }
 
 func overlaps(a, b []int) bool {
