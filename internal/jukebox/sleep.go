@@ -76,17 +76,24 @@ var evictionLoopPreActionHook atomic.Pointer[func(string)]
 // to inject deterministic phantom-vs-healthy responses without spinning
 // up an httptest server inside every wake test.
 //
-// The servedModelName argument is the value sent in the /v1/completions
-// `model` field — this is the vLLM --served-model-name (or the path
-// basename if unset), NOT the jukebox config key. They may differ; see
-// HIGH-3 in PR #27 adversarial review.
+// The servedModelName argument is the value sent in the probe's `model`
+// field — this is the vLLM --served-model-name (or the path basename if
+// unset), NOT the jukebox config key. They may differ; see HIGH-3 in PR
+// #27 adversarial review.
+//
+// The runner argument is the jukebox model Runner ("generate" or
+// "pooling"); it selects the probe endpoint (/v1/completions for
+// generative, /v1/embeddings for pooling/embedding/reranker models that
+// don't serve the completions verb). See vllmcli.VerifyWakeWithProbe.
 //
 // Contract: nil return = probe succeeded, engine confirmed responsive.
 // Non-nil = the wake is suspect. The caller MUST distinguish the
 // vllmcli.ErrWakeVerifyConfigError sentinel (model-name mismatch — do
-// NOT redeploy, log loud) from vllmcli.ErrWakeVerifyPhantom (engine
+// NOT redeploy, log loud) and vllmcli.ErrWakeVerifyEndpointUnsupported
+// (probe verb not served by this model type — NOT a wedge, route
+// normally, do NOT redeploy) from vllmcli.ErrWakeVerifyPhantom (engine
 // wedged — DO async redeploy).
-type wakeVerifyProbeFn func(ctx context.Context, baseURL, servedModelName string, timeout time.Duration) error
+type wakeVerifyProbeFn func(ctx context.Context, baseURL, servedModelName, runner string, timeout time.Duration) error
 
 // wakeVerifyProbe holds the active probe hook. Stored as atomic.Pointer
 // so concurrent test goroutines (writers) and the wake path (readers)
@@ -3000,81 +3007,110 @@ func (s *Scheduler) performWakeFromInsideColdLoadLock(ctx context.Context, inst 
 		// vLLM that was launched with a non-default served name.
 		servedName := modelCfg.EffectiveServedModelName(inst.model)
 		probeStart := s.now()
-		if probeErr := probe(ctx, baseURL, servedName, verifyBudget); probeErr != nil {
+		if probeErr := probe(ctx, baseURL, servedName, modelCfg.Runner, verifyBudget); probeErr != nil {
 			probeDur := s.now().Sub(probeStart)
-			// HIGH-3 fix: differentiate config-error from phantom. A
-			// config-error (model-name mismatch) is a structural bug
-			// that redeploying CANNOT fix — the recreated container
-			// will have the same --served-model-name flag and 404
-			// again forever. Log loud, roll back admission, but
-			// SKIP the async RedeployMember.
-			isConfigErr := errors.Is(probeErr, vllmcli.ErrWakeVerifyConfigError)
-			failureClass := "wake_phantom"
-			recovery := "schedule-recreate"
-			reasonAudit := "phantom-wake-detected"
-			if isConfigErr {
-				failureClass = "wake_config_error"
-				recovery = "skip-recreate-config-mismatch"
-				reasonAudit = "wake-config-error"
-			}
-			metrics.SleepFailuresTotal.WithLabelValues(inst.model, failureClass).Inc()
-			slog.Error("wake_phantom_detected",
-				"model", inst.model,
-				"served_model_name", servedName,
-				"trigger", trigger,
-				"err", probeErr,
-				"probe_budget_ms", verifyBudget.Milliseconds(),
-				"probe_elapsed_ms", probeDur.Milliseconds(),
-				"recovery", recovery,
-				"config_error", isConfigErr,
-			)
-			LogLifecycleTransition(LifecycleEvent{
-				Action:   LifecycleWake,
-				Model:    inst.model,
-				Related:  evictedVictims,
-				Reason:   reasonAudit,
-				GPUs:     modelCfg.GPUs,
-				Duration: s.now().Sub(start),
-			})
-			if s.admission != nil {
-				s.admission.NotifySleep(inst.model, "wake-phantom")
-			}
-			if len(evictedVictims) > 0 {
-				s.bestEffortRestoreVictims(ctx, evictedVictims, inst.model)
-			}
-			if isConfigErr {
-				// Don't recreate — recreate won't fix a served-model-name
-				// mismatch (flag is baked into the launch command). The
-				// operator must fix served_model_name in config.
-				return fmt.Errorf("wake verification failed (config error — served_model_name mismatch on %q sent %q): %w", inst.model, servedName, probeErr)
-			}
-			// Trigger async recreate. RedeployMember acquires
-			// WithColdLoadLock itself, so we MUST spawn this in a fresh
-			// goroutine — we are currently inside that same lock and
-			// sync.Mutex is non-reentrant. Use background ctx with a
-			// generous bound; the recreate path internally tears down
-			// the wedged container and brings up a fresh one via
-			// docker compose up + health-wait.
-			model := inst.model
-			doRecreate := func(m string) {
-				bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-				defer cancel()
-				slog.Info("wake_phantom_recreate_start", "model", m)
-				if _, rerr := s.RedeployMember(bgCtx, m); rerr != nil {
-					slog.Error("wake_phantom_recreate_failed", "model", m, "err", rerr)
-					return
-				}
-				slog.Info("wake_phantom_recreate_complete", "model", m)
-			}
-			if testHook := redeployMemberAsyncForTest.Load(); testHook != nil {
-				// Tests inject a synchronous-or-recorded hook so they can
-				// assert recreate was scheduled without spawning a real
-				// docker process or hitting the production async timing.
-				(*testHook)(model)
+			// Endpoint-unsupported is NOT a wake failure. Embedding /
+			// reranker models (runner: pooling, launched --task embed) do
+			// not serve /v1/completions; a generative probe against them
+			// route-404s. The wake actually SUCCEEDED — the engine answered
+			// the HTTP layer, it just doesn't serve that verb. Pre-fix this
+			// route-404 was misread as a phantom-wedge → 503 + a
+			// schedule-recreate that itself failed for sleep-evict members
+			// ("redeploy-member requires evict_action: stop"), black-holing
+			// the entire RAG path on EVERY request. Treat it as a healthy
+			// wake: fall through to flip state Ready and route normally. The
+			// model-type-aware probe (above) means we normally never get
+			// here for a correctly-configured pooling model, but this is the
+			// defense-in-depth backstop if the endpoint selection is ever
+			// wrong (e.g. a reranker that serves neither verb we probe).
+			if errors.Is(probeErr, vllmcli.ErrWakeVerifyEndpointUnsupported) {
+				slog.Warn("wake_verify_endpoint_unsupported",
+					"model", inst.model,
+					"served_model_name", servedName,
+					"runner", modelCfg.Runner,
+					"trigger", trigger,
+					"err", probeErr,
+					"probe_elapsed_ms", probeDur.Milliseconds(),
+					"note", "probe verb not served by this model type; wake treated as healthy (engine answered HTTP layer)",
+				)
+				// Do NOT roll back admission, do NOT redeploy — fall through
+				// to the normal Ready transition below.
 			} else {
-				go doRecreate(model)
+				// HIGH-3 fix: differentiate config-error from phantom. A
+				// config-error (model-name mismatch) is a structural bug
+				// that redeploying CANNOT fix — the recreated container
+				// will have the same --served-model-name flag and 404
+				// again forever. Log loud, roll back admission, but
+				// SKIP the async RedeployMember.
+				isConfigErr := errors.Is(probeErr, vllmcli.ErrWakeVerifyConfigError)
+				failureClass := "wake_phantom"
+				recovery := "schedule-recreate"
+				reasonAudit := "phantom-wake-detected"
+				if isConfigErr {
+					failureClass = "wake_config_error"
+					recovery = "skip-recreate-config-mismatch"
+					reasonAudit = "wake-config-error"
+				}
+				metrics.SleepFailuresTotal.WithLabelValues(inst.model, failureClass).Inc()
+				slog.Error("wake_phantom_detected",
+					"model", inst.model,
+					"served_model_name", servedName,
+					"runner", modelCfg.Runner,
+					"trigger", trigger,
+					"err", probeErr,
+					"probe_budget_ms", verifyBudget.Milliseconds(),
+					"probe_elapsed_ms", probeDur.Milliseconds(),
+					"recovery", recovery,
+					"config_error", isConfigErr,
+				)
+				LogLifecycleTransition(LifecycleEvent{
+					Action:   LifecycleWake,
+					Model:    inst.model,
+					Related:  evictedVictims,
+					Reason:   reasonAudit,
+					GPUs:     modelCfg.GPUs,
+					Duration: s.now().Sub(start),
+				})
+				if s.admission != nil {
+					s.admission.NotifySleep(inst.model, "wake-phantom")
+				}
+				if len(evictedVictims) > 0 {
+					s.bestEffortRestoreVictims(ctx, evictedVictims, inst.model)
+				}
+				if isConfigErr {
+					// Don't recreate — recreate won't fix a served-model-name
+					// mismatch (flag is baked into the launch command). The
+					// operator must fix served_model_name in config.
+					return fmt.Errorf("wake verification failed (config error — served_model_name mismatch on %q sent %q): %w", inst.model, servedName, probeErr)
+				}
+				// Trigger async recreate. RedeployMember acquires
+				// WithColdLoadLock itself, so we MUST spawn this in a fresh
+				// goroutine — we are currently inside that same lock and
+				// sync.Mutex is non-reentrant. Use background ctx with a
+				// generous bound; the recreate path internally tears down
+				// the wedged container and brings up a fresh one via
+				// docker compose up + health-wait.
+				model := inst.model
+				doRecreate := func(m string) {
+					bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					defer cancel()
+					slog.Info("wake_phantom_recreate_start", "model", m)
+					if _, rerr := s.RedeployMember(bgCtx, m); rerr != nil {
+						slog.Error("wake_phantom_recreate_failed", "model", m, "err", rerr)
+						return
+					}
+					slog.Info("wake_phantom_recreate_complete", "model", m)
+				}
+				if testHook := redeployMemberAsyncForTest.Load(); testHook != nil {
+					// Tests inject a synchronous-or-recorded hook so they can
+					// assert recreate was scheduled without spawning a real
+					// docker process or hitting the production async timing.
+					(*testHook)(model)
+				} else {
+					go doRecreate(model)
+				}
+				return fmt.Errorf("wake verification failed (phantom wake on %q): %w", inst.model, probeErr)
 			}
-			return fmt.Errorf("wake verification failed (phantom wake on %q): %w", inst.model, probeErr)
 		}
 	}
 

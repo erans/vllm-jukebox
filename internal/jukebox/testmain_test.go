@@ -36,7 +36,7 @@ import (
 func TestMain(m *testing.M) {
 	old := coldLoadPollInterval.Load()
 	coldLoadPollInterval.Store(int64(10 * time.Millisecond))
-	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, _ string, _ time.Duration) error {
+	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, _, _ string, _ time.Duration) error {
 		return nil
 	})
 	code := m.Run()

@@ -262,7 +262,7 @@ func SetEvictionLoopPreActionHookForTest(h func(peerName string)) func() {
 //
 // Implementation: stored via atomic.Pointer so concurrent reads (the
 // wake path under test) and writes (this setter) are race-detector clean.
-func SetWakeVerifyProbeForTest(fn func(ctx context.Context, baseURL, model string, timeout time.Duration) error) func() {
+func SetWakeVerifyProbeForTest(fn func(ctx context.Context, baseURL, model, runner string, timeout time.Duration) error) func() {
 	var old *wakeVerifyProbeFn
 	if fn == nil {
 		old = wakeVerifyProbe.Swap(nil)

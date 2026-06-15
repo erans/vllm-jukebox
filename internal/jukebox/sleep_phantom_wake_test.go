@@ -82,7 +82,7 @@ models:
 	// Inject phantom probe outcome — simulates the cumem wedge where
 	// /v1/completions hangs / returns error after /wake_up returned 200.
 	probeFired := atomic.Int32{}
-	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, baseURL, model string, _ time.Duration) error {
+	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, baseURL, model, _ string, _ time.Duration) error {
 		probeFired.Add(1)
 		if !strings.HasPrefix(baseURL, "http://phantom-target.test") {
 			t.Errorf("probe received unexpected baseURL %q", baseURL)
@@ -205,7 +205,7 @@ models:
 	s.SeedInstanceForTest("vllm-main", 8002, []int{0}, false, StateSleeping, mgr)
 
 	probeFired := atomic.Int32{}
-	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, _ string, _ time.Duration) error {
+	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, _, _ string, _ time.Duration) error {
 		probeFired.Add(1)
 		return nil // healthy decode
 	})
@@ -306,7 +306,7 @@ models:
 	s.SeedInstanceForTest("vllm-main", 8002, []int{0}, false, StateSleeping, mgr)
 
 	probeFired := atomic.Int32{}
-	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, _ string, _ time.Duration) error {
+	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, _, _ string, _ time.Duration) error {
 		probeFired.Add(1)
 		return errors.New("probe would-have-flagged-phantom but should not be called")
 	})
@@ -386,7 +386,7 @@ models:
 	// 404 because --served-model-name differs from what we sent.
 	probeFired := atomic.Int32{}
 	var seenServedName string
-	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, served string, _ time.Duration) error {
+	restoreProbe := SetWakeVerifyProbeForTest(func(_ context.Context, _, served, _ string, _ time.Duration) error {
 		probeFired.Add(1)
 		seenServedName = served
 		return fmt.Errorf("simulated 404: %w", vllmcli.ErrWakeVerifyConfigError)

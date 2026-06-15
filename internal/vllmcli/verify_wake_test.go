@@ -30,7 +30,7 @@ func TestVerifyWakeWithProbe_SuccessOnHealthyDecode(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "test-model", 2*time.Second); err != nil {
+	if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "test-model", "", 2*time.Second); err != nil {
 		t.Fatalf("VerifyWakeWithProbe: %v", err)
 	}
 	if seenPath != "/v1/completions" {
@@ -82,7 +82,7 @@ func TestVerifyWakeWithProbe_PromptUniquePerCall(t *testing.T) {
 	defer srv.Close()
 
 	for i := 0; i < 8; i++ {
-		if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", time.Second); err != nil {
+		if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", "", time.Second); err != nil {
 			t.Fatalf("iter %d: %v", i, err)
 		}
 	}
@@ -114,7 +114,7 @@ func TestVerifyWakeWithProbe_PhantomOnTimeout(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", 250*time.Millisecond)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", "", 250*time.Millisecond)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("expected timeout error on wedged decode; got nil")
@@ -162,7 +162,7 @@ func TestVerifyWakeWithProbe_PhantomOnHeadersThenHang(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", 1*time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", "", 1*time.Second)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("expected error on headers-then-hang wedge; got nil")
@@ -190,7 +190,7 @@ func TestVerifyWakeWithProbe_PhantomOn5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", 2*time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", "", 2*time.Second)
 	if err == nil {
 		t.Fatalf("expected error on 500; got nil")
 	}
@@ -216,7 +216,7 @@ func TestVerifyWakeWithProbe_PhantomOnEmptyChoices(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", 2*time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "m", "", 2*time.Second)
 	if err == nil {
 		t.Fatalf("expected error on empty choices; got nil")
 	}
@@ -246,7 +246,7 @@ func TestVerifyWakeWithProbe_ConfigErrorOn404ModelNotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", 2*time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", "", 2*time.Second)
 	if err == nil {
 		t.Fatalf("expected error on 404 model-not-found; got nil")
 	}
@@ -271,7 +271,7 @@ func TestVerifyWakeWithProbe_ConfigErrorOn400ModelNotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", 2*time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", "", 2*time.Second)
 	if err == nil {
 		t.Fatalf("expected error on 400 NotFoundError; got nil")
 	}
@@ -292,7 +292,7 @@ func TestVerifyWakeWithProbe_4xxWithoutModelHintIsPhantom(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", 2*time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "vllm-main", "", 2*time.Second)
 	if err == nil {
 		t.Fatalf("expected error on generic 400; got nil")
 	}
@@ -323,7 +323,7 @@ func TestVerifyWakeWithProbe_ServedNameUsedInRequest(t *testing.T) {
 	defer srv.Close()
 
 	const served = "Qwen/Qwen3-32B-AWQ"
-	if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, served, time.Second); err != nil {
+	if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, served, "", time.Second); err != nil {
 		t.Fatalf("probe: %v", err)
 	}
 	if seenModel != served {
@@ -337,7 +337,7 @@ func TestVerifyWakeWithProbe_ServedNameUsedInRequest(t *testing.T) {
 // "skip when baseURL is empty" gate from accidentally triggering this
 // code path on a regression.
 func TestVerifyWakeWithProbe_EmptyBaseURLRejected(t *testing.T) {
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), "", "m", time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), "", "m", "", time.Second)
 	if err == nil || !strings.Contains(err.Error(), "baseURL") {
 		t.Fatalf("expected baseURL validation error; got %v", err)
 	}
@@ -345,7 +345,7 @@ func TestVerifyWakeWithProbe_EmptyBaseURLRejected(t *testing.T) {
 
 // TestVerifyWakeWithProbe_EmptyModelRejected proves model name is required.
 func TestVerifyWakeWithProbe_EmptyModelRejected(t *testing.T) {
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), "http://example.test", "", time.Second)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), "http://example.test", "", "", time.Second)
 	if err == nil || !strings.Contains(err.Error(), "servedModelName") {
 		t.Fatalf("expected servedModelName validation error; got %v", err)
 	}
@@ -356,8 +356,176 @@ func TestVerifyWakeWithProbe_EmptyModelRejected(t *testing.T) {
 // regressions (a zero-deadline ctx returns immediately, which would
 // make every probe call false-pass).
 func TestVerifyWakeWithProbe_ZeroTimeoutRejected(t *testing.T) {
-	err := vllmcli.VerifyWakeWithProbe(context.Background(), "http://example.test", "m", 0)
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), "http://example.test", "m", "", 0)
 	if err == nil || !strings.Contains(err.Error(), "timeout") {
 		t.Fatalf("expected timeout validation error; got %v", err)
+	}
+}
+
+// --- model-type-aware probe (RAG-path black-hole fix) ---
+
+// TestVerifyWakeWithProbe_PoolingProbesEmbeddings proves the load-bearing
+// fix: a pooling model (runner: "pooling" — an embedding model like
+// bge-m3) is probed against /v1/embeddings, NOT /v1/completions. Pre-fix
+// the probe always hit /v1/completions, which pooling models don't serve
+// (they're launched --task embed) → route-404 → misclassified phantom →
+// 503 + schedule-recreate on every request, black-holing the RAG path.
+func TestVerifyWakeWithProbe_PoolingProbesEmbeddings(t *testing.T) {
+	var seenPath string
+	var seenBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}]}`)
+	}))
+	defer srv.Close()
+
+	if err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "bge-m3", "pooling", 2*time.Second); err != nil {
+		t.Fatalf("pooling probe against healthy embeddings endpoint should succeed; got %v", err)
+	}
+	if seenPath != "/v1/embeddings" {
+		t.Errorf("expected pooling model to be probed at /v1/embeddings; got %s", seenPath)
+	}
+	var decoded struct {
+		Model string `json:"model"`
+		Input string `json:"input"`
+	}
+	if err := json.Unmarshal(seenBody, &decoded); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if decoded.Model != "bge-m3" {
+		t.Errorf("expected model=bge-m3 in embeddings body; got %q", decoded.Model)
+	}
+	if !strings.HasPrefix(decoded.Input, "wake-verify-") {
+		t.Errorf("expected cache-defeating input prefixed 'wake-verify-'; got %q", decoded.Input)
+	}
+}
+
+// TestVerifyWakeWithProbe_PoolingEmptyDataIsPhantom proves a pooling model
+// that returns HTTP 200 with zero data entries (half-recovered engine) is
+// still detected as a phantom — the type-aware path doesn't weaken the
+// wedge detection for pooling models.
+func TestVerifyWakeWithProbe_PoolingEmptyDataIsPhantom(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"object":"list","data":[]}`)
+	}))
+	defer srv.Close()
+
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "bge-m3", "pooling", 2*time.Second)
+	if err == nil {
+		t.Fatalf("expected phantom on empty embeddings data; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("expected ErrWakeVerifyPhantom on zero data entries; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_RouteNotFoundIsEndpointUnsupported is the
+// core defense-in-depth assertion. This reproduces the EXACT live failure:
+// a reranker/embedding model whose verify probe hits an endpoint it
+// doesn't serve returns the FastAPI/Starlette route-404 body
+// {"detail":"Not Found"}. Pre-fix this was classified as a phantom-wedge
+// → 503 + schedule-recreate (which then failed for sleep-evict members).
+// Post-fix it MUST be ErrWakeVerifyEndpointUnsupported (NOT phantom, NOT
+// config-error) so the caller routes the model normally.
+func TestVerifyWakeWithProbe_RouteNotFoundIsEndpointUnsupported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"detail":"Not Found"}`)
+	}))
+	defer srv.Close()
+
+	// Probe a pooling model whose /v1/embeddings somehow route-404s (or a
+	// reranker that serves neither verb we probe) — the backstop must fire.
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "mxbai-rerank-base-v2", "pooling", 2*time.Second)
+	if err == nil {
+		t.Fatalf("expected endpoint-unsupported error on route-404; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyEndpointUnsupported) {
+		t.Errorf("expected ErrWakeVerifyEndpointUnsupported on {\"detail\":\"Not Found\"}; got %v", err)
+	}
+	if errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("route-404 MUST NOT be classified as phantom (would 503 + schedule-recreate the RAG path); got %v", err)
+	}
+	if errors.Is(err, vllmcli.ErrWakeVerifyConfigError) {
+		t.Errorf("route-404 MUST NOT be classified as config-error; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_GenerativeRouteNotFoundIsEndpointUnsupported
+// proves the same backstop on the generative path: even if a generative
+// model's /v1/completions somehow route-404s, that bare {"detail":"Not
+// Found"} is not a wedge signature.
+func TestVerifyWakeWithProbe_GenerativeRouteNotFoundIsEndpointUnsupported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"detail":"Not Found"}`)
+	}))
+	defer srv.Close()
+
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "qwen3", "generate", 2*time.Second)
+	if err == nil {
+		t.Fatalf("expected endpoint-unsupported error on generative route-404; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyEndpointUnsupported) {
+		t.Errorf("expected ErrWakeVerifyEndpointUnsupported; got %v", err)
+	}
+	if errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("route-404 MUST NOT be phantom; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_GenerativeTimeoutStillPhantom is the negative
+// control paired with the route-404 test: a GENERATIVE model whose probe
+// hangs (the genuine cumem-wedge signature) MUST still be flagged phantom.
+// This guards against the fix accidentally swallowing real wedges.
+func TestVerifyWakeWithProbe_GenerativeTimeoutStillPhantom(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "qwen3", "generate", 250*time.Millisecond)
+	if err == nil {
+		t.Fatalf("expected phantom on wedged generative decode; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyPhantom) {
+		t.Errorf("generative wedge MUST still be ErrWakeVerifyPhantom; got %v", err)
+	}
+	if errors.Is(err, vllmcli.ErrWakeVerifyEndpointUnsupported) {
+		t.Errorf("a timeout is a wedge, not endpoint-unsupported; got %v", err)
+	}
+}
+
+// TestVerifyWakeWithProbe_ModelNotFoundStillConfigError guards that the
+// new route-404 branch doesn't steal the model-name-mismatch 404 (which
+// references the model + NotFoundError and MUST stay ErrWakeVerifyConfigError).
+func TestVerifyWakeWithProbe_ModelNotFoundStillConfigError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"message":"The model 'qwen3' does not exist.","type":"NotFoundError","code":404}}`)
+	}))
+	defer srv.Close()
+
+	err := vllmcli.VerifyWakeWithProbe(context.Background(), srv.URL, "qwen3", "generate", 2*time.Second)
+	if err == nil {
+		t.Fatalf("expected config error on model-not-found 404; got nil")
+	}
+	if !errors.Is(err, vllmcli.ErrWakeVerifyConfigError) {
+		t.Errorf("model-name 404 must stay ErrWakeVerifyConfigError; got %v", err)
+	}
+	if errors.Is(err, vllmcli.ErrWakeVerifyEndpointUnsupported) {
+		t.Errorf("model-name 404 must NOT be reclassified as endpoint-unsupported; got %v", err)
 	}
 }
