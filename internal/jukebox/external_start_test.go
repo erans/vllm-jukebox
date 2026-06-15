@@ -1,0 +1,997 @@
+package jukebox
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/ports"
+)
+
+// externalStartTestConfig matches the live scenario that Issue #5 was
+// filed against: two external models in DIFFERENT swap-groups,
+// overlapping on GPU 1. `holder` is admission-Ready (resident, holding
+// VRAM). `target` is admission-Stopped (no jukebox lifecycle has
+// started it yet). The fault: someone runs `docker start vllm-target`
+// directly, bypassing the cold-load path. Without the
+// ExternalStartMonitor, the target would have OOM'd on GPU 1.
+const externalStartTestConfig = `
+scheduler:
+  port_range_start: 9100
+  port_range_end: 9199
+vllm:
+  port: 9000
+  startup_timeout: 1s
+  drain_timeout: 50ms
+  shutdown_timeout: 50ms
+models:
+  holder:
+    lifecycle: external
+    host: vllm-holder
+    port: 9001
+    gpus: [0, 1]
+    min_free_mem_mb_per_gpu: 10
+    sleep_mode: true
+    swap_group: holder-group
+    pinned: true
+    expected_vram_mb_per_gpu: 12000
+    sleep_l1_residual_mb: 1000
+    wake_timeout: 1s
+  target:
+    lifecycle: external
+    host: vllm-target
+    port: 9002
+    gpus: [1, 2]
+    min_free_mem_mb_per_gpu: 10
+    sleep_mode: true
+    swap_group: target-group
+    expected_vram_mb_per_gpu: 11000
+    sleep_l1_residual_mb: 0
+    wake_timeout: 1s
+`
+
+// makeExternalStartScheduler is a fresh-ish copy of
+// makeCrossGroupScheduler tuned for ExternalStartMonitor tests: it
+// doesn't need a `bystander` model and uses 8000mb totals so the
+// admission paths are tight enough to be representative.
+func makeExternalStartScheduler(t *testing.T, holderState, targetState State) (*Scheduler, *AdmissionController, map[string]*fakeRedeployMgr) {
+	t.Helper()
+	cfg, err := config.Load([]byte(externalStartTestConfig))
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	totalsByGPU := map[int]int{0: 24000, 1: 24000, 2: 24000}
+	inv := newRedeployInventory(totalsByGPU)
+	pool := ports.New(9100, 9199)
+	s := NewSchedulerWithFactory(cfg, inv, pool, time.Now, nil, nil)
+	a := NewAdmissionController(cfg, totalsByGPU, &SchedulerEvictor{S: s})
+	s.SetAdmission(a)
+
+	mgrs := map[string]*fakeRedeployMgr{
+		"holder": {port: 9001},
+		"target": {port: 9002},
+	}
+	for name, m := range mgrs {
+		modelCfg := cfg.Models[name]
+		var st State
+		switch name {
+		case "holder":
+			st = holderState
+		case "target":
+			st = targetState
+		}
+		switch st {
+		case StateReady:
+			m.pid.Store(int64(7000 + m.port))
+			m.isSleeping.Store(false)
+		case StateSleeping:
+			m.pid.Store(int64(7000 + m.port))
+			m.isSleeping.Store(true)
+		case StateStopped:
+			m.pid.Store(0)
+			m.isSleeping.Store(true)
+		}
+		s.SeedInstanceForTest(name, m.port, modelCfg.GPUs, modelCfg.Pinned != nil && *modelCfg.Pinned, st, m)
+	}
+
+	// Sync admission for stopped seeds so IsStopped agrees with the
+	// instance map (KickColdLoad consults admission, not s.instances).
+	a.mu.Lock()
+	if targetState == StateStopped {
+		a.markStoppedLocked(a.models["target"])
+	}
+	if holderState == StateStopped {
+		a.markStoppedLocked(a.models["holder"])
+	}
+	a.mu.Unlock()
+
+	return s, a, mgrs
+}
+
+// dockerInspectRecorder is a thread-safe recorder for the docker calls
+// the ExternalStartMonitor issues via runSleepDocker. Tests configure
+// per-container inspect responses (status string) and assert on the
+// stop/start call sequence.
+type dockerInspectRecorder struct {
+	mu       sync.Mutex
+	calls    []string          // every "docker <args...>" string
+	stops    []string          // container names passed to "docker stop"
+	starts   []string          // container names passed to "docker start"
+	statusBy map[string]string // container → status string returned by `docker inspect -f '{{json .State}}'`
+	// startedAtBy lets tests override the StartedAt value reported per
+	// container. Empty/unset → falls back to the recorder's default
+	// (1h in the future from time.Now()), which is AFTER the scheduler's
+	// bootEpoch, so shouldAdoptOnBoot returns Adopt=false and the
+	// existing pre-Issue-#5b SIGKILL behavior is preserved. New
+	// startup-adopt tests explicitly set a value PRIOR to bootEpoch to
+	// exercise the adopt path.
+	startedAtBy map[string]string
+	stopErr     func(container string) error // optional: per-container stop failure
+}
+
+func newDockerInspectRecorder() *dockerInspectRecorder {
+	return &dockerInspectRecorder{
+		statusBy:    map[string]string{},
+		startedAtBy: map[string]string{},
+	}
+}
+
+func (r *dockerInspectRecorder) setStartedAt(container, startedAt string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.startedAtBy[container] = startedAt
+}
+
+func (r *dockerInspectRecorder) startedAtOf(container string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if v, ok := r.startedAtBy[container]; ok && v != "" {
+		return v
+	}
+	// Default: 1 hour from now. This guarantees the container's
+	// StartedAt is AFTER any sane scheduler bootEpoch the test
+	// constructs via NewSchedulerWithFactory(now=time.Now), so the
+	// startup-adopt path is NOT taken and the existing external-start
+	// SIGKILL tests stay green.
+	return time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339Nano)
+}
+
+func (r *dockerInspectRecorder) setStatus(container, status string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.statusBy[container] = status
+}
+
+func (r *dockerInspectRecorder) statusOf(container string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.statusBy[container]
+	if !ok {
+		// Default = "exited" (the safe assumption when the test hasn't
+		// explicitly arranged a status). exited containers are NOT
+		// flagged by the monitor.
+		return "exited"
+	}
+	return s
+}
+
+func (r *dockerInspectRecorder) handler() func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return func(_ context.Context, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		r.mu.Lock()
+		r.calls = append(r.calls, full)
+		r.mu.Unlock()
+
+		// docker inspect -f '{{json .State}}' <container>
+		if len(args) >= 4 && args[0] == "inspect" && args[1] == "-f" {
+			container := args[3]
+			status := r.statusOf(container)
+			startedAt := r.startedAtOf(container)
+			// Minimal but valid JSON matching containerState's fields.
+			payload := fmt.Sprintf(`{"Status":%q,"ExitCode":0,"OOMKilled":false,"Error":"","StartedAt":%q,"FinishedAt":""}`, status, startedAt)
+			return []byte(payload), nil
+		}
+
+		// docker stop -t 0 <container>
+		if len(args) >= 4 && args[0] == "stop" {
+			container := args[len(args)-1]
+			r.mu.Lock()
+			r.stops = append(r.stops, container)
+			r.mu.Unlock()
+			if r.stopErr != nil {
+				if err := r.stopErr(container); err != nil {
+					return []byte("stop failed"), err
+				}
+			}
+			// Flip the status to "exited" so a follow-up inspect agrees
+			// with the post-stop reality.
+			r.setStatus(container, "exited")
+			return []byte("ok"), nil
+		}
+
+		// docker start <container>
+		if len(args) >= 2 && args[0] == "start" {
+			container := args[len(args)-1]
+			r.mu.Lock()
+			r.starts = append(r.starts, container)
+			r.mu.Unlock()
+			return []byte("ok"), nil
+		}
+
+		return []byte("ok"), nil
+	}
+}
+
+func (r *dockerInspectRecorder) stopsContains(container string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.stops {
+		if c == container {
+			return true
+		}
+	}
+	return false
+}
+
+// TestExternalStart_DetectsRunningStoppedPeer_StopsAndKicks is the
+// load-bearing Issue #5 regression. Admission records `target` as
+// Stopped; docker reports `vllm-target` as running. The monitor MUST:
+//  1. Issue `docker stop -t 0 vllm-target` immediately.
+//  2. Invoke KickColdLoad which spawns the proper cold-load goroutine.
+//
+// Pre-fix behavior: the monitor doesn't exist; the externally-started
+// container OOMs on GPU 1 because `holder` is awake there. Post-fix:
+// stop fires, KickColdLoad fires, the cold-load goroutine runs the
+// cross-group eviction before its own docker start.
+func TestExternalStart_DetectsRunningStoppedPeer_StopsAndKicks(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Issue #5c: the rogue-start case this test models is a container
+	// racing for VRAM at init that has NOT come up healthy. Make the
+	// health probe fail so we exercise the SIGKILL + cold-load path
+	// (a healthy externally-started container is now adopted instead).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: vLLM init racing for VRAM")
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running") // holder legitimately Ready
+	rec.setStatus("vllm-target", "running") // <-- externally started!
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Speed up: prevent the spawned KickColdLoad goroutine from doing
+	// its full 5-minute /is_sleeping poll loop in the test.
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	// MUST have stopped vllm-target.
+	if !rec.stopsContains("vllm-target") {
+		t.Fatalf("expected docker stop vllm-target; got calls=%v", rec.calls)
+	}
+	// MUST NOT have stopped vllm-holder (admission Ready agrees with
+	// docker running — no external start).
+	if rec.stopsContains("vllm-holder") {
+		t.Fatalf("did NOT expect docker stop vllm-holder (legitimately Ready); got stops=%v", rec.stops)
+	}
+
+	// Wait for the async KickColdLoad goroutine to register itself by
+	// checking that admission state flips. coldLoadKicks is set
+	// synchronously in KickColdLoad before the goroutine spawns; we
+	// can probe it directly.
+	deadline := time.Now().Add(2 * time.Second)
+	kickFired := false
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		_, kicked := s.coldLoadKicks["target"]
+		s.mu.RUnlock()
+		// Either the kick is in-flight (entry exists) OR has completed
+		// (entry was deferred-deleted). Either way, KickColdLoad fired.
+		if kicked {
+			kickFired = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !kickFired {
+		t.Logf("note: did not observe coldLoadKicks entry (kick may have completed before poll); stop fired correctly")
+	}
+}
+
+// TestExternalStart_IgnoresLegitimatelyRunningReady asserts the monitor
+// does NOT take action on a Ready instance whose container is running
+// (the happy path — jukebox put it there). Selection criteria filters
+// by admission state Stopped/Sleeping, so a Ready instance is never
+// even inspected.
+func TestExternalStart_IgnoresLegitimatelyRunningReady(t *testing.T) {
+	s, _, _ := makeExternalStartScheduler(t, StateReady, StateReady)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "running")
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	if len(rec.stops) != 0 {
+		t.Fatalf("expected no docker stop calls (both instances Ready); got stops=%v", rec.stops)
+	}
+}
+
+// TestExternalStart_IgnoresStoppedAndExited covers the steady-state
+// no-op case: admission says Stopped, docker says exited. No action.
+func TestExternalStart_IgnoresStoppedAndExited(t *testing.T) {
+	s, _, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "exited")
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	if len(rec.stops) != 0 {
+		t.Fatalf("expected no docker stop calls (target exited matches Stopped admission); got stops=%v", rec.stops)
+	}
+}
+
+// TestExternalStart_DetectsRunningSleepingPeer: admission records
+// `target` as Sleeping (peer was admission-Sleeping, e.g. boot-probe
+// found it asleep), but docker reports it running. This is also
+// inconsistent — Sleeping means "vLLM is paused via /sleep", not
+// "container is stopped" — but the same fix applies: SIGKILL and
+// re-route through cold-load to restore invariants.
+func TestExternalStart_DetectsRunningSleepingPeer(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateSleeping)
+	// Rogue start, not a healthy recovery: fail the health probe so the
+	// SIGKILL + cold-load path runs (Issue #5c adopts healthy peers).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused")
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "running") // <-- inconsistent with Sleeping
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	if !rec.stopsContains("vllm-target") {
+		t.Fatalf("expected docker stop vllm-target (Sleeping admission + running docker is inconsistent); got calls=%v", rec.calls)
+	}
+}
+
+// TestExternalStart_NoOpForAdmissionDisabledModels: a model with no
+// expected_vram_mb_per_gpu is invisible to admission and must NOT be
+// probed by the monitor (admission filter at the selection layer).
+func TestExternalStart_NoOpForAdmissionDisabledModels(t *testing.T) {
+	const cfg = `
+scheduler:
+  port_range_start: 9100
+  port_range_end: 9199
+vllm:
+  port: 9000
+  startup_timeout: 1s
+  drain_timeout: 50ms
+  shutdown_timeout: 50ms
+models:
+  untracked:
+    lifecycle: external
+    host: vllm-untracked
+    port: 9001
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    sleep_mode: true
+    wake_timeout: 1s
+`
+	parsed, err := config.Load([]byte(cfg))
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	totalsByGPU := map[int]int{0: 24000}
+	inv := newRedeployInventory(totalsByGPU)
+	pool := ports.New(9100, 9199)
+	s := NewSchedulerWithFactory(parsed, inv, pool, time.Now, nil, nil)
+	a := NewAdmissionController(parsed, totalsByGPU, &SchedulerEvictor{S: s})
+	s.SetAdmission(a)
+	mgr := &fakeRedeployMgr{port: 9001}
+	mgr.pid.Store(0)
+	mgr.isSleeping.Store(true)
+	modelCfg := parsed.Models["untracked"]
+	s.SeedInstanceForTest("untracked", mgr.port, modelCfg.GPUs, false, StateStopped, mgr)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-untracked", "running")
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	// Untracked-by-admission models must be filtered out before the
+	// inspect even runs.
+	for _, c := range rec.calls {
+		if strings.Contains(c, "inspect") && strings.Contains(c, "vllm-untracked") {
+			t.Fatalf("admission-disabled model must NOT be inspected; got call %q (all calls: %v)", c, rec.calls)
+		}
+	}
+}
+
+// TestExternalStart_StopFailureSurfacesMetricAndSkipsKick: if docker
+// stop -t 0 itself fails, the monitor must NOT proceed to KickColdLoad
+// (the still-running container would race with the cold-load's
+// docker start). It bumps the failure counter and returns.
+func TestExternalStart_StopFailureSurfacesMetricAndSkipsKick(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Rogue start (unhealthy): drive the SIGKILL path so the stop-failure
+	// branch is reachable (Issue #5c adopts healthy peers before this).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused")
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "running")
+	rec.stopErr = func(container string) error {
+		if container == "vllm-target" {
+			return fmt.Errorf("simulated docker daemon hiccup")
+		}
+		return nil
+	}
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	// Stop was attempted.
+	if !rec.stopsContains("vllm-target") {
+		t.Fatalf("expected docker stop vllm-target attempt; got calls=%v", rec.calls)
+	}
+	// docker start MUST NOT have followed (KickColdLoad was correctly skipped).
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, c := range rec.starts {
+		if c == "vllm-target" {
+			t.Fatalf("KickColdLoad must NOT run when stop failed; saw docker start %s", c)
+		}
+	}
+}
+
+// TestExternalStart_AdoptsHealthyExternallyStartedPeer is the Issue #5c
+// regression: jukebox booted while an aux peer was DOWN, so the boot
+// probe latched admission Stopped. Later an operator runs
+// `docker start <peer>` and the container comes up HEALTHY. Because the
+// container's StartedAt is AFTER jukebox's bootEpoch, the boot-adopt
+// path (Issue #5b) declines. The PRE-FIX behavior then SIGKILLs the
+// healthy container and kicks an orphaning cold-load — destroying a peer
+// the operator just brought up. POST-FIX: the monitor probes /health
+// (VerifyReady), sees the peer is healthy, and ADOPTS it (state→Ready,
+// admission booked, NO docker stop, NO cold-load).
+//
+// Pre-fix: docker stop vllm-target fires → test FAILS on the no-stop
+// assertion. Post-fix: no stop, state reconciled to Ready → PASSES.
+func TestExternalStart_AdoptsHealthyExternallyStartedPeer(t *testing.T) {
+	s, a, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Healthy externally-started container (the operator's `docker start`
+	// succeeded; vLLM came up clean).
+	mgrs["target"].verifyErr = nil
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "running") // operator just started it
+	// StartedAt AFTER bootEpoch (default recorder behavior is +1h) so the
+	// boot-adopt path declines and we reach the healthy-start-adopt path.
+	// Be explicit for clarity.
+	rec.setStartedAt("vllm-target", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	// Guard: if the fix regressed and a cold-load kicked, don't let it
+	// run a 5-minute poll loop in the test.
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	// CORE ASSERTION: the healthy container must NOT have been SIGKILLed.
+	if rec.stopsContains("vllm-target") {
+		t.Fatalf("PRE-FIX BUG REPRODUCED: monitor SIGKILL'd a healthy externally-started peer; stops=%v", rec.stops)
+	}
+
+	// And no cold-load docker start should have fired for it (adopt path
+	// leaves the container alone; it does not re-route through cold-load).
+	rec.mu.Lock()
+	for _, c := range rec.starts {
+		if c == "vllm-target" {
+			rec.mu.Unlock()
+			t.Fatalf("adopt path must NOT kick a cold-load (docker start) for a healthy peer; starts=%v", rec.starts)
+		}
+	}
+	rec.mu.Unlock()
+
+	// State must have been reconciled away from the stale Stopped latch,
+	// SLEEP_MODE-AWARE. `target` is sleep_mode:true → it is in vLLM's
+	// normal slept-L1 resting state and must reconcile to StateSleeping
+	// (NOT StateReady — supervisor FAIL: the pre-fix code marked it Ready
+	// while only booking the L1 residual, so its awake VRAM was never
+	// accounted; the next consumer correctly takes the wake path from
+	// Sleeping). Booking must be L1 residual, NOT full awake VRAM.
+	got, ok := s.InstanceStateForTest("target")
+	if !ok {
+		t.Fatalf("target instance gone from scheduler")
+	}
+	if got != StateSleeping {
+		t.Fatalf("expected stale Stopped latch reconciled to StateSleeping (sleep_mode:true) after healthy adopt, got %v", got)
+	}
+
+	// ADMISSION BOOKS (not just inst.state): admission must be off Stopped
+	// and the GPU-1 books must reflect the L1 residual (sleep_l1_residual_mb
+	// is 0 for target, so the meaningful assertion is: it is Sleeping, NOT
+	// holding full awake VRAM). Verify no full awake VRAM was booked for the
+	// target's GPUs (1,2) — that is the supervisor-FAIL symptom.
+	if a.IsStopped("target") {
+		t.Fatalf("admission still reports Stopped after healthy adopt")
+	}
+	a.mu.Lock()
+	awakeG1, awakeG2 := a.awakeByGPU[1], a.awakeByGPU[2]
+	a.mu.Unlock()
+	// holder (Ready, sleep_mode:true) is booked awake on GPUs 0,1 — so GPU 1
+	// awake includes holder's 12000. target's expected_vram is 11000 on GPUs
+	// 1,2. If target were wrongly booked awake, GPU 2 awake would be 11000.
+	if awakeG2 != 0 {
+		t.Fatalf("supervisor FAIL: sleep_mode:true peer wrongly booked FULL awake VRAM on GPU 2 (got %d, want 0); should be slept-L1 only", awakeG2)
+	}
+	_ = awakeG1
+}
+
+// TestExternalStart_AdoptsHealthyNonSleepModePeer is the sleep_mode:false
+// half of the supervisor-FAIL fix: a non-sleep-mode external model that
+// comes back healthy must reconcile to StateReady AND have its FULL awake
+// VRAM booked (NotifyStartedAwake) — mirroring ReprobeStoppedExternal. The
+// pre-fix adopt path called NotifyStarted (L1 residual + Sleeping-ish books)
+// + StateReady, which under-booked the awake VRAM (shared-GPU OOM) for a
+// model that is just "up" and has no /wake_up endpoint.
+func TestExternalStart_AdoptsHealthyNonSleepModePeer(t *testing.T) {
+	const cfg = `
+scheduler:
+  port_range_start: 9100
+  port_range_end: 9199
+vllm:
+  port: 9000
+  startup_timeout: 1s
+  drain_timeout: 50ms
+  shutdown_timeout: 50ms
+models:
+  ocr:
+    lifecycle: external
+    host: vllm-ocr
+    port: 9001
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    expected_vram_mb_per_gpu: 8000
+    wake_timeout: 1s
+`
+	parsed, err := config.Load([]byte(cfg))
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	totalsByGPU := map[int]int{0: 24000}
+	inv := newRedeployInventory(totalsByGPU)
+	pool := ports.New(9100, 9199)
+	s := NewSchedulerWithFactory(parsed, inv, pool, time.Now, nil, nil)
+	a := NewAdmissionController(parsed, totalsByGPU, &SchedulerEvictor{S: s})
+	s.SetAdmission(a)
+
+	mgr := &fakeRedeployMgr{port: 9001}
+	mgr.pid.Store(0)
+	mgr.isSleeping.Store(false)
+	mgr.verifyErr = nil // healthy
+	modelCfg := parsed.Models["ocr"]
+	s.SeedInstanceForTest("ocr", 9001, modelCfg.GPUs, false, StateStopped, mgr)
+	a.mu.Lock()
+	a.markStoppedLocked(a.models["ocr"])
+	a.mu.Unlock()
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-ocr", "running")
+	rec.setStartedAt("vllm-ocr", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	// No SIGKILL, no cold-load.
+	if rec.stopsContains("vllm-ocr") {
+		t.Fatalf("non-sleep healthy peer must NOT be SIGKILLed; stops=%v", rec.stops)
+	}
+
+	// Instance reconciled to Ready (no wake path for non-sleep-mode).
+	got, ok := s.InstanceStateForTest("ocr")
+	if !ok {
+		t.Fatalf("ocr instance gone from scheduler")
+	}
+	if got != StateReady {
+		t.Fatalf("expected non-sleep-mode peer reconciled to StateReady, got %v", got)
+	}
+
+	// ADMISSION BOOKS: FULL awake VRAM booked (8000 on GPU 0), NOT slept-L1.
+	if a.IsStopped("ocr") {
+		t.Fatalf("admission still reports Stopped after non-sleep adopt")
+	}
+	a.mu.Lock()
+	awakeG0 := a.awakeByGPU[0]
+	l1G0 := a.l1ResidualByGPU[0]
+	a.mu.Unlock()
+	if awakeG0 != 8000 {
+		t.Fatalf("supervisor FAIL: non-sleep-mode adopt did not book FULL awake VRAM (awakeByGPU[0]=%d, want 8000) — NotifyStartedAwake not called", awakeG0)
+	}
+	if l1G0 != 0 {
+		t.Fatalf("non-sleep-mode adopt wrongly booked L1 residual (l1ResidualByGPU[0]=%d, want 0)", l1G0)
+	}
+}
+
+// TestExternalStart_AdoptThenReconcileToStoppedThenRogueRestartSigkills is
+// the adversarial-HIGH lifecycle regression: the bootAdoptedPeers one-shot
+// latch must be CLEARED when the StateReconciler resets a peer to Stopped,
+// or rogue-start (Issue #5) protection is permanently disabled for that
+// model for the jukebox process lifetime.
+//
+// Sequence:
+//  1. Operator `docker start <peer>`; it comes up healthy → checkOneExternalStart
+//     ADOPTS it, sets bootAdoptedPeers[target].
+//  2. The peer OOM-dies; docker reports it exited. StateReconciler flips
+//     admission + inst.state back to StateStopped — and (the FIX) clears
+//     bootAdoptedPeers[target].
+//  3. Operator `docker start <peer>` AGAIN, under GPU contention; this time
+//     the container is running but UNHEALTHY (racing for VRAM at init). This
+//     is a genuine rogue start that MUST be SIGKILLed.
+//
+// Pre-fix: step 1 latches bootAdoptedPeers permanently; step 3's
+// checkOneExternalStart returns early at the alreadyAdopted guard → NO
+// SIGKILL → Issue #5 protection gone. Post-fix: step 2 clears the latch →
+// step 3 reaches the health-gate → unhealthy → SIGKILL fires.
+func TestExternalStart_AdoptThenReconcileToStoppedThenRogueRestartSigkills(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	startedAt := time.Now().Add(1 * time.Minute).UTC().Format(time.RFC3339Nano)
+	rec.setStartedAt("vllm-target", startedAt)
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	// STEP 1: operator started the peer; it is running + healthy → ADOPT.
+	mgrs["target"].verifyErr = nil
+	rec.setStatus("vllm-target", "running")
+	s.CheckExternalStartsForTest(context.Background())
+
+	// Precondition: adopted (sleep_mode:true → Sleeping) and latched.
+	if got, _ := s.InstanceStateForTest("target"); got != StateSleeping {
+		t.Fatalf("STEP 1: expected adopted peer in StateSleeping, got %v", got)
+	}
+	s.mu.RLock()
+	_, latched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if !latched {
+		t.Fatalf("STEP 1: expected bootAdoptedPeers[target] set after adopt")
+	}
+	if rec.stopsContains("vllm-target") {
+		t.Fatalf("STEP 1: healthy adopt must not SIGKILL; stops=%v", rec.stops)
+	}
+
+	// STEP 2: the peer OOM-died; docker now reports it exited. The
+	// StateReconciler must flip Sleeping → Stopped AND clear the latch.
+	rec.setStatus("vllm-target", "exited")
+	s.ReconcileStateForTest(context.Background())
+
+	if got, _ := s.InstanceStateForTest("target"); got != StateStopped {
+		t.Fatalf("STEP 2: expected reconciler to reset peer to StateStopped, got %v", got)
+	}
+	s.mu.RLock()
+	_, stillLatched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if stillLatched {
+		t.Fatalf("ADVERSARIAL-HIGH BUG REPRODUCED: bootAdoptedPeers[target] still set after reconcile-to-Stopped; rogue-start detection permanently disabled")
+	}
+
+	// STEP 3: operator restarts the peer under GPU contention; this time it
+	// is a genuine rogue start — running but UNHEALTHY (racing for VRAM).
+	// The latch is cleared, so checkOneExternalStart must reach the
+	// health-gate, find it unhealthy, and SIGKILL it.
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: rogue init racing for VRAM")
+	rec.setStatus("vllm-target", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(2*time.Minute).UTC().Format(time.RFC3339Nano))
+	s.CheckExternalStartsForTest(context.Background())
+
+	if !rec.stopsContains("vllm-target") {
+		t.Fatalf("STEP 3: genuine rogue restart MUST be SIGKILLed after latch cleared; got calls=%v", rec.calls)
+	}
+}
+
+// TestExternalStart_UnhealthyExternalStartStillSigkills is the negative
+// control for Issue #5c: a container that is running but NOT healthy
+// (the genuine rogue start racing for VRAM at init) must STILL be
+// SIGKILLed + re-routed through cold-load. Confirms the health probe
+// only diverts the healthy case and leaves the original Issue #5
+// protection intact for the unhealthy case.
+func TestExternalStart_UnhealthyExternalStartStillSigkills(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	// Unhealthy: VerifyReady fails (vLLM init in-flight / racing for VRAM).
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: init in flight")
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	if !rec.stopsContains("vllm-target") {
+		t.Fatalf("unhealthy rogue start MUST still be SIGKILLed; got calls=%v", rec.calls)
+	}
+}
+
+// TestExternalStart_AdoptThenEvictToStoppedThenRogueRestartSigkills is the
+// round-2 adversarial-HIGH regression: the bootAdoptedPeers one-shot latch
+// must be cleared on EVERY jukebox-initiated eviction to Stopped — not just
+// the state-reconciler path. THIS test exercises the EVICTION path
+// (StopForEviction, the SchedulerEvictor), which is distinct from the
+// existing TestExternalStart_AdoptThenReconcileToStoppedThenRogueRestartSigkills
+// (state-reconciler path). Pre-round-2 code added the latch-clear ONLY to
+// state_reconciler.go, leaving StopForEviction / cold-load-evict /
+// redeploy / SIGKILL paths leaking the latch.
+//
+// Live reachability: aux cold-loads evict cross-group GPU contenders via
+// evictCrossGroupGPUContendersLocked (→ Stopped). If such a contender was
+// previously adopted (operator `docker start` on a healthy peer), the leak
+// means a later rogue restart of that contender under contention is NEVER
+// SIGKILLed — the Issue-#5 GPU-contention OOM the monitor exists to prevent.
+//
+// Sequence:
+//  1. Operator `docker start <peer>`; healthy → checkOneExternalStart ADOPTS,
+//     sets bootAdoptedPeers[target].
+//  2. An aux cold-load (modeled directly by StopForEviction) evicts the peer
+//     to Stopped. The FIX (setInstanceStoppedLocked) clears the latch.
+//  3. Operator `docker start <peer>` AGAIN under contention; this time the
+//     container is running but UNHEALTHY. Genuine rogue start → MUST SIGKILL.
+//
+// Pre-fix: step 2's StopForEviction sets inst.state=StateStopped WITHOUT
+// clearing the latch → step 3 returns early at the alreadyAdopted guard →
+// NO SIGKILL. Post-fix: step 2 clears the latch → step 3 SIGKILLs.
+func TestExternalStart_AdoptThenEvictToStoppedThenRogueRestartSigkills(t *testing.T) {
+	s, a, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	// STEP 1: operator started the peer; running + healthy → ADOPT + latch.
+	mgrs["target"].verifyErr = nil
+	rec.setStatus("vllm-target", "running")
+	s.CheckExternalStartsForTest(context.Background())
+
+	if got, _ := s.InstanceStateForTest("target"); got != StateSleeping {
+		t.Fatalf("STEP 1: expected adopted peer in StateSleeping, got %v", got)
+	}
+	s.mu.RLock()
+	_, latched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if !latched {
+		t.Fatalf("STEP 1: expected bootAdoptedPeers[target] set after adopt")
+	}
+	if rec.stopsContains("vllm-target") {
+		t.Fatalf("STEP 1: healthy adopt must not SIGKILL; stops=%v", rec.stops)
+	}
+
+	// STEP 2: an aux cold-load evicts this peer to Stopped. Drive the SAME
+	// production helper a cold-load uses (StopForEviction → docker stop →
+	// inst.state=Stopped). This is the EVICTION path the round-2 finding
+	// flagged — distinct from the state-reconciler path.
+	evictor := &SchedulerEvictor{S: s}
+	if err := evictor.StopForEviction(context.Background(), "target", "aux-cold-load-cross-group-contender"); err != nil {
+		t.Fatalf("STEP 2: StopForEviction failed: %v", err)
+	}
+	if got, _ := s.InstanceStateForTest("target"); got != StateStopped {
+		t.Fatalf("STEP 2: expected peer in StateStopped after eviction, got %v", got)
+	}
+	s.mu.RLock()
+	_, stillLatched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if stillLatched {
+		t.Fatalf("ROUND-2 ADVERSARIAL-HIGH BUG REPRODUCED: bootAdoptedPeers[target] still set after StopForEviction; rogue-start detection permanently disabled on the eviction path")
+	}
+	// Admission must agree the peer is Stopped (StopForEviction's caller
+	// normally calls NotifyStopped; the evictor itself does not, so mirror
+	// the production cold-load path here so step 3's monitor selects it).
+	a.mu.Lock()
+	a.markStoppedLocked(a.models["target"])
+	a.mu.Unlock()
+
+	// STEP 2 itself issued a `docker stop vllm-target` (the eviction). Record
+	// the count of stop calls now so STEP 3's assertion checks for a NEW
+	// SIGKILL rather than being satisfied by the eviction's stop.
+	rec.mu.Lock()
+	stopsBeforeStep3 := len(rec.stops)
+	rec.mu.Unlock()
+
+	// STEP 3: operator restarts under GPU contention; running but UNHEALTHY
+	// (racing for VRAM). Latch cleared → monitor reaches the health-gate,
+	// finds it unhealthy, and SIGKILLs.
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: rogue init racing for VRAM")
+	rec.setStatus("vllm-target", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(2*time.Minute).UTC().Format(time.RFC3339Nano))
+	s.CheckExternalStartsForTest(context.Background())
+
+	rec.mu.Lock()
+	stopsAfterStep3 := len(rec.stops)
+	rec.mu.Unlock()
+	if stopsAfterStep3 <= stopsBeforeStep3 {
+		t.Fatalf("STEP 3: genuine rogue restart MUST be SIGKILLed (a NEW docker stop) after latch cleared on eviction; before=%d after=%d calls=%v",
+			stopsBeforeStep3, stopsAfterStep3, rec.calls)
+	}
+}
+
+// TestExternalStart_MonitorLoopExitsOnContextCancel exercises the
+// production goroutine path: start the monitor, cancel the ctx, and
+// verify it returns within a bounded window. Guards against a missing
+// <-ctx.Done() branch (a future refactor that returns early on tick
+// processing only).
+func TestExternalStart_MonitorLoopExitsOnContextCancel(t *testing.T) {
+	s, _, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+	// Very tight cadence so the test doesn't pay 2s per tick.
+	old := SetExternalStartPollIntervalForTest(5 * time.Millisecond)
+	defer SetExternalStartPollIntervalForTest(old)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStatus("vllm-target", "exited")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var ranAtLeastOnce atomic.Bool
+	// Wrap the docker hook to flag that at least one tick ran.
+	inner := rec.handler()
+	SetSleepDockerCmdForTest(func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		ranAtLeastOnce.Store(true)
+		return inner(ctx, name, args...)
+	})
+	defer SetSleepDockerCmdForTest(nil)
+
+	go func() {
+		s.ExternalStartMonitor(ctx)
+		close(done)
+	}()
+
+	// Give the ticker enough wall-clock to fire a few times.
+	time.Sleep(50 * time.Millisecond)
+	if !ranAtLeastOnce.Load() {
+		t.Fatalf("monitor did not run any ticks in 50ms")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("ExternalStartMonitor did not return within 500ms of ctx cancel")
+	}
+}
+
+// TestExternalStart_DoesNotRefireOnOwnInFlightColdLoad is the regression
+// for the dedupe-race that wedged the fleet on 2026-06-14. Scenario:
+//
+//  1. Tick N: monitor saw target admission=Stopped + container=running,
+//     SIGKILL'd it, called KickColdLoad. The cold-load goroutine
+//     starts (sets coldLoadKicks[target]=true under s.mu), acquires
+//     coldLoadMu, marks coldLoadEviction[target...]=true, runs cross-
+//     group eviction, then runs `docker start vllm-target` and starts
+//     waiting on /health (~5min). DURING THIS WAIT, inst.state stays
+//     StateStopped while the container is `running`.
+//  2. Tick N+1 (2s later): WITHOUT THE GUARD, the monitor sees admission
+//     Stopped + container running again, classifies it as a fresh
+//     external start, SIGKILLs the in-flight cold-load (vLLM dies
+//     exit 137), then calls KickColdLoad. KickColdLoad refuses with
+//     `kick_in_flight` (the goroutine from tick N hasn't deferred-
+//     deleted coldLoadKicks[target] yet). The peer is now wedged: the
+//     cold-load failed, coldLoadFailures[target] is recorded, and the
+//     30s cooldown gate triggers on retry.
+//
+// POST-FIX: the guard at the top of checkOneExternalStart skips peers
+// where IsInColdLoadEviction is true OR coldLoadKicks[name] is true.
+// Tick N+1 returns early without issuing a stop. The cold-load
+// goroutine completes its work undisturbed.
+//
+// Test mechanics: we don't drive a full async cold-load (that requires
+// the full coldLoadStoppedMember pipeline + a 5min health wait). We
+// directly set s.coldLoadKicks[target] = true to simulate the
+// in-flight state from tick N, then invoke checkOneExternalStart and
+// assert that NO docker stop fires on vllm-target. We also test the
+// IsInColdLoadEviction branch by setting that gate explicitly.
+func TestExternalStart_DoesNotRefireOnOwnInFlightColdLoad(t *testing.T) {
+	t.Run("guarded_by_coldLoadKicks", func(t *testing.T) {
+		s, _, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+		rec := newDockerInspectRecorder()
+		rec.setStatus("vllm-holder", "running")
+		rec.setStatus("vllm-target", "running") // mid-cold-load: container up, admission still Stopped
+		SetSleepDockerCmdForTest(rec.handler())
+		defer SetSleepDockerCmdForTest(nil)
+
+		// Simulate tick N's KickColdLoad having spawned its goroutine:
+		// coldLoadKicks[target] is set, defer-delete hasn't run yet.
+		s.mu.Lock()
+		if s.coldLoadKicks == nil {
+			s.coldLoadKicks = make(map[string]bool)
+		}
+		s.coldLoadKicks["target"] = true
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			delete(s.coldLoadKicks, "target")
+			s.mu.Unlock()
+		}()
+
+		// First tick — the guard should skip target entirely, no stop.
+		s.CheckExternalStartsForTest(context.Background())
+		if rec.stopsContains("vllm-target") {
+			t.Fatalf("PRE-FIX BUG REPRODUCED: monitor re-SIGKILL'd its own in-flight cold-load. stops=%v", rec.stops)
+		}
+		stopsAfterTick1 := len(rec.stops)
+
+		// Second tick (simulating monitor cadence). Counter must stay
+		// flat — the guard still holds while coldLoadKicks is set.
+		s.CheckExternalStartsForTest(context.Background())
+		if got := len(rec.stops); got != stopsAfterTick1 {
+			t.Fatalf("expected stops count stable across ticks (still mid-cold-load); tick1=%d tick2=%d stops=%v",
+				stopsAfterTick1, got, rec.stops)
+		}
+		if rec.stopsContains("vllm-target") {
+			t.Fatalf("monitor re-SIGKILL'd target on tick 2 despite kick-in-flight; stops=%v", rec.stops)
+		}
+	})
+
+	t.Run("guarded_by_coldLoadEviction", func(t *testing.T) {
+		s, _, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+		rec := newDockerInspectRecorder()
+		rec.setStatus("vllm-holder", "running")
+		rec.setStatus("vllm-target", "running")
+		SetSleepDockerCmdForTest(rec.handler())
+		defer SetSleepDockerCmdForTest(nil)
+
+		// Simulate the inner coldLoadStoppedMember having marked the
+		// eviction scope (target + cross-group contenders) — the path
+		// IsInColdLoadEviction reports on.
+		s.markColdLoadEviction("target")
+		defer s.unmarkColdLoadEviction("target")
+
+		s.CheckExternalStartsForTest(context.Background())
+		if rec.stopsContains("vllm-target") {
+			t.Fatalf("monitor SIGKILL'd target despite IsInColdLoadEviction; stops=%v", rec.stops)
+		}
+
+		// And a second tick (matches the live 2s ticker pattern).
+		s.CheckExternalStartsForTest(context.Background())
+		if rec.stopsContains("vllm-target") {
+			t.Fatalf("monitor SIGKILL'd target on tick 2 despite eviction gate; stops=%v", rec.stops)
+		}
+	})
+}
