@@ -476,7 +476,7 @@ func TestExternalStart_StopFailureSurfacesMetricAndSkipsKick(t *testing.T) {
 // Pre-fix: docker stop vllm-target fires → test FAILS on the no-stop
 // assertion. Post-fix: no stop, state reconciled to Ready → PASSES.
 func TestExternalStart_AdoptsHealthyExternallyStartedPeer(t *testing.T) {
-	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+	s, a, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
 	// Healthy externally-started container (the operator's `docker start`
 	// succeeded; vLLM came up clean).
 	mgrs["target"].verifyErr = nil
@@ -514,15 +514,206 @@ func TestExternalStart_AdoptsHealthyExternallyStartedPeer(t *testing.T) {
 	}
 	rec.mu.Unlock()
 
-	// State must have been reconciled away from the stale Stopped latch.
-	// adoptPreExistingPeer flips a StateStopped peer to StateReady (the
-	// boot probe transiently failed; the container is alive now).
+	// State must have been reconciled away from the stale Stopped latch,
+	// SLEEP_MODE-AWARE. `target` is sleep_mode:true → it is in vLLM's
+	// normal slept-L1 resting state and must reconcile to StateSleeping
+	// (NOT StateReady — supervisor FAIL: the pre-fix code marked it Ready
+	// while only booking the L1 residual, so its awake VRAM was never
+	// accounted; the next consumer correctly takes the wake path from
+	// Sleeping). Booking must be L1 residual, NOT full awake VRAM.
 	got, ok := s.InstanceStateForTest("target")
 	if !ok {
 		t.Fatalf("target instance gone from scheduler")
 	}
+	if got != StateSleeping {
+		t.Fatalf("expected stale Stopped latch reconciled to StateSleeping (sleep_mode:true) after healthy adopt, got %v", got)
+	}
+
+	// ADMISSION BOOKS (not just inst.state): admission must be off Stopped
+	// and the GPU-1 books must reflect the L1 residual (sleep_l1_residual_mb
+	// is 0 for target, so the meaningful assertion is: it is Sleeping, NOT
+	// holding full awake VRAM). Verify no full awake VRAM was booked for the
+	// target's GPUs (1,2) — that is the supervisor-FAIL symptom.
+	if a.IsStopped("target") {
+		t.Fatalf("admission still reports Stopped after healthy adopt")
+	}
+	a.mu.Lock()
+	awakeG1, awakeG2 := a.awakeByGPU[1], a.awakeByGPU[2]
+	a.mu.Unlock()
+	// holder (Ready, sleep_mode:true) is booked awake on GPUs 0,1 — so GPU 1
+	// awake includes holder's 12000. target's expected_vram is 11000 on GPUs
+	// 1,2. If target were wrongly booked awake, GPU 2 awake would be 11000.
+	if awakeG2 != 0 {
+		t.Fatalf("supervisor FAIL: sleep_mode:true peer wrongly booked FULL awake VRAM on GPU 2 (got %d, want 0); should be slept-L1 only", awakeG2)
+	}
+	_ = awakeG1
+}
+
+// TestExternalStart_AdoptsHealthyNonSleepModePeer is the sleep_mode:false
+// half of the supervisor-FAIL fix: a non-sleep-mode external model that
+// comes back healthy must reconcile to StateReady AND have its FULL awake
+// VRAM booked (NotifyStartedAwake) — mirroring ReprobeStoppedExternal. The
+// pre-fix adopt path called NotifyStarted (L1 residual + Sleeping-ish books)
+// + StateReady, which under-booked the awake VRAM (shared-GPU OOM) for a
+// model that is just "up" and has no /wake_up endpoint.
+func TestExternalStart_AdoptsHealthyNonSleepModePeer(t *testing.T) {
+	const cfg = `
+scheduler:
+  port_range_start: 9100
+  port_range_end: 9199
+vllm:
+  port: 9000
+  startup_timeout: 1s
+  drain_timeout: 50ms
+  shutdown_timeout: 50ms
+models:
+  ocr:
+    lifecycle: external
+    host: vllm-ocr
+    port: 9001
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    expected_vram_mb_per_gpu: 8000
+    wake_timeout: 1s
+`
+	parsed, err := config.Load([]byte(cfg))
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	totalsByGPU := map[int]int{0: 24000}
+	inv := newRedeployInventory(totalsByGPU)
+	pool := ports.New(9100, 9199)
+	s := NewSchedulerWithFactory(parsed, inv, pool, time.Now, nil, nil)
+	a := NewAdmissionController(parsed, totalsByGPU, &SchedulerEvictor{S: s})
+	s.SetAdmission(a)
+
+	mgr := &fakeRedeployMgr{port: 9001}
+	mgr.pid.Store(0)
+	mgr.isSleeping.Store(false)
+	mgr.verifyErr = nil // healthy
+	modelCfg := parsed.Models["ocr"]
+	s.SeedInstanceForTest("ocr", 9001, modelCfg.GPUs, false, StateStopped, mgr)
+	a.mu.Lock()
+	a.markStoppedLocked(a.models["ocr"])
+	a.mu.Unlock()
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-ocr", "running")
+	rec.setStartedAt("vllm-ocr", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	s.CheckExternalStartsForTest(context.Background())
+
+	// No SIGKILL, no cold-load.
+	if rec.stopsContains("vllm-ocr") {
+		t.Fatalf("non-sleep healthy peer must NOT be SIGKILLed; stops=%v", rec.stops)
+	}
+
+	// Instance reconciled to Ready (no wake path for non-sleep-mode).
+	got, ok := s.InstanceStateForTest("ocr")
+	if !ok {
+		t.Fatalf("ocr instance gone from scheduler")
+	}
 	if got != StateReady {
-		t.Fatalf("expected stale Stopped latch reconciled to StateReady after healthy adopt, got %v", got)
+		t.Fatalf("expected non-sleep-mode peer reconciled to StateReady, got %v", got)
+	}
+
+	// ADMISSION BOOKS: FULL awake VRAM booked (8000 on GPU 0), NOT slept-L1.
+	if a.IsStopped("ocr") {
+		t.Fatalf("admission still reports Stopped after non-sleep adopt")
+	}
+	a.mu.Lock()
+	awakeG0 := a.awakeByGPU[0]
+	l1G0 := a.l1ResidualByGPU[0]
+	a.mu.Unlock()
+	if awakeG0 != 8000 {
+		t.Fatalf("supervisor FAIL: non-sleep-mode adopt did not book FULL awake VRAM (awakeByGPU[0]=%d, want 8000) — NotifyStartedAwake not called", awakeG0)
+	}
+	if l1G0 != 0 {
+		t.Fatalf("non-sleep-mode adopt wrongly booked L1 residual (l1ResidualByGPU[0]=%d, want 0)", l1G0)
+	}
+}
+
+// TestExternalStart_AdoptThenReconcileToStoppedThenRogueRestartSigkills is
+// the adversarial-HIGH lifecycle regression: the bootAdoptedPeers one-shot
+// latch must be CLEARED when the StateReconciler resets a peer to Stopped,
+// or rogue-start (Issue #5) protection is permanently disabled for that
+// model for the jukebox process lifetime.
+//
+// Sequence:
+//  1. Operator `docker start <peer>`; it comes up healthy → checkOneExternalStart
+//     ADOPTS it, sets bootAdoptedPeers[target].
+//  2. The peer OOM-dies; docker reports it exited. StateReconciler flips
+//     admission + inst.state back to StateStopped — and (the FIX) clears
+//     bootAdoptedPeers[target].
+//  3. Operator `docker start <peer>` AGAIN, under GPU contention; this time
+//     the container is running but UNHEALTHY (racing for VRAM at init). This
+//     is a genuine rogue start that MUST be SIGKILLed.
+//
+// Pre-fix: step 1 latches bootAdoptedPeers permanently; step 3's
+// checkOneExternalStart returns early at the alreadyAdopted guard → NO
+// SIGKILL → Issue #5 protection gone. Post-fix: step 2 clears the latch →
+// step 3 reaches the health-gate → unhealthy → SIGKILL fires.
+func TestExternalStart_AdoptThenReconcileToStoppedThenRogueRestartSigkills(t *testing.T) {
+	s, _, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	startedAt := time.Now().Add(1 * time.Minute).UTC().Format(time.RFC3339Nano)
+	rec.setStartedAt("vllm-target", startedAt)
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	// STEP 1: operator started the peer; it is running + healthy → ADOPT.
+	mgrs["target"].verifyErr = nil
+	rec.setStatus("vllm-target", "running")
+	s.CheckExternalStartsForTest(context.Background())
+
+	// Precondition: adopted (sleep_mode:true → Sleeping) and latched.
+	if got, _ := s.InstanceStateForTest("target"); got != StateSleeping {
+		t.Fatalf("STEP 1: expected adopted peer in StateSleeping, got %v", got)
+	}
+	s.mu.RLock()
+	_, latched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if !latched {
+		t.Fatalf("STEP 1: expected bootAdoptedPeers[target] set after adopt")
+	}
+	if rec.stopsContains("vllm-target") {
+		t.Fatalf("STEP 1: healthy adopt must not SIGKILL; stops=%v", rec.stops)
+	}
+
+	// STEP 2: the peer OOM-died; docker now reports it exited. The
+	// StateReconciler must flip Sleeping → Stopped AND clear the latch.
+	rec.setStatus("vllm-target", "exited")
+	s.ReconcileStateForTest(context.Background())
+
+	if got, _ := s.InstanceStateForTest("target"); got != StateStopped {
+		t.Fatalf("STEP 2: expected reconciler to reset peer to StateStopped, got %v", got)
+	}
+	s.mu.RLock()
+	_, stillLatched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if stillLatched {
+		t.Fatalf("ADVERSARIAL-HIGH BUG REPRODUCED: bootAdoptedPeers[target] still set after reconcile-to-Stopped; rogue-start detection permanently disabled")
+	}
+
+	// STEP 3: operator restarts the peer under GPU contention; this time it
+	// is a genuine rogue start — running but UNHEALTHY (racing for VRAM).
+	// The latch is cleared, so checkOneExternalStart must reach the
+	// health-gate, find it unhealthy, and SIGKILL it.
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: rogue init racing for VRAM")
+	rec.setStatus("vllm-target", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(2*time.Minute).UTC().Format(time.RFC3339Nano))
+	s.CheckExternalStartsForTest(context.Background())
+
+	if !rec.stopsContains("vllm-target") {
+		t.Fatalf("STEP 3: genuine rogue restart MUST be SIGKILLed after latch cleared; got calls=%v", rec.calls)
 	}
 }
 

@@ -100,14 +100,18 @@ func TestStartupAdopt_PreExistingSleepingPeer_NotKilled(t *testing.T) {
 	}
 }
 
-// TestStartupAdopt_PreExistingStoppedPeer_ReconciledToReady covers the
-// second adoption branch: boot probe failed to reach /health AND the
+// TestStartupAdopt_PreExistingStoppedPeer_ReconciledSleepModeAware covers
+// the second adoption branch: boot probe failed to reach /health AND the
 // model has evict_action: stop → boot seeded state=Stopped. Then the
 // peer DOES become reachable (the probe was just transiently slow) and
 // the external_start_monitor sees {admission=Stopped, docker=running}.
 // Pre-fix: this triggered the same SIGKILL fault as the Sleeping case.
-// Post-fix: we adopt and reconcile state to Ready + admission Started.
-func TestStartupAdopt_PreExistingStoppedPeer_ReconciledToReady(t *testing.T) {
+// Post-fix: we adopt and reconcile SLEEP_MODE-AWARE (mirroring
+// ReprobeStoppedExternal). `target` is sleep_mode:true → it reconciles to
+// StateSleeping (NOT StateReady — the supervisor-FAIL fix: marking a
+// sleep_mode:true peer Ready while only booking the L1 residual under-books
+// its awake VRAM). The next consumer wakes it from Sleeping.
+func TestStartupAdopt_PreExistingStoppedPeer_ReconciledSleepModeAware(t *testing.T) {
 	s, a, _ := makeExternalStartScheduler(t, StateReady, StateStopped)
 
 	rec := newDockerInspectRecorder()
@@ -132,10 +136,11 @@ func TestStartupAdopt_PreExistingStoppedPeer_ReconciledToReady(t *testing.T) {
 	if !ok {
 		t.Fatalf("target instance gone from scheduler")
 	}
-	if got != StateReady {
-		t.Fatalf("expected StateReady post-adopt (was Stopped), got %v", got)
+	if got != StateSleeping {
+		t.Fatalf("expected StateSleeping post-adopt (sleep_mode:true, was Stopped), got %v", got)
 	}
-	// Admission should have transitioned out of admissionStopped.
+	// Admission should have transitioned out of admissionStopped (now
+	// Sleeping with the L1 residual booked, NOT full awake VRAM).
 	if a.IsStopped("target") {
 		t.Fatalf("expected admission NOT Stopped post-adopt (NotifyStarted should have fired)")
 	}

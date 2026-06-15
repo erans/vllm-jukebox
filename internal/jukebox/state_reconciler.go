@@ -269,6 +269,18 @@ func (s *Scheduler) reconcileOne(ctx context.Context, name string, modelCfg conf
 			if inst := s.instances[name]; inst != nil {
 				inst.state = StateStopped
 			}
+			// FIX (adversarial HIGH): clear the one-shot boot-adopt latch
+			// when we reset this peer to Stopped. The latch
+			// (bootAdoptedPeers) exists only to suppress repeated adopt
+			// WARN/metric noise while a peer stays adopted. Once the peer
+			// has DIED and we've reset it to Stopped, the next operator
+			// `docker start <peer>` under GPU contention is a genuine
+			// external start that MUST flow through checkOneExternalStart's
+			// health-gate → SIGKILL fallthrough (Issue #5 protection).
+			// Leaving the latch set would make checkOneExternalStart return
+			// early at the alreadyAdopted guard FOREVER, silently disabling
+			// rogue-start detection for this model for the process lifetime.
+			delete(s.bootAdoptedPeers, name)
 			s.mu.Unlock()
 
 			// If the peer is pinned (config says "should always be

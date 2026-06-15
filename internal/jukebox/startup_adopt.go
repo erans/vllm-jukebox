@@ -182,9 +182,29 @@ func shouldAdoptOnBoot(startedAtStr string, bootEpoch time.Time) adoptDecision {
 //     unreachable AND evict_action: stop, so we seeded state=Stopped.
 //     But now the container IS running — the boot probe must have
 //     had a transient failure (probes finish under a 10s budget;
-//     a fresh container can take longer to respond than that). Flip
-//     state back to StateReady and notify admission via NotifyStarted
-//     so the budget reflects the resident model.
+//     a fresh container can take longer to respond than that). The
+//     reconciliation here is SLEEP_MODE-AWARE and MUST mirror
+//     ReprobeStoppedExternal (sleep.go) exactly — both reconcile a
+//     stale-Stopped-but-actually-running external peer:
+//
+//   - sleep_mode:true  → NotifyStarted (books L1 residual,
+//     admission=Sleeping) + instance=StateSleeping. The container
+//     is in vLLM's normal slept-L1 resting state; the next
+//     consumer request takes the wake path.
+//
+//   - sleep_mode:false → NotifyStartedAwake (books FULL awake
+//     VRAM) + instance=StateReady. A non-sleep-mode model has NO
+//     --enable-sleep-mode and therefore NO /wake_up endpoint: it
+//     is just "up", never "asleep". Booking it L1-residual-Sleeping
+//     under-accounts its awake VRAM (shared-GPU OOM) AND would
+//     route the next request through /wake_up → 404/error →
+//     perma-wedge.
+//
+//     PRE-FIX BUG (supervisor FAIL): this branch unconditionally did
+//     NotifyStarted + StateReady — matching NEITHER ReprobeStoppedExternal
+//     case. For an awake-serving operator-started peer that mismatch
+//     books only the L1 residual while marking it Ready, so its awake
+//     VRAM is never booked and never reconciled → shared-GPU OOM.
 //
 // Returns the new state we settled on (for logging).
 func (s *Scheduler) adoptPreExistingPeer(name string, observedState State, modelCfg config.ModelConfig) State {
@@ -215,33 +235,68 @@ func (s *Scheduler) adoptPreExistingPeer(name string, observedState State, model
 
 	case StateStopped:
 		// Container is alive — must have been a transient probe
-		// failure at boot. Reconcile to Ready + tell admission the
-		// container is started so it accounts for the running VRAM.
-		if s.admission != nil {
-			s.admission.NotifyStarted(name)
-		}
-		s.mu.Lock()
-		if inst := s.instances[name]; inst != nil {
-			if inst.state == StateStopped {
-				inst.state = StateReady
-				// startedAt is informational; set it to bootEpoch so
-				// idle timers don't count the pre-existing uptime as
-				// "always been awake" which would trigger immediate
-				// idle-sleep on swap-group peers.
-				if inst.startedAt.IsZero() {
-					inst.startedAt = s.bootEpoch
-				}
-				if inst.lastUsedAt.IsZero() {
-					inst.lastUsedAt = s.bootEpoch
-				}
-			}
-		}
-		s.mu.Unlock()
-		return StateReady
+		// failure at boot. Reconcile SLEEP_MODE-AWARE, mirroring
+		// ReprobeStoppedExternal. See doc comment above.
+		return s.reconcileStoppedRunningPeer(name, modelCfg)
 	}
 	// Shouldn't happen — caller only invokes with StateStopped or
 	// StateSleeping. Defensive return.
 	return observedState
+}
+
+// reconcileStoppedRunningPeer reconciles a peer that admission/scheduler
+// believe is StateStopped but whose container is actually running +
+// healthy, choosing the admission booking + final instance state by the
+// model's sleep_mode. This is the SHARED reconciliation core: both the
+// boot/healthy adopt paths (adoptPreExistingPeer, via the
+// ExternalStartMonitor) and ReprobeStoppedExternal (sleep.go, via the
+// request path) must agree on it, or the books drift.
+//
+//   - sleep_mode:true  → NotifyStarted (books L1 residual,
+//     admission=Sleeping) + instance=StateSleeping. Next consumer wakes.
+//   - sleep_mode:false → NotifyStartedAwake (books FULL awake VRAM,
+//     admission=Awake) + instance=StateReady. No /wake_up will ever fire.
+//
+// startedAt / lastUsedAt are seeded to bootEpoch (informational) so idle
+// timers don't count pre-existing uptime as "always been awake".
+//
+// Re-checks inst.state under the final lock and only mutates when it is
+// still StateStopped — a concurrent KickColdLoad/reconciler may have
+// reconciled in the meantime (mirrors ReprobeStoppedExternal's
+// stillStopped guard). Returns the settled state for logging.
+func (s *Scheduler) reconcileStoppedRunningPeer(name string, modelCfg config.ModelConfig) State {
+	if modelCfg.SleepMode {
+		if s.admission != nil {
+			s.admission.NotifyStarted(name)
+		}
+	} else {
+		// Non-sleep-mode: book full awake VRAM, no /wake_up path.
+		if s.admission != nil {
+			s.admission.NotifyStartedAwake(name)
+		}
+	}
+	settled := StateReady
+	if modelCfg.SleepMode {
+		settled = StateSleeping
+	}
+	s.mu.Lock()
+	if inst := s.instances[name]; inst != nil {
+		if inst.state == StateStopped {
+			inst.state = settled
+			if inst.startedAt.IsZero() {
+				inst.startedAt = s.bootEpoch
+			}
+			if inst.lastUsedAt.IsZero() {
+				inst.lastUsedAt = s.bootEpoch
+			}
+		} else {
+			// Already reconciled by a concurrent path — report its
+			// current state rather than clobbering it.
+			settled = inst.state
+		}
+	}
+	s.mu.Unlock()
+	return settled
 }
 
 // logAndCountAdoption emits the unified WARN log + bumps the metric
