@@ -159,6 +159,32 @@ type Scheduler struct {
 	decodeStallCounts map[string]int
 }
 
+// setInstanceStoppedLocked transitions inst to StateStopped AND clears the
+// one-shot boot-adopt latch (bootAdoptedPeers) for name in a single place.
+//
+// CENTRALIZATION (adversarial-HIGH): every jukebox-initiated eviction path
+// (StopForEviction, the cold-load same-group + cross-group peer-stop loops,
+// RedeployMember's peer-stop + self-stop, the external-start SIGKILL path,
+// the boot-probe unreachable seed) and the periodic state-reconciler must
+// route their `inst.state = StateStopped` transition through this helper.
+// Routing it here GUARANTEES the latch can never outlive the Stopped
+// transition: a peer that was adopted (latch set) and is later evicted to
+// Stopped will have its latch cleared, so the next operator `docker start`
+// under GPU contention flows through checkOneExternalStart's health-gate →
+// SIGKILL fallthrough (Issue #5 protection) instead of returning early at
+// the alreadyAdopted guard forever.
+//
+// inst may be nil (caller looked it up under-lock and found it gone) — the
+// latch is still cleared, which is the correct conservative behavior. The
+// caller MUST hold s.mu (write lock); this mutates both the instance state
+// and the bootAdoptedPeers map without taking the lock itself.
+func (s *Scheduler) setInstanceStoppedLocked(name string, inst *schedInstance) {
+	if inst != nil {
+		inst.state = StateStopped
+	}
+	delete(s.bootAdoptedPeers, name)
+}
+
 // coldLoadFailureRecord captures the last cold-load failure for a model
 // so KickColdLoad can suppress immediate re-kicks. Stored by value in
 // the coldLoadFailures map.

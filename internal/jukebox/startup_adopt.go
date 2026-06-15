@@ -71,16 +71,25 @@ import (
 //
 // Reciprocally, the grace window also tolerates the case where the
 // jukebox process's clock is slightly behind the docker daemon's
-// (e.g. container clock-skew at host startup) — a 5s window comfortably
-// covers expected single-host NTP drift while staying narrow enough
-// that a real external-start triggered seconds after jukebox boot
-// still gets caught by the SIGKILL path.
-
-// adoptGraceBeforeBoot widens the adoption window backwards by this
-// much before bootEpoch. See comment above for rationale. Conservative
-// — 5s is much larger than expected NTP drift on a healthy host but
-// still narrow enough that a real bare-`docker start` issued seconds
+// (e.g. container clock-skew at host startup). The adoption cutoff is
+// bootEpoch + adoptGraceBeforeBoot, so the window extends FORWARD past
+// boot: a container whose StartedAt is up to `adoptGraceBeforeBoot` (5s)
+// AFTER bootEpoch is still adopted, not SIGKILLed. This is deliberate —
+// it is the reciprocal of the backward tolerance and covers the symmetric
+// clock-skew direction. The cost is bounded: a genuine bare-`docker start`
+// issued within 5s of jukebox boot is adopted instead of killed (worst
+// case it lives with whatever admission state we infer; the periodic
+// state-reconciler corrects any drift). A rogue start issued MORE than 5s
 // after jukebox boot still trips the SIGKILL path.
+
+// adoptGraceBeforeBoot widens the adoption window by this much. Despite
+// the name, the cutoff is bootEpoch + adoptGraceBeforeBoot, so the window
+// extends both backward (clock-skew before boot) AND forward (the
+// reciprocal skew direction): a container that started up to this much
+// AFTER bootEpoch is still adopted. Conservative — 5s is much larger than
+// expected NTP drift on a healthy host but still narrow enough that a real
+// bare-`docker start` issued MORE than 5s after jukebox boot trips the
+// SIGKILL path.
 const adoptGraceBeforeBoot = 5 * time.Second
 
 // adoptDecision captures whether the running peer should be adopted
@@ -265,37 +274,53 @@ func (s *Scheduler) adoptPreExistingPeer(name string, observedState State, model
 // reconciled in the meantime (mirrors ReprobeStoppedExternal's
 // stillStopped guard). Returns the settled state for logging.
 func (s *Scheduler) reconcileStoppedRunningPeer(name string, modelCfg config.ModelConfig) State {
-	if modelCfg.SleepMode {
-		if s.admission != nil {
-			s.admission.NotifyStarted(name)
-		}
-	} else {
-		// Non-sleep-mode: book full awake VRAM, no /wake_up path.
-		if s.admission != nil {
-			s.admission.NotifyStartedAwake(name)
-		}
-	}
 	settled := StateReady
 	if modelCfg.SleepMode {
 		settled = StateSleeping
 	}
+	// MED1 (atomicity): book admission AND set inst.state in a SINGLE
+	// critical section under s.mu, mirroring ReprobeStoppedExternal
+	// (sleep.go). The pre-fix code called NotifyStarted/NotifyStartedAwake
+	// OUTSIDE the lock and only re-acquired s.mu to set inst.state — a
+	// transient window where admission already said Started/Awake while
+	// the schedInstance still read StateStopped. A concurrent reader
+	// (external-start monitor tick, idle scan, request route) observing
+	// that split state could misclassify the peer. Holding the lock across
+	// both mutations eliminates the window. The VerifyReady health probe
+	// stays OUTSIDE the lock at the caller (adoptPreExistingPeer ←
+	// checkOneExternalStart) — only the booking + state flip is atomic.
+	//
+	// stillStopped guard (mirrors ReprobeStoppedExternal): a concurrent
+	// KickColdLoad/reconciler may have reconciled this peer between the
+	// caller's snapshot and this lock. Only mutate when it is STILL
+	// genuinely Stopped; otherwise report its current state and book
+	// nothing (the other path already booked).
 	s.mu.Lock()
-	if inst := s.instances[name]; inst != nil {
-		if inst.state == StateStopped {
-			inst.state = settled
-			if inst.startedAt.IsZero() {
-				inst.startedAt = s.bootEpoch
-			}
-			if inst.lastUsedAt.IsZero() {
-				inst.lastUsedAt = s.bootEpoch
-			}
+	defer s.mu.Unlock()
+	inst := s.instances[name]
+	if inst == nil {
+		return settled
+	}
+	if inst.state != StateStopped {
+		// Already reconciled by a concurrent path — report its current
+		// state rather than clobbering it (and do NOT double-book).
+		return inst.state
+	}
+	if s.admission != nil {
+		if modelCfg.SleepMode {
+			s.admission.NotifyStarted(name) // books L1 residual, admission=Sleeping
 		} else {
-			// Already reconciled by a concurrent path — report its
-			// current state rather than clobbering it.
-			settled = inst.state
+			// Non-sleep-mode: book full awake VRAM, no /wake_up path.
+			s.admission.NotifyStartedAwake(name)
 		}
 	}
-	s.mu.Unlock()
+	inst.state = settled
+	if inst.startedAt.IsZero() {
+		inst.startedAt = s.bootEpoch
+	}
+	if inst.lastUsedAt.IsZero() {
+		inst.lastUsedAt = s.bootEpoch
+	}
 	return settled
 }
 

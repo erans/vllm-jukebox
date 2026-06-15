@@ -126,7 +126,17 @@ func (s *Scheduler) reconcileState(ctx context.Context) {
 	var candidates []candidate
 
 	s.mu.RLock()
-	for name, modelCfg := range s.cfg.Models {
+	for name := range s.cfg.Models {
+		// LOW (live-config): resolve per-model config from the hot-reloaded
+		// config.Current() (via liveModelCfg) rather than the construction-
+		// time s.cfg snapshot, so a hot-reloaded pinned / host / admission
+		// field is honored on the next reconcile pass. The model SET is
+		// structural (not hot-reloadable), so name enumeration over
+		// s.cfg.Models is correct; only per-model fields are resolved live.
+		modelCfg, ok := liveModelCfg(s.cfg, name)
+		if !ok {
+			continue
+		}
 		if modelCfg.EffectiveLifecycle() != config.LifecycleExternal {
 			continue
 		}
@@ -266,11 +276,8 @@ func (s *Scheduler) reconcileOne(ctx context.Context, name string, modelCfg conf
 			// Flip admission + schedInstance to Stopped.
 			s.admission.NotifyStopped(name)
 			s.mu.Lock()
-			if inst := s.instances[name]; inst != nil {
-				inst.state = StateStopped
-			}
-			// FIX (adversarial HIGH): clear the one-shot boot-adopt latch
-			// when we reset this peer to Stopped. The latch
+			// Flip schedInstance to Stopped + clear the one-shot boot-adopt
+			// latch in one place (setInstanceStoppedLocked). The latch
 			// (bootAdoptedPeers) exists only to suppress repeated adopt
 			// WARN/metric noise while a peer stays adopted. Once the peer
 			// has DIED and we've reset it to Stopped, the next operator
@@ -280,7 +287,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, name string, modelCfg conf
 			// Leaving the latch set would make checkOneExternalStart return
 			// early at the alreadyAdopted guard FOREVER, silently disabling
 			// rogue-start detection for this model for the process lifetime.
-			delete(s.bootAdoptedPeers, name)
+			s.setInstanceStoppedLocked(name, s.instances[name])
 			s.mu.Unlock()
 
 			// If the peer is pinned (config says "should always be

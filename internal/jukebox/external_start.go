@@ -176,7 +176,18 @@ func (s *Scheduler) checkExternalStarts(ctx context.Context) {
 	var candidates []candidate
 
 	s.mu.RLock()
-	for name, modelCfg := range s.cfg.Models {
+	for name := range s.cfg.Models {
+		// LOW (live-config): resolve the per-model config from the
+		// hot-reloaded config.Current() (via liveModelCfg) rather than the
+		// construction-time s.cfg snapshot, so a hot-reloaded sleep_mode /
+		// host / admission field is honored on the very next monitor tick.
+		// The model SET (add/remove) is structural and not hot-reloadable,
+		// so enumerating names over s.cfg.Models is correct; only the
+		// per-model fields are resolved live. Mirrors ReprobeStoppedExternal.
+		modelCfg, ok := liveModelCfg(s.cfg, name)
+		if !ok {
+			continue
+		}
 		if modelCfg.EffectiveLifecycle() != config.LifecycleExternal {
 			continue
 		}
@@ -371,6 +382,14 @@ func (s *Scheduler) checkOneExternalStart(ctx context.Context, name string, mode
 				"action", "adopt_no_sigkill",
 				"runbook", "external-start-healthy-adopt-Issue-5c",
 			)
+			// LOW (metric semantics): AdmissionStartupAdoptedTotal and the
+			// LifecycleColdLoad audit below fire on EVERY adopt — including
+			// RE-adopts after the boot-adopt latch was cleared by an
+			// intervening eviction → Stopped (see setInstanceStoppedLocked).
+			// So this counter is "adopt events", not "distinct peers adopted
+			// once at boot". A dashboard wanting per-boot uniqueness should
+			// dedupe by (model, jukebox_boot_epoch). Left as-is (a distinct
+			// re-adopt verb is not worth a new metric series today).
 			metrics.AdmissionStartupAdoptedTotal.WithLabelValues(name).Inc()
 			LogLifecycleTransition(LifecycleEvent{
 				Action: LifecycleColdLoad, // reuse cold-load audit verb, same
@@ -448,9 +467,11 @@ func (s *Scheduler) checkOneExternalStart(ctx context.Context, name string, mode
 	// "container is no longer holding VRAM" (we just SIGKILL'd it).
 	s.admission.NotifyStopped(name)
 	s.mu.Lock()
-	if inst := s.instances[name]; inst != nil {
-		inst.state = StateStopped
-	}
+	// Centralized Stopped transition + boot-adopt latch clear. We just
+	// SIGKILL'd a rogue start; clearing the latch keeps subsequent ticks
+	// honest (this path itself doesn't set the latch, but routing every
+	// →Stopped through one helper is what makes the invariant robust).
+	s.setInstanceStoppedLocked(name, s.instances[name])
 	s.mu.Unlock()
 
 	// Now route through the proper cold-load path. KickColdLoad spawns

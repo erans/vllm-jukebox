@@ -745,6 +745,110 @@ func TestExternalStart_UnhealthyExternalStartStillSigkills(t *testing.T) {
 	}
 }
 
+// TestExternalStart_AdoptThenEvictToStoppedThenRogueRestartSigkills is the
+// round-2 adversarial-HIGH regression: the bootAdoptedPeers one-shot latch
+// must be cleared on EVERY jukebox-initiated eviction to Stopped — not just
+// the state-reconciler path. THIS test exercises the EVICTION path
+// (StopForEviction, the SchedulerEvictor), which is distinct from the
+// existing TestExternalStart_AdoptThenReconcileToStoppedThenRogueRestartSigkills
+// (state-reconciler path). Pre-round-2 code added the latch-clear ONLY to
+// state_reconciler.go, leaving StopForEviction / cold-load-evict /
+// redeploy / SIGKILL paths leaking the latch.
+//
+// Live reachability: aux cold-loads evict cross-group GPU contenders via
+// evictCrossGroupGPUContendersLocked (→ Stopped). If such a contender was
+// previously adopted (operator `docker start` on a healthy peer), the leak
+// means a later rogue restart of that contender under contention is NEVER
+// SIGKILLed — the Issue-#5 GPU-contention OOM the monitor exists to prevent.
+//
+// Sequence:
+//  1. Operator `docker start <peer>`; healthy → checkOneExternalStart ADOPTS,
+//     sets bootAdoptedPeers[target].
+//  2. An aux cold-load (modeled directly by StopForEviction) evicts the peer
+//     to Stopped. The FIX (setInstanceStoppedLocked) clears the latch.
+//  3. Operator `docker start <peer>` AGAIN under contention; this time the
+//     container is running but UNHEALTHY. Genuine rogue start → MUST SIGKILL.
+//
+// Pre-fix: step 2's StopForEviction sets inst.state=StateStopped WITHOUT
+// clearing the latch → step 3 returns early at the alreadyAdopted guard →
+// NO SIGKILL. Post-fix: step 2 clears the latch → step 3 SIGKILLs.
+func TestExternalStart_AdoptThenEvictToStoppedThenRogueRestartSigkills(t *testing.T) {
+	s, a, mgrs := makeExternalStartScheduler(t, StateReady, StateStopped)
+
+	rec := newDockerInspectRecorder()
+	rec.setStatus("vllm-holder", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(1*time.Minute).UTC().Format(time.RFC3339Nano))
+	SetSleepDockerCmdForTest(rec.handler())
+	defer SetSleepDockerCmdForTest(nil)
+	oldPoll := SetColdLoadPollIntervalForTest(5 * time.Millisecond)
+	defer SetColdLoadPollIntervalForTest(oldPoll)
+
+	// STEP 1: operator started the peer; running + healthy → ADOPT + latch.
+	mgrs["target"].verifyErr = nil
+	rec.setStatus("vllm-target", "running")
+	s.CheckExternalStartsForTest(context.Background())
+
+	if got, _ := s.InstanceStateForTest("target"); got != StateSleeping {
+		t.Fatalf("STEP 1: expected adopted peer in StateSleeping, got %v", got)
+	}
+	s.mu.RLock()
+	_, latched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if !latched {
+		t.Fatalf("STEP 1: expected bootAdoptedPeers[target] set after adopt")
+	}
+	if rec.stopsContains("vllm-target") {
+		t.Fatalf("STEP 1: healthy adopt must not SIGKILL; stops=%v", rec.stops)
+	}
+
+	// STEP 2: an aux cold-load evicts this peer to Stopped. Drive the SAME
+	// production helper a cold-load uses (StopForEviction → docker stop →
+	// inst.state=Stopped). This is the EVICTION path the round-2 finding
+	// flagged — distinct from the state-reconciler path.
+	evictor := &SchedulerEvictor{S: s}
+	if err := evictor.StopForEviction(context.Background(), "target", "aux-cold-load-cross-group-contender"); err != nil {
+		t.Fatalf("STEP 2: StopForEviction failed: %v", err)
+	}
+	if got, _ := s.InstanceStateForTest("target"); got != StateStopped {
+		t.Fatalf("STEP 2: expected peer in StateStopped after eviction, got %v", got)
+	}
+	s.mu.RLock()
+	_, stillLatched := s.bootAdoptedPeers["target"]
+	s.mu.RUnlock()
+	if stillLatched {
+		t.Fatalf("ROUND-2 ADVERSARIAL-HIGH BUG REPRODUCED: bootAdoptedPeers[target] still set after StopForEviction; rogue-start detection permanently disabled on the eviction path")
+	}
+	// Admission must agree the peer is Stopped (StopForEviction's caller
+	// normally calls NotifyStopped; the evictor itself does not, so mirror
+	// the production cold-load path here so step 3's monitor selects it).
+	a.mu.Lock()
+	a.markStoppedLocked(a.models["target"])
+	a.mu.Unlock()
+
+	// STEP 2 itself issued a `docker stop vllm-target` (the eviction). Record
+	// the count of stop calls now so STEP 3's assertion checks for a NEW
+	// SIGKILL rather than being satisfied by the eviction's stop.
+	rec.mu.Lock()
+	stopsBeforeStep3 := len(rec.stops)
+	rec.mu.Unlock()
+
+	// STEP 3: operator restarts under GPU contention; running but UNHEALTHY
+	// (racing for VRAM). Latch cleared → monitor reaches the health-gate,
+	// finds it unhealthy, and SIGKILLs.
+	mgrs["target"].verifyErr = fmt.Errorf("connection refused: rogue init racing for VRAM")
+	rec.setStatus("vllm-target", "running")
+	rec.setStartedAt("vllm-target", time.Now().Add(2*time.Minute).UTC().Format(time.RFC3339Nano))
+	s.CheckExternalStartsForTest(context.Background())
+
+	rec.mu.Lock()
+	stopsAfterStep3 := len(rec.stops)
+	rec.mu.Unlock()
+	if stopsAfterStep3 <= stopsBeforeStep3 {
+		t.Fatalf("STEP 3: genuine rogue restart MUST be SIGKILLed (a NEW docker stop) after latch cleared on eviction; before=%d after=%d calls=%v",
+			stopsBeforeStep3, stopsAfterStep3, rec.calls)
+	}
+}
+
 // TestExternalStart_MonitorLoopExitsOnContextCancel exercises the
 // production goroutine path: start the monitor, cancel the ctx, and
 // verify it returns within a bounded window. Guards against a missing

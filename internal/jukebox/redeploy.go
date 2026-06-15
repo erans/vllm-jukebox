@@ -383,7 +383,10 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 			// and scheduler state in one short critical section.
 			s.admission.NotifyStopped(peer)
 			s.mu.Lock()
-			peerInst.state = StateStopped
+			// Centralized Stopped transition + boot-adopt latch clear — a
+			// redeploy that stops this peer must not leave a stale adopt
+			// latch that would disable Issue #5 rogue-start protection.
+			s.setInstanceStoppedLocked(peer, peerInst)
 			s.mu.Unlock()
 			// Success path: emit the redeploy-member-peer-stop audit only
 			// when the docker stop actually succeeded. Previously this
@@ -448,7 +451,12 @@ func (s *Scheduler) RedeployMember(ctx context.Context, name string) (RedeployRe
 		s.admission.NotifyStopped(name)
 
 		s.mu.Lock()
-		inst.state = StateStopped
+		// Centralized Stopped transition + boot-adopt latch clear (mirrors
+		// StopForEviction). Clearing the self latch on redeploy is correct:
+		// the redeploy re-starts the container immediately below, and if
+		// that start fails the operator's manual recovery must flow through
+		// the health-gate, not be short-circuited by a stale adopt latch.
+		s.setInstanceStoppedLocked(name, inst)
 		inst.draining = false
 		s.mu.Unlock()
 

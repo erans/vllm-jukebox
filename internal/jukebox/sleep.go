@@ -359,7 +359,12 @@ func (e *SchedulerEvictor) StopForEviction(ctx context.Context, victim, reason s
 	}
 
 	e.S.mu.Lock()
-	inst.state = StateStopped
+	// Route through setInstanceStoppedLocked so the boot-adopt latch is
+	// cleared atomically with the Stopped transition (adversarial-HIGH:
+	// an adopted peer evicted here must NOT keep its latch, or a later
+	// rogue `docker start` returns early at the alreadyAdopted guard and
+	// bypasses Issue #5 SIGKILL protection).
+	e.S.setInstanceStoppedLocked(victim, inst)
 	inst.draining = false
 	e.S.mu.Unlock()
 
@@ -1323,7 +1328,10 @@ func (s *Scheduler) evictPeersForColdLoadLocked(ctx context.Context, name string
 		// critical section.
 		s.admission.NotifyStopped(peer)
 		s.mu.Lock()
-		peerInst.state = StateStopped
+		// Clear the boot-adopt latch with the Stopped transition (centralized
+		// in setInstanceStoppedLocked) — an aux cold-load that evicts this
+		// same-group peer must not leave a stale adopt latch behind.
+		s.setInstanceStoppedLocked(peer, peerInst)
 		s.mu.Unlock()
 		LogLifecycleTransition(LifecycleEvent{
 			Action: LifecycleEvict,
@@ -1607,7 +1615,12 @@ func (s *Scheduler) evictCrossGroupGPUContendersLocked(ctx context.Context, name
 		}
 		s.admission.NotifyStopped(c.name)
 		s.mu.Lock()
-		peerInst.state = StateStopped
+		// Clear the boot-adopt latch with the Stopped transition
+		// (centralized) — a cross-group cold-load eviction of this
+		// contender (THE reachable production case in the adversarial
+		// finding: aux cold-loads evict cross-group contenders) must not
+		// leave a stale adopt latch that disables Issue #5 protection.
+		s.setInstanceStoppedLocked(c.name, peerInst)
 		s.mu.Unlock()
 		LogLifecycleTransition(LifecycleEvent{
 			Action: LifecycleEvict,
@@ -3300,10 +3313,12 @@ func (s *Scheduler) RegisterExternalInstances(ctx context.Context) error {
 				// We do NOT proactively cold-load here — recovery is
 				// demand-driven via the consumer async-503 path.
 				s.mu.Lock()
-				inst := s.instances[p.name]
-				if inst != nil {
-					inst.state = StateStopped
-				}
+				// Centralized Stopped transition + latch clear. (At boot the
+				// latch is empty so the clear is a no-op here, but routing
+				// EVERY →Stopped through one helper is what makes the
+				// invariant adversarial-proof against future call-order
+				// changes.)
+				s.setInstanceStoppedLocked(p.name, s.instances[p.name])
 				s.mu.Unlock()
 				if s.admission != nil {
 					s.admission.NotifyStopped(p.name)
