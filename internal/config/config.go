@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -52,6 +53,9 @@ type ServerConfig struct {
 	ReadTimeout  Duration `yaml:"read_timeout"`
 	WriteTimeout Duration `yaml:"write_timeout"`
 	LogRequests  *bool    `yaml:"log_requests"`
+	APIKey       string   `yaml:"api_key"`
+
+	apiKeySet bool
 }
 
 type VLLMConfig struct {
@@ -116,10 +120,16 @@ type ModelConfig struct {
 }
 
 func Load(data []byte) (*Config, error) {
+	apiKeySet, err := serverAPIKeyPresent(data)
+	if err != nil {
+		return nil, err
+	}
+
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 
 	var cfg Config
+	cfg.Server.apiKeySet = apiKeySet
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}
@@ -130,9 +140,21 @@ func Load(data []byte) (*Config, error) {
 	return &cfg, nil
 }
 
+func serverAPIKeyPresent(data []byte) (bool, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var raw struct {
+		Server map[string]interface{} `yaml:"server"`
+	}
+	if err := dec.Decode(&raw); err != nil {
+		return false, err
+	}
+	_, ok := raw.Server["api_key"]
+	return ok, nil
+}
+
 func (c *Config) applyDefaults() {
 	if c.Server.Host == "" {
-		c.Server.Host = "0.0.0.0"
+		c.Server.Host = "127.0.0.1"
 	}
 	if c.Server.Port == 0 {
 		c.Server.Port = 8080
@@ -199,6 +221,9 @@ func (c *Config) Validate() error {
 	}
 	if err := validatePort("vllm.port", c.VLLM.Port); err != nil {
 		return err
+	}
+	if c.Server.apiKeySet && strings.TrimSpace(c.Server.APIKey) == "" {
+		return fmt.Errorf("server.api_key must not be empty/whitespace; omit the field to disable auth")
 	}
 
 	if err := c.validateRuntimes(); err != nil {
