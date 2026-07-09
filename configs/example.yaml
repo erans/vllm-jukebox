@@ -1,6 +1,13 @@
 server:
+  # Default bind is 127.0.0.1 (localhost only). This example explicitly sets
+  # 0.0.0.0 to expose jukebox on all interfaces; ensure network-level
+  # protection or set api_key below.
   host: "0.0.0.0"
   port: 8080
+  # Optional: require `Authorization: Bearer <key>` on inference,
+  # /v1/models, /status, and /metrics. /health remains open.
+  # Omit to disable auth (backward compatible).
+  # api_key: "change-me"
 
 vllm:
   # Use uvx to run vLLM (assumes uvx is already installed).
