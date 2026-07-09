@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"vllm-jukebox/internal/config"
-	"vllm-jukebox/internal/gpu"
 	"vllm-jukebox/internal/inflight"
 	"vllm-jukebox/internal/metrics"
 )
@@ -95,7 +94,7 @@ type Coordinator struct {
 	cfg      *config.Config
 	mgr      Manager
 	tr       *inflight.Tracker
-	powerMgr *gpu.PowerManager
+	powerMgr PowerController
 	now      func() time.Time
 
 	requests chan ensureReq
@@ -144,7 +143,7 @@ func NewCoordinator(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now f
 	return NewCoordinatorWithPower(cfg, mgr, tr, now, nil)
 }
 
-func NewCoordinatorWithPower(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now func() time.Time, powerMgr *gpu.PowerManager) *Coordinator {
+func NewCoordinatorWithPower(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now func() time.Time, powerMgr PowerController) *Coordinator {
 	if now == nil {
 		now = time.Now
 	}

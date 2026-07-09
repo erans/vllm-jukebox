@@ -21,7 +21,7 @@ type Scheduler struct {
 	cfg      *config.Config
 	inv      gpu.Inventory
 	ports    *ports.Pool
-	powerMgr *gpu.PowerManager
+	powerMgr PowerController
 	now      func() time.Time
 	new      InstanceFactory
 
@@ -64,7 +64,7 @@ func NewScheduler(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, n
 	return NewSchedulerWithFactory(cfg, inv, portPool, now, nil, nil)
 }
 
-func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, now func() time.Time, factory InstanceFactory, powerMgr *gpu.PowerManager) *Scheduler {
+func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, now func() time.Time, factory InstanceFactory, powerMgr PowerController) *Scheduler {
 	if now == nil {
 		now = time.Now
 	}
