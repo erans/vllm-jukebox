@@ -329,13 +329,13 @@ func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstre
 
 	now := s.now()
 	s.mu.Lock()
-	// Re-check under lock.
-	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
+	defer s.mu.Unlock()
+	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst &&
+		inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
 		inst.lastUsedAt = now
+		return s.routeForInstance(ctx, inst, upstreamModel), true
 	}
-	s.mu.Unlock()
-
-	return s.routeForInstance(ctx, inst, upstreamModel), true
+	return Route{}, false
 }
 
 func (s *Scheduler) routeForInstance(ctx context.Context, inst *schedInstance, upstreamModel string) Route {
@@ -613,4 +613,27 @@ func joinInts(nums []int, sep string) string {
 		b.WriteString(strconv.Itoa(n))
 	}
 	return b.String()
+}
+
+// InstancesForTest exposes the instance map for tests. Not safe for concurrent
+// use outside tests.
+func (s *Scheduler) InstancesForTest() map[string]*schedInstance {
+	return s.instances
+}
+
+// TryRouteReadyForTest exposes tryRouteReady for tests.
+func (s *Scheduler) TryRouteReadyForTest(ctx context.Context, resolvedModelName, upstreamModel string) (Route, bool) {
+	return s.tryRouteReady(ctx, resolvedModelName, upstreamModel)
+}
+
+// MarkInstanceStoppingForTest marks the named instance as draining+stopping,
+// simulating a concurrent eviction that won the race against tryRouteReady.
+// Test-only helper.
+func (s *Scheduler) MarkInstanceStoppingForTest(model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if inst := s.instances[model]; inst != nil {
+		inst.draining = true
+		inst.state = StateStopping
+	}
 }

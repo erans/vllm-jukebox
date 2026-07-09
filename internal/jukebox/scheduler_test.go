@@ -559,3 +559,46 @@ models:
 		t.Fatalf("timed out waiting for second request")
 	}
 }
+
+func TestScheduler_TryRouteReady_ReturnsFalseWhenConcurrentlyStopped(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port}
+	}, nil)
+
+	ctx := context.Background()
+
+	// Start model "a" so it becomes Ready.
+	route, err := s.AcquireRoute(ctx, "a", "req1")
+	if err != nil {
+		t.Fatalf("AcquireRoute: %v", err)
+	}
+	route.Done()
+
+	// Manually mark the instance draining+stopping concurrently, simulating an
+	// eviction that won the race between tryRouteReady's RLock read and its Lock.
+	s.MarkInstanceStoppingForTest("a")
+
+	// tryRouteReady must return false now (instance is being stopped).
+	if _, ok := s.TryRouteReadyForTest(ctx, "a", "/models/a"); ok {
+		t.Fatalf("expected tryRouteReady to return false for a concurrently-stopped instance")
+	}
+}
