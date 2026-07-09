@@ -35,6 +35,7 @@ type fakeInstanceController struct {
 	mu          sync.Mutex
 	startBlocks map[string]<-chan struct{}
 	stopOrder   []string
+	stopStarted chan string
 }
 
 type fakeInstance struct {
@@ -45,6 +46,8 @@ type fakeInstance struct {
 	pid int
 
 	startedModel string
+	startErr     error
+	verifyErr    error
 }
 
 func (f *fakeInstance) Start(ctx context.Context, modelName string) (int, error) {
@@ -59,6 +62,9 @@ func (f *fakeInstance) Start(ctx context.Context, modelName string) (int, error)
 			return 0, ctx.Err()
 		}
 	}
+	if f.startErr != nil {
+		return 0, f.startErr
+	}
 	f.mu.Lock()
 	f.pid = 123
 	f.startedModel = modelName
@@ -70,16 +76,29 @@ func (f *fakeInstance) Stop(_ context.Context) error {
 	f.mu.Lock()
 	model := f.startedModel
 	f.mu.Unlock()
+	entry := fmt.Sprintf("%s@%d", model, f.port)
 	f.ctrl.mu.Lock()
-	f.ctrl.stopOrder = append(f.ctrl.stopOrder, fmt.Sprintf("%s@%d", model, f.port))
+	f.ctrl.stopOrder = append(f.ctrl.stopOrder, entry)
+	stopStarted := f.ctrl.stopStarted
 	f.ctrl.mu.Unlock()
+	if stopStarted != nil {
+		select {
+		case stopStarted <- entry:
+		default:
+		}
+	}
 	f.mu.Lock()
 	f.pid = 0
 	f.mu.Unlock()
 	return nil
 }
 
-func (f *fakeInstance) VerifyReady(_ context.Context, _ string) error { return nil }
+func (f *fakeInstance) VerifyReady(_ context.Context, _ string) error {
+	if f.verifyErr != nil {
+		return f.verifyErr
+	}
+	return nil
+}
 
 func (f *fakeInstance) CurrentPID() int {
 	f.mu.Lock()
@@ -98,6 +117,39 @@ func mustLoadSchedulerCfg(t *testing.T, yaml string) *config.Config {
 		t.Fatalf("load config: %v", err)
 	}
 	return cfg
+}
+
+func TestScheduler_TypedNilPowerManagerDisablesPowerLimits(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    power_limit: 300
+`)
+
+	var pm *gpu.PowerManager
+	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{}}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, _ string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port}
+	}, pm)
+
+	route, err := s.AcquireRoute(context.Background(), "a", "req1")
+	if err != nil {
+		t.Fatalf("AcquireRoute: %v", err)
+	}
+	if route.Done != nil {
+		route.Done()
+	}
 }
 
 func TestScheduler_ReadyModelRoutesWhileAnotherModelIsScheduling(t *testing.T) {
@@ -411,6 +463,74 @@ models:
 	}
 }
 
+func TestScheduler_MaxInstancesAllowsSameModelCrashReplacement(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8101
+  max_instances: 1
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+`)
+	inv := &fakeInventory{gpus: []gpu.GPU{
+		{Index: 0, TotalMB: 100, FreeMB: 100},
+		{Index: 1, TotalMB: 100, FreeMB: 100},
+	}}
+	pool := ports.New(8100, 8101)
+	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{}}
+
+	var createdMu sync.Mutex
+	var created []*fakeInstance
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, _ string) jukebox.InstanceManager {
+		inst := &fakeInstance{ctrl: ctrl, port: port}
+		createdMu.Lock()
+		created = append(created, inst)
+		createdMu.Unlock()
+		return inst
+	}, nil)
+
+	routeA, err := s.AcquireRoute(context.Background(), "a", "req-a")
+	if err != nil {
+		t.Fatalf("AcquireRoute(a): %v", err)
+	}
+	if routeA.Done != nil {
+		routeA.Done()
+	}
+
+	createdMu.Lock()
+	old := created[0]
+	createdMu.Unlock()
+	old.mu.Lock()
+	old.pid = 0
+	old.mu.Unlock()
+
+	// Avoid the conflict-eviction path so this specifically exercises the
+	// same-model replacement path while max_instances is already reached.
+	modelA := cfg.Models["a"]
+	modelA.GPUs = []int{1}
+	cfg.Models["a"] = modelA
+
+	routeB, err := s.AcquireRoute(context.Background(), "a", "req-a-replace")
+	if err != nil {
+		t.Fatalf("AcquireRoute(a replace): %v", err)
+	}
+	if routeB.Done != nil {
+		routeB.Done()
+	}
+
+	createdMu.Lock()
+	defer createdMu.Unlock()
+	if len(created) != 2 {
+		t.Fatalf("expected replacement instance to be created, got %d", len(created))
+	}
+}
+
 func TestScheduler_MinInstanceUptimePreventsEviction(t *testing.T) {
 	cfg := mustLoadSchedulerCfg(t, `
 scheduler:
@@ -557,5 +677,318 @@ models:
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("timed out waiting for second request")
+	}
+}
+
+func TestScheduler_TryRouteReady_ReturnsFalseWhenConcurrentlyStopped(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port}
+	}, nil)
+
+	ctx := context.Background()
+
+	// Start model "a" so it becomes Ready.
+	route, err := s.AcquireRoute(ctx, "a", "req1")
+	if err != nil {
+		t.Fatalf("AcquireRoute: %v", err)
+	}
+	route.Done()
+
+	// Manually mark the instance draining+stopping concurrently, simulating an
+	// eviction that won the race between tryRouteReady's RLock read and its Lock.
+	s.MarkInstanceStoppingForTest("a")
+
+	// tryRouteReady must return false now (instance is being stopped).
+	if _, ok := s.TryRouteReadyForTest(ctx, "a", "/models/a"); ok {
+		t.Fatalf("expected tryRouteReady to return false for a concurrently-stopped instance")
+	}
+}
+
+func TestScheduler_CrashReplace_StopsOldAndReleasesPort(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{
+		{Index: 0, TotalMB: 100000, FreeMB: 50000},
+		{Index: 1, TotalMB: 100000, FreeMB: 50000},
+	}}
+
+	var createdMu sync.Mutex
+	var created []jukebox.InstanceManager
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		inst := &fakeInstance{ctrl: ctrl, port: port}
+		createdMu.Lock()
+		created = append(created, inst)
+		createdMu.Unlock()
+		return inst
+	}, nil)
+
+	ctx := context.Background()
+	route, err := s.AcquireRoute(ctx, "a", "req1")
+	if err != nil {
+		t.Fatalf("AcquireRoute: %v", err)
+	}
+	route.Done()
+
+	createdMu.Lock()
+	if len(created) != 1 {
+		createdMu.Unlock()
+		t.Fatalf("expected one created instance, got %d", len(created))
+	}
+	old := created[0].(*fakeInstance)
+	createdMu.Unlock()
+	oldPort := old.port
+
+	// Simulate a crash: PID goes to 0 while state still Ready in the map.
+	old.mu.Lock()
+	old.pid = 0
+	old.mu.Unlock()
+
+	// Move the model to a non-overlapping GPU so this test exercises the
+	// crash-replace block itself rather than the conflict-eviction path.
+	modelA := cfg.Models["a"]
+	modelA.GPUs = []int{1}
+	cfg.Models["a"] = modelA
+
+	// A new request must replace the crashed instance with a fresh one.
+	route2, err := s.AcquireRoute(ctx, "a", "req2")
+	if err != nil {
+		t.Fatalf("AcquireRoute(replace): %v", err)
+	}
+	route2.Done()
+
+	// The old port must have been released back to the pool; one new instance
+	// remains running, so exactly one of the ten ports should be in use.
+	if got := pool.AvailableForTest(); got != 9 {
+		t.Fatalf("expected only new instance port in use (9 available), got %d", got)
+	}
+	// The old instance's process must have been stopped (stop recorded).
+	ctrl.mu.Lock()
+	if len(ctrl.stopOrder) == 0 {
+		ctrl.mu.Unlock()
+		t.Fatalf("expected old instance to be stopped, got stopOrder=%v", ctrl.stopOrder)
+	}
+	if ctrl.stopOrder[0] != fmt.Sprintf("a@%d", oldPort) {
+		got := append([]string(nil), ctrl.stopOrder...)
+		ctrl.mu.Unlock()
+		t.Fatalf("expected old instance on port %d to be stopped, got stopOrder=%v", oldPort, got)
+	}
+	ctrl.mu.Unlock()
+}
+
+func TestScheduler_CrashReplace_WaitsForOldInFlightBeforeStoppingAndReleasingPort(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8101
+  min_instance_uptime: 0s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+  drain_timeout: 500ms
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+`)
+
+	ctrl := &fakeInstanceController{stopStarted: make(chan string, 2)}
+	pool := ports.New(8100, 8101)
+	inv := &fakeInventory{gpus: []gpu.GPU{
+		{Index: 0, TotalMB: 100000, FreeMB: 50000},
+		{Index: 1, TotalMB: 100000, FreeMB: 50000},
+	}}
+
+	created := make(chan *fakeInstance, 2)
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, _ string) jukebox.InstanceManager {
+		inst := &fakeInstance{ctrl: ctrl, port: port}
+		created <- inst
+		return inst
+	}, nil)
+
+	ctx := context.Background()
+	oldRoute, err := s.AcquireRoute(ctx, "a", "req1")
+	if err != nil {
+		t.Fatalf("AcquireRoute: %v", err)
+	}
+	var old *fakeInstance
+	select {
+	case old = <-created:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for old instance")
+	}
+	oldPort := old.port
+
+	// Simulate a crash while the old route is still in flight.
+	old.mu.Lock()
+	old.pid = 0
+	old.mu.Unlock()
+
+	// Move to a non-overlapping GPU so replacement cleanup, not conflict eviction,
+	// is responsible for draining and releasing the old port.
+	modelA := cfg.Models["a"]
+	modelA.GPUs = []int{1}
+	cfg.Models["a"] = modelA
+
+	type acquireResult struct {
+		route jukebox.Route
+		err   error
+	}
+	resultCh := make(chan acquireResult, 1)
+	go func() {
+		route, err := s.AcquireRoute(ctx, "a", "req2")
+		resultCh <- acquireResult{route: route, err: err}
+	}()
+
+	select {
+	case <-created:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for replacement instance")
+	}
+
+	select {
+	case entry := <-ctrl.stopStarted:
+		t.Fatalf("old instance stopped before old route drained: %s", entry)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := pool.AvailableForTest(); got != 0 {
+		t.Fatalf("expected old port to remain held before drain, available ports=%d", got)
+	}
+
+	if oldRoute.Done != nil {
+		oldRoute.Done()
+	}
+
+	var result acquireResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for replacement acquire")
+	}
+	if result.err != nil {
+		t.Fatalf("AcquireRoute(replace): %v", result.err)
+	}
+	if result.route.Done != nil {
+		result.route.Done()
+	}
+
+	select {
+	case entry := <-ctrl.stopStarted:
+		want := fmt.Sprintf("a@%d", oldPort)
+		if entry != want {
+			t.Fatalf("expected old instance stop %s, got %s", want, entry)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected old instance to stop after drain")
+	}
+	if got := pool.AvailableForTest(); got != 1 {
+		t.Fatalf("expected old port released and replacement port held, available ports=%d", got)
+	}
+}
+
+func TestScheduler_StartFailure_RevertsPowerLimits(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    power_limit: 300
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+	power := &fakePowerController{}
+
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port, startErr: errors.New("boom")}
+	}, power)
+
+	_, err := s.AcquireRoute(context.Background(), "a", "req1")
+	if err == nil {
+		t.Fatalf("expected start error")
+	}
+	if len(power.revertedGPU) == 0 {
+		t.Fatalf("expected power revert on failed start, got %v", power.revertedGPU)
+	}
+	if pool.AvailableForTest() != 10 { // port must be released
+		t.Fatalf("expected port released after failed start")
+	}
+}
+
+func TestScheduler_VerifyFailure_RevertsPowerLimits(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    power_limit: 300
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+	power := &fakePowerController{}
+
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port, verifyErr: errors.New("verify boom")}
+	}, power)
+
+	_, err := s.AcquireRoute(context.Background(), "a", "req1")
+	if err == nil {
+		t.Fatalf("expected verify error")
+	}
+	if len(power.revertedGPU) == 0 {
+		t.Fatalf("expected power revert on failed verify, got %v", power.revertedGPU)
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"vllm-jukebox/internal/config"
-	"vllm-jukebox/internal/gpu"
 	"vllm-jukebox/internal/inflight"
 	"vllm-jukebox/internal/metrics"
 )
@@ -95,7 +94,7 @@ type Coordinator struct {
 	cfg      *config.Config
 	mgr      Manager
 	tr       *inflight.Tracker
-	powerMgr *gpu.PowerManager
+	powerMgr PowerController
 	now      func() time.Time
 
 	requests chan ensureReq
@@ -144,7 +143,7 @@ func NewCoordinator(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now f
 	return NewCoordinatorWithPower(cfg, mgr, tr, now, nil)
 }
 
-func NewCoordinatorWithPower(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now func() time.Time, powerMgr *gpu.PowerManager) *Coordinator {
+func NewCoordinatorWithPower(cfg *config.Config, mgr Manager, tr *inflight.Tracker, now func() time.Time, powerMgr PowerController) *Coordinator {
 	if now == nil {
 		now = time.Now
 	}
@@ -152,7 +151,7 @@ func NewCoordinatorWithPower(cfg *config.Config, mgr Manager, tr *inflight.Track
 		cfg:      cfg,
 		mgr:      mgr,
 		tr:       tr,
-		powerMgr: powerMgr,
+		powerMgr: normalizePowerController(powerMgr),
 		now:      now,
 		requests: make(chan ensureReq),
 		state:    StateIdle,
@@ -428,6 +427,17 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 
 	// If we already have a running model, stop it after draining in-flight.
 	if st := c.Status(); st.State == StateStopping || st.State == StateReady {
+		// Resolve the OLD model's config to revert ITS GPUs (not the new model's).
+		var oldGPUs []int
+		c.mu.RLock()
+		oldName := c.currentModel
+		c.mu.RUnlock()
+		if oldName != "" {
+			if _, oldCfg, err := c.cfg.ResolveModel(oldName); err == nil {
+				oldGPUs = oldCfg.GPUs
+			}
+		}
+
 		if c.tr != nil {
 			drainCtx, cancel := context.WithTimeout(context.Background(), c.cfg.VLLM.DrainTimeout.Duration)
 			err := c.tr.WaitForDrain(drainCtx)
@@ -444,9 +454,9 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 			return stopErr
 		}
 
-		// Revert power limits after stop (if we have GPUs configured)
-		if c.powerMgr != nil && len(modelCfg.GPUs) > 0 {
-			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		// Revert power limits for the OLD model's GPUs after stop.
+		if c.powerMgr != nil && len(oldGPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), oldGPUs)
 		}
 	}
 
@@ -465,6 +475,9 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 	_, err = c.mgr.Start(startCtx, model)
 	cancel()
 	if err != nil {
+		if c.powerMgr != nil && len(modelCfg.GPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return err
 	}
 
@@ -476,7 +489,34 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), c.cfg.VLLM.ShutdownTimeout.Duration)
 		_ = c.mgr.Stop(stopCtx)
 		stopCancel()
+		if c.powerMgr != nil && len(modelCfg.GPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return err
+	}
+
+	return nil
+}
+
+func (c *Coordinator) StopCurrent(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.RLock()
+	currentModel := c.currentModel
+	c.mu.RUnlock()
+
+	if c.mgr != nil {
+		if err := c.mgr.Stop(ctx); err != nil {
+			return err
+		}
+	}
+
+	if c.powerMgr != nil && currentModel != "" && c.cfg != nil {
+		if _, modelCfg, err := c.cfg.ResolveModel(currentModel); err == nil && len(modelCfg.GPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 	}
 
 	return nil

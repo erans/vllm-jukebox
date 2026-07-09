@@ -3,10 +3,12 @@ package jukebox_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/gpu"
 	"vllm-jukebox/internal/inflight"
 	"vllm-jukebox/internal/jukebox"
 )
@@ -57,6 +59,62 @@ func (m *fakeManager) VerifyReady(ctx context.Context, expectedModel string) err
 
 func (m *fakeManager) CurrentPID() int {
 	return m.pid
+}
+
+type fakePowerController struct {
+	mu          sync.Mutex
+	applied     []appliedLimit
+	revertedGPU [][]int
+}
+
+type appliedLimit struct {
+	gpus        []int
+	powerLimit  *int
+	powerLimits map[int]int
+}
+
+func (f *fakePowerController) ApplyModelLimits(_ context.Context, gpus []int, powerLimit *int, powerLimits map[int]int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.applied = append(f.applied, appliedLimit{gpus: append([]int(nil), gpus...), powerLimit: powerLimit, powerLimits: powerLimits})
+	return nil
+}
+
+func (f *fakePowerController) RevertModelLimits(_ context.Context, gpus []int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revertedGPU = append(f.revertedGPU, append([]int(nil), gpus...))
+	return nil
+}
+
+func TestCoordinator_TypedNilPowerManagerDisablesPowerLimits(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    gpus: [0]
+    power_limit: 300
+`))
+	if err != nil {
+		t.Fatalf("load cfg: %v", err)
+	}
+
+	var pm *gpu.PowerManager
+	var tr inflight.Tracker
+	mgr := &fakeManager{}
+	c := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, time.Now, pm)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "m", "req_1"); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	if mgr.startCalls != 1 {
+		t.Fatalf("expected 1 start call, got %d", mgr.startCalls)
+	}
 }
 
 func TestCoordinator_StartsFromIdleAndBecomesReady(t *testing.T) {
@@ -260,5 +318,162 @@ models:
 	}
 	if mgr.stopCalls != 1 {
 		t.Fatalf("expected 1 stop call after verify failure, got %d", mgr.stopCalls)
+	}
+}
+
+func TestCoordinator_DoSwap_RevertsOldModelGPUs(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  a:
+    path: "/models/a"
+    gpus: [0, 1]
+    power_limit: 300
+  b:
+    path: "/models/b"
+    gpus: [2, 3]
+    power_limit: 250
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	var tr inflight.Tracker
+	mgr := &fakeManager{}
+	power := &fakePowerController{}
+	now := time.Date(2025, 12, 14, 0, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	c := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, clock, power)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "a", "req_1"); err != nil {
+		t.Fatalf("EnsureModel a: %v", err)
+	}
+
+	// Advance the clock past the default 30s swap cooldown so the swap to b is accepted.
+	now = now.Add(35 * time.Second)
+
+	// Swap to model b. The revert on swap must target a's GPUs [0,1], not b's [2,3].
+	if err := c.EnsureModel(context.Background(), "b", "req_2"); err != nil {
+		t.Fatalf("EnsureModel b: %v", err)
+	}
+
+	power.mu.Lock()
+	defer power.mu.Unlock()
+	if len(power.revertedGPU) == 0 {
+		t.Fatalf("expected a revert on swap, got none")
+	}
+	// The first revert (during the swap) must be for a's GPUs [0,1].
+	first := power.revertedGPU[0]
+	if len(first) != 2 || first[0] != 0 || first[1] != 1 {
+		t.Fatalf("expected revert of old model GPUs [0 1], got %v", first)
+	}
+}
+
+func TestCoordinator_StopCurrent_RevertsCurrentModelPowerLimits(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  a:
+    path: "/models/a"
+    gpus: [0, 2]
+    power_limit: 300
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	var tr inflight.Tracker
+	mgr := &fakeManager{}
+	power := &fakePowerController{}
+	c := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, func() time.Time { return time.Date(2025, 12, 14, 0, 0, 0, 0, time.UTC) }, power)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "a", "req_1"); err != nil {
+		t.Fatalf("EnsureModel a: %v", err)
+	}
+	if err := c.StopCurrent(context.Background()); err != nil {
+		t.Fatalf("StopCurrent: %v", err)
+	}
+	if mgr.stopCalls != 1 {
+		t.Fatalf("expected one stop call, got %d", mgr.stopCalls)
+	}
+
+	power.mu.Lock()
+	defer power.mu.Unlock()
+	if len(power.revertedGPU) != 1 {
+		t.Fatalf("expected one power revert, got %v", power.revertedGPU)
+	}
+	got := power.revertedGPU[0]
+	if len(got) != 2 || got[0] != 0 || got[1] != 2 {
+		t.Fatalf("expected revert of current model GPUs [0 2], got %v", got)
+	}
+}
+
+func TestCoordinator_StartFailure_RevertsPowerLimits(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    power_limit: 300
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	var tr inflight.Tracker
+	mgr := &fakeManager{startErr: errors.New("boom")}
+	power := &fakePowerController{}
+	c := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, func() time.Time { return time.Date(2025, 12, 14, 0, 0, 0, 0, time.UTC) }, power)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "a", "req_1"); err == nil {
+		t.Fatalf("expected start error")
+	}
+	power.mu.Lock()
+	defer power.mu.Unlock()
+	if len(power.revertedGPU) == 0 {
+		t.Fatalf("expected power revert on failed start, got %v", power.revertedGPU)
+	}
+}
+
+func TestCoordinator_VerifyFailure_RevertsPowerLimits(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    power_limit: 300
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	var tr inflight.Tracker
+	mgr := &fakeManager{verifyErr: errors.New("verify boom")}
+	power := &fakePowerController{}
+	c := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, func() time.Time { return time.Date(2025, 12, 14, 0, 0, 0, 0, time.UTC) }, power)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "a", "req_1"); err == nil {
+		t.Fatalf("expected verify error")
+	}
+	power.mu.Lock()
+	defer power.mu.Unlock()
+	if len(power.revertedGPU) == 0 {
+		t.Fatalf("expected power revert on failed verify, got %v", power.revertedGPU)
 	}
 }

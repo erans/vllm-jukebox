@@ -65,6 +65,7 @@ Jukebox is configured with a single YAML file.
 
 ```yaml
 server:
+  # Defaults to 127.0.0.1 (localhost only) if omitted.
   host: "127.0.0.1"
   port: 8080
 
@@ -79,12 +80,19 @@ models:
     path: "Qwen/Qwen2.5-0.5B-Instruct"
 ```
 
+> **Note:** The default bind is `127.0.0.1` (localhost). To expose jukebox on the
+> network, set `host: "0.0.0.0"` and configure `server.api_key` to require
+> `Authorization: Bearer <key>` on inference endpoints plus `/v1/models`,
+> `/status`, and `/metrics`. `/health` remains open.
+
 ### Multiple models + aliases
 
 ```yaml
 server:
+  # Explicit network exposure; configure server.api_key for bearer auth.
   host: "0.0.0.0"
   port: 8080
+  # api_key: "change-me"
   log_requests: true
 
 vllm:
@@ -122,8 +130,10 @@ In scheduler mode, each non-alias model declares an **exact GPU set** and a **mi
 
 ```yaml
 server:
+  # Explicit network exposure; configure server.api_key for bearer auth.
   host: "0.0.0.0"
   port: 8080
+  # api_key: "change-me"
 
 vllm:
   binary: "uvx"
@@ -177,13 +187,14 @@ Anthropic endpoints (proxy to vLLM):
 
 Notes:
 - These endpoints require a `model` field in the JSON body (matching OpenAI semantics).
+- When `server.api_key` is set, model-bearing endpoints require `Authorization: Bearer <key>`.
 - In scheduler mode, each request is routed to the vLLM instance for that model (potentially triggering eviction/start).
 
 Jukebox endpoints:
-- `GET /v1/models` (returns configured models, not vLLM’s)
-- `GET /health`
-- `GET /status` (bind to localhost / protect in production)
-- `GET /metrics` (Prometheus)
+- `GET /v1/models` (returns configured models, not vLLM’s; protected by `server.api_key` when set)
+- `GET /health` (open, even when `server.api_key` is set)
+- `GET /status` (operational details; protected by `server.api_key` when set)
+- `GET /metrics` (Prometheus; protected by `server.api_key` when set)
 
 ## Example request
 

@@ -26,19 +26,19 @@ type Manager struct {
 	// extraEnv is applied after default and model env, overriding on conflict.
 	extraEnv map[string]string
 
-	mu            sync.Mutex
-	cmd           *exec.Cmd
-	pid           int
-	waitCh        chan error
-	exitCh        chan struct{}
-	exitInfo      *processExitInfo
-	stopRequested bool
-	currentModel  string
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	pid            int
+	waitCh         chan error
+	exitCh         chan struct{}
+	exitInfo       *processExitInfo
+	stopRequested  bool
+	currentModel   string
 	currentRuntime string
-	startedAt     time.Time
-	stderrTail    *tailBuffer
-	stdoutTail    *tailBuffer
-	logWriter     *RotatingFileWriter
+	startedAt      time.Time
+	stderrTail     *tailBuffer
+	stdoutTail     *tailBuffer
+	logWriter      *RotatingFileWriter
 }
 
 type processExitInfo struct {

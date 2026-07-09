@@ -47,17 +47,25 @@ func anthropicProxyHandler(opts Options) fiber.Handler {
 		if err != nil {
 			return mapAnthropicError(c, err)
 		}
-		if route.Done != nil {
-			defer route.Done()
-		}
-
-		return proxy.ForwardFiber(c, proxy.ForwardOptions{
+		err = proxy.ForwardFiber(c, proxy.ForwardOptions{
 			BaseURL:          route.BaseURL,
 			RewriteModelName: opts.Config.Behavior.RewriteModelName,
 			RequestedModel:   modelName,
 			UpstreamModel:    route.UpstreamModel,
 			RequestID:        requestID,
+			OnDone:           route.Done,
 		})
+		// ForwardFiber does not call OnDone on its error paths (request build
+		// failure, client.Do failure, buffered read failure). Release the
+		// in-flight slot here so a failed forward does not leak the counter
+		// and block future drains/swaps. On success the proxy already fired
+		// (and nil'd) OnDone, so route.Done is a no-op there; on error it
+		// never fired, so we release exactly once. The inflight tracker's
+		// done func uses sync.Once, making this idempotent.
+		if err != nil && route.Done != nil {
+			route.Done()
+		}
+		return err
 	}
 }
 

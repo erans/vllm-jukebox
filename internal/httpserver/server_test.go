@@ -228,6 +228,217 @@ models:
 	}
 }
 
+func TestServer_AuthMiddleware_MountedWhenAPIKeySet(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  api_key: "secret"
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	app := httpserver.NewApp(httpserver.Options{Config: cfg})
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on /status without key, got %d", resp.StatusCode)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("expected auth to pass with correct key, got 401")
+	}
+}
+
+func TestServer_AuthMiddleware_NotMountedWhenAPIKeyUnset(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	app := httpserver.NewApp(httpserver.Options{Config: cfg})
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("expected no auth when api_key unset, got 401")
+	}
+}
+
+func TestServer_AuthMiddleware_HealthOpenWhenAPIKeySet(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  api_key: "secret"
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	app := httpserver.NewApp(httpserver.Options{
+		Config: cfg,
+		Router: &stubCoord{st: jukebox.Status{State: jukebox.StateReady}},
+	})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/health", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /health to remain open with key set, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_AuthMiddleware_UnsupportedRoutesStayUnauthenticatedWhenAPIKeySet(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  api_key: "secret"
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	app := httpserver.NewApp(httpserver.Options{Config: cfg})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/v1/audio/test", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected unsupported route to remain 501 without auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_AuthMiddleware_ModelsProtectedWhenAPIKeySet(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  api_key: "secret"
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	app := httpserver.NewApp(httpserver.Options{Config: cfg})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on /v1/models without key, got %d", resp.StatusCode)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /v1/models with correct key to proceed, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_AuthMiddleware_ProtectedRoutesRequireAuthWhenAPIKeySet(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  api_key: "secret"
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	app := httpserver.NewApp(httpserver.Options{Config: cfg})
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "responses", method: http.MethodPost, path: "/v1/responses"},
+		{name: "chat completions", method: http.MethodPost, path: "/v1/chat/completions"},
+		{name: "completions", method: http.MethodPost, path: "/v1/completions"},
+		{name: "embeddings", method: http.MethodPost, path: "/v1/embeddings"},
+		{name: "tokenize", method: http.MethodPost, path: "/v1/tokenize"},
+		{name: "detokenize", method: http.MethodPost, path: "/v1/detokenize"},
+		{name: "messages", method: http.MethodPost, path: "/v1/messages"},
+		{name: "models", method: http.MethodGet, path: "/v1/models"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body io.Reader
+			if tt.method != http.MethodGet {
+				body = strings.NewReader(`{"model":"m"}`)
+			}
+
+			req := httptest.NewRequest(tt.method, tt.path, body)
+			if body != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("expected 401 on %s without key, got %d", tt.path, resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestServer_RecoveryMiddlewareReturns500OnPanic(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 server:

@@ -121,7 +121,7 @@ func main() {
 				}
 				stopCtx, stopCancel := context.WithTimeout(context.Background(), timeout)
 				defer stopCancel()
-				if err := mgr.Stop(stopCtx); err != nil {
+				if err := coord.StopCurrent(stopCtx); err != nil {
 					slog.Error("failed to stop vLLM", "err", err)
 				}
 			})

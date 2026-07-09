@@ -21,7 +21,7 @@ type Scheduler struct {
 	cfg      *config.Config
 	inv      gpu.Inventory
 	ports    *ports.Pool
-	powerMgr *gpu.PowerManager
+	powerMgr PowerController
 	now      func() time.Time
 	new      InstanceFactory
 
@@ -64,7 +64,7 @@ func NewScheduler(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, n
 	return NewSchedulerWithFactory(cfg, inv, portPool, now, nil, nil)
 }
 
-func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, now func() time.Time, factory InstanceFactory, powerMgr *gpu.PowerManager) *Scheduler {
+func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *ports.Pool, now func() time.Time, factory InstanceFactory, powerMgr PowerController) *Scheduler {
 	if now == nil {
 		now = time.Now
 	}
@@ -77,7 +77,7 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		cfg:       cfg,
 		inv:       inv,
 		ports:     portPool,
-		powerMgr:  powerMgr,
+		powerMgr:  normalizePowerController(powerMgr),
 		now:       now,
 		new:       factory,
 		sched:     make(chan struct{}, 1),
@@ -204,6 +204,9 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	if s.cfg.Scheduler.MaxInstances != nil {
 		s.mu.RLock()
 		currentInstances := len(s.instances)
+		if s.instances[resolvedName] != nil {
+			currentInstances--
+		}
 		s.mu.RUnlock()
 		if currentInstances >= *s.cfg.Scheduler.MaxInstances {
 			metrics.ScheduleRejectionsTotal.WithLabelValues(string(RejectNoCapacity)).Inc()
@@ -260,6 +263,9 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	cancel()
 	if startErr != nil {
 		s.ports.Release(port)
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return Route{}, startErr
 	}
 
@@ -271,6 +277,9 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 		_ = mgr.Stop(stopCtx)
 		stopCancel()
 		s.ports.Release(port)
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return Route{}, verifyErr
 	}
 
@@ -281,13 +290,47 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	metrics.RunningInstances.WithLabelValues(inst.model, portLabel).Set(1)
 
 	s.mu.Lock()
-	// If a previous instance exists for this model (e.g., crashed), replace it.
-	if old := s.instances[resolvedName]; old != nil {
-		// Best-effort cleanup of the old instance without blocking.
+	// If a previous instance exists for this model (e.g., crashed), capture it
+	// for cleanup. Do NOT delete from the map here — the new instance owns the
+	// key now; drainAndStopInstance's own delete would clobber it.
+	old := s.instances[resolvedName]
+	if old != nil {
 		old.draining = true
+		old.state = StateStopping
 	}
 	s.instances[resolvedName] = inst
 	s.mu.Unlock()
+
+	if old != nil {
+		if old.mgr != nil {
+			if !old.inflightIsDrained() {
+				drainTimeout := s.cfg.VLLM.DrainTimeout.Duration
+				if drainTimeout <= 0 {
+					drainTimeout = 60 * time.Second
+				}
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
+				_ = old.inflight.WaitForDrain(drainCtx)
+				drainCancel()
+			}
+
+			stopTimeout := s.cfg.VLLM.ShutdownTimeout.Duration
+			if stopTimeout <= 0 {
+				stopTimeout = 30 * time.Second
+			}
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)
+			_ = old.mgr.Stop(stopCtx)
+			stopCancel()
+		}
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), old.gpus)
+		}
+		oldPortLabel := strconv.Itoa(old.port)
+		metrics.RunningInstances.WithLabelValues(old.model, oldPortLabel).Set(0)
+		metrics.InstanceInFlightRequests.WithLabelValues(old.model, oldPortLabel).Set(0)
+		if s.ports != nil && old.port != 0 {
+			s.ports.Release(old.port)
+		}
+	}
 
 	return s.routeForInstance(ctx, inst, modelCfg.Path), nil
 }
@@ -317,24 +360,16 @@ func (s *Scheduler) StopAll(ctx context.Context) error {
 }
 
 func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstreamModel string) (Route, bool) {
-	s.mu.RLock()
-	inst := s.instances[resolvedModelName]
-	s.mu.RUnlock()
-	if inst == nil {
-		return Route{}, false
-	}
-	if inst.state != StateReady || inst.draining || inst.mgr == nil || inst.mgr.CurrentPID() == 0 {
-		return Route{}, false
-	}
-
 	now := s.now()
 	s.mu.Lock()
-	// Re-check under lock.
-	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst && inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
-		inst.lastUsedAt = now
-	}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
+	inst := s.instances[resolvedModelName]
+	if inst == nil || inst.state != StateReady || inst.draining || inst.mgr == nil || inst.mgr.CurrentPID() == 0 {
+		return Route{}, false
+	}
+
+	inst.lastUsedAt = now
 	return s.routeForInstance(ctx, inst, upstreamModel), true
 }
 
@@ -613,4 +648,27 @@ func joinInts(nums []int, sep string) string {
 		b.WriteString(strconv.Itoa(n))
 	}
 	return b.String()
+}
+
+// InstancesForTest exposes the instance map for tests. Not safe for concurrent
+// use outside tests.
+func (s *Scheduler) InstancesForTest() map[string]*schedInstance {
+	return s.instances
+}
+
+// TryRouteReadyForTest exposes tryRouteReady for tests.
+func (s *Scheduler) TryRouteReadyForTest(ctx context.Context, resolvedModelName, upstreamModel string) (Route, bool) {
+	return s.tryRouteReady(ctx, resolvedModelName, upstreamModel)
+}
+
+// MarkInstanceStoppingForTest marks the named instance as draining+stopping,
+// simulating a concurrent eviction that won the race against tryRouteReady.
+// Test-only helper.
+func (s *Scheduler) MarkInstanceStoppingForTest(model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if inst := s.instances[model]; inst != nil {
+		inst.draining = true
+		inst.state = StateStopping
+	}
 }

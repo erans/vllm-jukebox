@@ -152,6 +152,88 @@ models:
 	}
 }
 
+func TestConfig_DefaultHostIsLocalhost(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Fatalf("expected default host 127.0.0.1, got %q", cfg.Server.Host)
+	}
+}
+
+func TestConfig_ExplicitHostPreserved(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  host: "0.0.0.0"
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Server.Host != "0.0.0.0" {
+		t.Fatalf("expected explicit host preserved, got %q", cfg.Server.Host)
+	}
+}
+
+func TestConfig_APIKeyAccepted(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  api_key: "secret-token"
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Server.APIKey != "secret-token" {
+		t.Fatalf("expected api_key parsed, got %q", cfg.Server.APIKey)
+	}
+}
+
+func TestConfig_EmptyAPIKeyRejected(t *testing.T) {
+	_, err := config.Load([]byte(`
+server:
+  api_key: ""
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err == nil {
+		t.Fatalf("expected error for empty api_key")
+	}
+}
+
+func TestConfig_WhitespaceAPIKeyRejected(t *testing.T) {
+	_, err := config.Load([]byte(`
+server:
+  api_key: "   "
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err == nil {
+		t.Fatalf("expected error for whitespace api_key")
+	}
+}
+
 func TestLoad_Scheduler_AllowsNull(t *testing.T) {
 	_, err := loadFromYAML(t, `
 scheduler: null
