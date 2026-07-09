@@ -27,21 +27,27 @@ func NewApp(opts Options) *fiber.App {
 	}
 
 	app.Get("/health", healthHandler(opts.Router))
-	app.Get("/status", statusHandler(opts.Config, opts.Router))
 
-	app.Get("/v1/models", listModelsHandler(opts.Config))
-	app.Get("/metrics", metricsHandler())
+	// Protected routes require bearer auth when server.api_key is set.
+	apiKey := ""
+	if opts.Config != nil {
+		apiKey = opts.Config.Server.APIKey
+	}
+	protected := app.Group("/", AuthAPIKey(apiKey))
 
-	// Model-bearing endpoints (scheduler-routed).
-	app.Post("/v1/responses", switchingProxyHandler(opts))
-	app.Post("/v1/chat/completions", switchingProxyHandler(opts))
-	app.Post("/v1/completions", switchingProxyHandler(opts))
-	app.Post("/v1/embeddings", switchingProxyHandler(opts))
-	app.Post("/v1/tokenize", switchingProxyHandler(opts))
-	app.Post("/v1/detokenize", switchingProxyHandler(opts))
+	protected.Get("/status", statusHandler(opts.Config, opts.Router))
+	protected.Get("/metrics", metricsHandler())
+
+	protected.Get("/v1/models", listModelsHandler(opts.Config))
+	protected.Post("/v1/responses", switchingProxyHandler(opts))
+	protected.Post("/v1/chat/completions", switchingProxyHandler(opts))
+	protected.Post("/v1/completions", switchingProxyHandler(opts))
+	protected.Post("/v1/embeddings", switchingProxyHandler(opts))
+	protected.Post("/v1/tokenize", switchingProxyHandler(opts))
+	protected.Post("/v1/detokenize", switchingProxyHandler(opts))
 
 	// Anthropic endpoints
-	app.Post("/v1/messages", anthropicProxyHandler(opts))
+	protected.Post("/v1/messages", anthropicProxyHandler(opts))
 
 	// Explicit unsupported endpoints.
 	app.All("/v1/audio/*", notImplementedHandler())
