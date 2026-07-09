@@ -978,7 +978,7 @@ models:
 	ctrl := &fakeInstanceController{}
 	pool := ports.New(8100, 8109)
 	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMemoryMB: 100000, FreeMemoryMB: 50000}}}
-	power := &fakePowerControllerSched{}
+	power := &fakePowerController{}
 
 	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
 		return &fakeInstance{ctrl: ctrl, port: port, startErr: errors.New("boom")}
@@ -1016,7 +1016,7 @@ models:
 	ctrl := &fakeInstanceController{}
 	pool := ports.New(8100, 8109)
 	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMemoryMB: 100000, FreeMemoryMB: 50000}}}
-	power := &fakePowerControllerSched{}
+	power := &fakePowerController{}
 
 	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
 		return &fakeInstance{ctrl: ctrl, port: port, verifyErr: errors.New("verify boom")}
