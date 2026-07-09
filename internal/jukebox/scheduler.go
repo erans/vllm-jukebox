@@ -287,13 +287,35 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	metrics.RunningInstances.WithLabelValues(inst.model, portLabel).Set(1)
 
 	s.mu.Lock()
-	// If a previous instance exists for this model (e.g., crashed), replace it.
-	if old := s.instances[resolvedName]; old != nil {
-		// Best-effort cleanup of the old instance without blocking.
-		old.draining = true
-	}
+	// If a previous instance exists for this model (e.g., crashed), capture it
+	// for cleanup. Do NOT delete from the map here — the new instance owns the
+	// key now; drainAndStopInstance's own delete would clobber it.
+	old := s.instances[resolvedName]
 	s.instances[resolvedName] = inst
 	s.mu.Unlock()
+
+	if old != nil {
+		old.draining = true
+		old.state = StateStopping
+		if old.mgr != nil {
+			stopTimeout := s.cfg.VLLM.ShutdownTimeout.Duration
+			if stopTimeout <= 0 {
+				stopTimeout = 30 * time.Second
+			}
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)
+			_ = old.mgr.Stop(stopCtx)
+			stopCancel()
+		}
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), old.gpus)
+		}
+		oldPortLabel := strconv.Itoa(old.port)
+		metrics.RunningInstances.WithLabelValues(old.model, oldPortLabel).Set(0)
+		metrics.InstanceInFlightRequests.WithLabelValues(old.model, oldPortLabel).Set(0)
+		if s.ports != nil && old.port != 0 {
+			s.ports.Release(old.port)
+		}
+	}
 
 	return s.routeForInstance(ctx, inst, modelCfg.Path), nil
 }

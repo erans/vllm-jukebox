@@ -613,6 +613,92 @@ models:
 	}
 }
 
+func TestScheduler_CrashReplace_StopsOldAndReleasesPort(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{
+		{Index: 0, TotalMB: 100000, FreeMB: 50000},
+		{Index: 1, TotalMB: 100000, FreeMB: 50000},
+	}}
+
+	var createdMu sync.Mutex
+	var created []jukebox.InstanceManager
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		inst := &fakeInstance{ctrl: ctrl, port: port}
+		createdMu.Lock()
+		created = append(created, inst)
+		createdMu.Unlock()
+		return inst
+	}, nil)
+
+	ctx := context.Background()
+	route, err := s.AcquireRoute(ctx, "a", "req1")
+	if err != nil {
+		t.Fatalf("AcquireRoute: %v", err)
+	}
+	route.Done()
+
+	createdMu.Lock()
+	if len(created) != 1 {
+		createdMu.Unlock()
+		t.Fatalf("expected one created instance, got %d", len(created))
+	}
+	old := created[0].(*fakeInstance)
+	createdMu.Unlock()
+	oldPort := old.port
+
+	// Simulate a crash: PID goes to 0 while state still Ready in the map.
+	old.mu.Lock()
+	old.pid = 0
+	old.mu.Unlock()
+
+	// Move the model to a non-overlapping GPU so this test exercises the
+	// crash-replace block itself rather than the conflict-eviction path.
+	modelA := cfg.Models["a"]
+	modelA.GPUs = []int{1}
+	cfg.Models["a"] = modelA
+
+	// A new request must replace the crashed instance with a fresh one.
+	route2, err := s.AcquireRoute(ctx, "a", "req2")
+	if err != nil {
+		t.Fatalf("AcquireRoute(replace): %v", err)
+	}
+	route2.Done()
+
+	// The old port must have been released back to the pool; one new instance
+	// remains running, so exactly one of the ten ports should be in use.
+	if got := pool.AvailableForTest(); got != 9 {
+		t.Fatalf("expected only new instance port in use (9 available), got %d", got)
+	}
+	// The old instance's process must have been stopped (stop recorded).
+	ctrl.mu.Lock()
+	if len(ctrl.stopOrder) == 0 {
+		ctrl.mu.Unlock()
+		t.Fatalf("expected old instance to be stopped, got stopOrder=%v", ctrl.stopOrder)
+	}
+	if ctrl.stopOrder[0] != fmt.Sprintf("a@%d", oldPort) {
+		got := append([]string(nil), ctrl.stopOrder...)
+		ctrl.mu.Unlock()
+		t.Fatalf("expected old instance on port %d to be stopped, got stopOrder=%v", oldPort, got)
+	}
+	ctrl.mu.Unlock()
+}
+
 func TestScheduler_StartFailure_RevertsPowerLimits(t *testing.T) {
 	cfg := mustLoadSchedulerCfg(t, `
 scheduler:
