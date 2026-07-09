@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"vllm-jukebox/internal/config"
+	"vllm-jukebox/internal/gpu"
 	"vllm-jukebox/internal/inflight"
 	"vllm-jukebox/internal/jukebox"
 )
@@ -84,6 +85,36 @@ func (f *fakePowerController) RevertModelLimits(_ context.Context, gpus []int) e
 	defer f.mu.Unlock()
 	f.revertedGPU = append(f.revertedGPU, append([]int(nil), gpus...))
 	return nil
+}
+
+func TestCoordinator_TypedNilPowerManagerDisablesPowerLimits(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+    gpus: [0]
+    power_limit: 300
+`))
+	if err != nil {
+		t.Fatalf("load cfg: %v", err)
+	}
+
+	var pm *gpu.PowerManager
+	var tr inflight.Tracker
+	mgr := &fakeManager{}
+	c := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, time.Now, pm)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "m", "req_1"); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	if mgr.startCalls != 1 {
+		t.Fatalf("expected 1 start call, got %d", mgr.startCalls)
+	}
 }
 
 func TestCoordinator_StartsFromIdleAndBecomesReady(t *testing.T) {

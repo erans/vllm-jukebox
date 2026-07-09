@@ -110,6 +110,39 @@ func mustLoadSchedulerCfg(t *testing.T, yaml string) *config.Config {
 	return cfg
 }
 
+func TestScheduler_TypedNilPowerManagerDisablesPowerLimits(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    power_limit: 300
+`)
+
+	var pm *gpu.PowerManager
+	ctrl := &fakeInstanceController{startBlocks: map[string]<-chan struct{}{}}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, _ string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port}
+	}, pm)
+
+	route, err := s.AcquireRoute(context.Background(), "a", "req1")
+	if err != nil {
+		t.Fatalf("AcquireRoute: %v", err)
+	}
+	if route.Done != nil {
+		route.Done()
+	}
+}
+
 func TestScheduler_ReadyModelRoutesWhileAnotherModelIsScheduling(t *testing.T) {
 	cfg := mustLoadSchedulerCfg(t, `
 scheduler:

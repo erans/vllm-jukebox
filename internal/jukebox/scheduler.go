@@ -77,7 +77,7 @@ func NewSchedulerWithFactory(cfg *config.Config, inv gpu.Inventory, portPool *po
 		cfg:       cfg,
 		inv:       inv,
 		ports:     portPool,
-		powerMgr:  powerMgr,
+		powerMgr:  normalizePowerController(powerMgr),
 		now:       now,
 		new:       factory,
 		sched:     make(chan struct{}, 1),

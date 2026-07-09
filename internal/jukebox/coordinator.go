@@ -151,7 +151,7 @@ func NewCoordinatorWithPower(cfg *config.Config, mgr Manager, tr *inflight.Track
 		cfg:      cfg,
 		mgr:      mgr,
 		tr:       tr,
-		powerMgr: powerMgr,
+		powerMgr: normalizePowerController(powerMgr),
 		now:      now,
 		requests: make(chan ensureReq),
 		state:    StateIdle,
