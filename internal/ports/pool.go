@@ -35,3 +35,10 @@ func (p *Pool) Release(port int) {
 	defer p.mu.Unlock()
 	delete(p.used, port)
 }
+
+// AvailableForTest returns the count of free ports. For tests only.
+func (p *Pool) AvailableForTest() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.end - p.start + 1 - len(p.used)
+}

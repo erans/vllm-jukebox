@@ -45,6 +45,8 @@ type fakeInstance struct {
 	pid int
 
 	startedModel string
+	startErr     error
+	verifyErr    error
 }
 
 func (f *fakeInstance) Start(ctx context.Context, modelName string) (int, error) {
@@ -58,6 +60,9 @@ func (f *fakeInstance) Start(ctx context.Context, modelName string) (int, error)
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
+	}
+	if f.startErr != nil {
+		return 0, f.startErr
 	}
 	f.mu.Lock()
 	f.pid = 123
@@ -79,7 +84,12 @@ func (f *fakeInstance) Stop(_ context.Context) error {
 	return nil
 }
 
-func (f *fakeInstance) VerifyReady(_ context.Context, _ string) error { return nil }
+func (f *fakeInstance) VerifyReady(_ context.Context, _ string) error {
+	if f.verifyErr != nil {
+		return f.verifyErr
+	}
+	return nil
+}
 
 func (f *fakeInstance) CurrentPID() int {
 	f.mu.Lock()
@@ -600,5 +610,78 @@ models:
 	// tryRouteReady must return false now (instance is being stopped).
 	if _, ok := s.TryRouteReadyForTest(ctx, "a", "/models/a"); ok {
 		t.Fatalf("expected tryRouteReady to return false for a concurrently-stopped instance")
+	}
+}
+
+func TestScheduler_StartFailure_RevertsPowerLimits(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    power_limit: 300
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+	power := &fakePowerController{}
+
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port, startErr: errors.New("boom")}
+	}, power)
+
+	_, err := s.AcquireRoute(context.Background(), "a", "req1")
+	if err == nil {
+		t.Fatalf("expected start error")
+	}
+	if len(power.revertedGPU) == 0 {
+		t.Fatalf("expected power revert on failed start, got %v", power.revertedGPU)
+	}
+	if pool.AvailableForTest() != 10 { // port must be released
+		t.Fatalf("expected port released after failed start")
+	}
+}
+
+func TestScheduler_VerifyFailure_RevertsPowerLimits(t *testing.T) {
+	cfg := mustLoadSchedulerCfg(t, `
+scheduler:
+  port_range_start: 8100
+  port_range_end: 8109
+  min_instance_uptime: 1s
+vllm:
+  port: 8000
+  startup_timeout: 5s
+models:
+  a:
+    path: "/models/a"
+    gpus: [0]
+    min_free_mem_mb_per_gpu: 10
+    power_limit: 300
+`)
+
+	ctrl := &fakeInstanceController{}
+	pool := ports.New(8100, 8109)
+	inv := &fakeInventory{gpus: []gpu.GPU{{Index: 0, TotalMB: 100000, FreeMB: 50000}}}
+	power := &fakePowerController{}
+
+	s := jukebox.NewSchedulerWithFactory(cfg, inv, pool, time.Now, func(port int, cuda string) jukebox.InstanceManager {
+		return &fakeInstance{ctrl: ctrl, port: port, verifyErr: errors.New("verify boom")}
+	}, power)
+
+	_, err := s.AcquireRoute(context.Background(), "a", "req1")
+	if err == nil {
+		t.Fatalf("expected verify error")
+	}
+	if len(power.revertedGPU) == 0 {
+		t.Fatalf("expected power revert on failed verify, got %v", power.revertedGPU)
 	}
 }

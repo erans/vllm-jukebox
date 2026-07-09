@@ -260,6 +260,9 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	cancel()
 	if startErr != nil {
 		s.ports.Release(port)
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return Route{}, startErr
 	}
 
@@ -271,6 +274,9 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 		_ = mgr.Stop(stopCtx)
 		stopCancel()
 		s.ports.Release(port)
+		if s.powerMgr != nil {
+			_ = s.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
 		return Route{}, verifyErr
 	}
 
