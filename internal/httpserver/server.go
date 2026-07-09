@@ -33,21 +33,21 @@ func NewApp(opts Options) *fiber.App {
 	if opts.Config != nil {
 		apiKey = opts.Config.Server.APIKey
 	}
-	protected := app.Group("/", AuthAPIKey(apiKey))
+	auth := AuthAPIKey(apiKey)
 
-	protected.Get("/status", statusHandler(opts.Config, opts.Router))
-	protected.Get("/metrics", metricsHandler())
+	app.Get("/status", auth, statusHandler(opts.Config, opts.Router))
+	app.Get("/metrics", auth, metricsHandler())
 
-	protected.Get("/v1/models", listModelsHandler(opts.Config))
-	protected.Post("/v1/responses", switchingProxyHandler(opts))
-	protected.Post("/v1/chat/completions", switchingProxyHandler(opts))
-	protected.Post("/v1/completions", switchingProxyHandler(opts))
-	protected.Post("/v1/embeddings", switchingProxyHandler(opts))
-	protected.Post("/v1/tokenize", switchingProxyHandler(opts))
-	protected.Post("/v1/detokenize", switchingProxyHandler(opts))
+	app.Get("/v1/models", auth, listModelsHandler(opts.Config))
+	app.Post("/v1/responses", auth, switchingProxyHandler(opts))
+	app.Post("/v1/chat/completions", auth, switchingProxyHandler(opts))
+	app.Post("/v1/completions", auth, switchingProxyHandler(opts))
+	app.Post("/v1/embeddings", auth, switchingProxyHandler(opts))
+	app.Post("/v1/tokenize", auth, switchingProxyHandler(opts))
+	app.Post("/v1/detokenize", auth, switchingProxyHandler(opts))
 
 	// Anthropic endpoints
-	protected.Post("/v1/messages", anthropicProxyHandler(opts))
+	app.Post("/v1/messages", auth, anthropicProxyHandler(opts))
 
 	// Explicit unsupported endpoints.
 	app.All("/v1/audio/*", notImplementedHandler())

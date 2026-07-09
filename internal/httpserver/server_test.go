@@ -321,6 +321,32 @@ models:
 	}
 }
 
+func TestServer_AuthMiddleware_UnsupportedRoutesStayUnauthenticatedWhenAPIKeySet(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+server:
+  api_key: "secret"
+  log_requests: false
+vllm:
+  port: 8000
+models:
+  m:
+    path: "/models/m"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	app := httpserver.NewApp(httpserver.Options{Config: cfg})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/v1/audio/test", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected unsupported route to remain 501 without auth, got %d", resp.StatusCode)
+	}
+}
+
 func TestServer_AuthMiddleware_ModelsProtectedWhenAPIKeySet(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 server:
@@ -359,7 +385,7 @@ models:
 	}
 }
 
-func TestServer_AuthMiddleware_InferenceRoutesProtectedWhenAPIKeySet(t *testing.T) {
+func TestServer_AuthMiddleware_ProtectedRoutesRequireAuthWhenAPIKeySet(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 server:
   api_key: "secret"
@@ -375,15 +401,41 @@ models:
 	}
 	app := httpserver.NewApp(httpserver.Options{Config: cfg})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("app.Test: %v", err)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "responses", method: http.MethodPost, path: "/v1/responses"},
+		{name: "chat completions", method: http.MethodPost, path: "/v1/chat/completions"},
+		{name: "completions", method: http.MethodPost, path: "/v1/completions"},
+		{name: "embeddings", method: http.MethodPost, path: "/v1/embeddings"},
+		{name: "tokenize", method: http.MethodPost, path: "/v1/tokenize"},
+		{name: "detokenize", method: http.MethodPost, path: "/v1/detokenize"},
+		{name: "messages", method: http.MethodPost, path: "/v1/messages"},
+		{name: "models", method: http.MethodGet, path: "/v1/models"},
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 on /v1/chat/completions without key, got %d", resp.StatusCode)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body io.Reader
+			if tt.method != http.MethodGet {
+				body = strings.NewReader(`{"model":"m"}`)
+			}
+
+			req := httptest.NewRequest(tt.method, tt.path, body)
+			if body != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("expected 401 on %s without key, got %d", tt.path, resp.StatusCode)
+			}
+		})
 	}
 }
 
