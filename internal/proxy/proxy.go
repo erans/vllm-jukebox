@@ -20,6 +20,16 @@ type ForwardOptions struct {
 	RequestID         string
 	AdditionalHeaders map[string]string
 	Timeout           time.Duration
+	OnDone            func()
+}
+
+// callOnce invokes f and nils it out so it can only fire once, even across the
+// SSE writer closure and the buffered path. Safe if f is nil.
+func callOnce(f *func()) {
+	if f != nil && *f != nil {
+		(*f)()
+		*f = nil
+	}
 }
 
 func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
@@ -78,8 +88,10 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
+		onDone := &opts.OnDone
 		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
 			defer resp.Body.Close()
+			defer callOnce(onDone)
 			if opts.RewriteModelName && opts.RequestedModel != "" {
 				_ = RewriteSSEModel(resp.Body, w, opts.RequestedModel)
 			} else {
@@ -102,6 +114,7 @@ func ForwardFiber(c *fiber.Ctx, opts ForwardOptions) error {
 		}
 	}
 
+	callOnce(&opts.OnDone)
 	return c.Send(data)
 }
 
