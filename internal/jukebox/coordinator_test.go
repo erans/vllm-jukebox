@@ -373,6 +373,49 @@ models:
 	}
 }
 
+func TestCoordinator_StopCurrent_RevertsCurrentModelPowerLimits(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+vllm:
+  port: 8000
+models:
+  a:
+    path: "/models/a"
+    gpus: [0, 2]
+    power_limit: 300
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	var tr inflight.Tracker
+	mgr := &fakeManager{}
+	power := &fakePowerController{}
+	c := jukebox.NewCoordinatorWithPower(cfg, mgr, &tr, func() time.Time { return time.Date(2025, 12, 14, 0, 0, 0, 0, time.UTC) }, power)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	if err := c.EnsureModel(context.Background(), "a", "req_1"); err != nil {
+		t.Fatalf("EnsureModel a: %v", err)
+	}
+	if err := c.StopCurrent(context.Background()); err != nil {
+		t.Fatalf("StopCurrent: %v", err)
+	}
+	if mgr.stopCalls != 1 {
+		t.Fatalf("expected one stop call, got %d", mgr.stopCalls)
+	}
+
+	power.mu.Lock()
+	defer power.mu.Unlock()
+	if len(power.revertedGPU) != 1 {
+		t.Fatalf("expected one power revert, got %v", power.revertedGPU)
+	}
+	got := power.revertedGPU[0]
+	if len(got) != 2 || got[0] != 0 || got[1] != 2 {
+		t.Fatalf("expected revert of current model GPUs [0 2], got %v", got)
+	}
+}
+
 func TestCoordinator_StartFailure_RevertsPowerLimits(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 vllm:

@@ -204,6 +204,9 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	if s.cfg.Scheduler.MaxInstances != nil {
 		s.mu.RLock()
 		currentInstances := len(s.instances)
+		if s.instances[resolvedName] != nil {
+			currentInstances--
+		}
 		s.mu.RUnlock()
 		if currentInstances >= *s.cfg.Scheduler.MaxInstances {
 			metrics.ScheduleRejectionsTotal.WithLabelValues(string(RejectNoCapacity)).Inc()
@@ -291,13 +294,25 @@ func (s *Scheduler) AcquireRoute(ctx context.Context, requestedModel, requestID 
 	// for cleanup. Do NOT delete from the map here — the new instance owns the
 	// key now; drainAndStopInstance's own delete would clobber it.
 	old := s.instances[resolvedName]
+	if old != nil {
+		old.draining = true
+		old.state = StateStopping
+	}
 	s.instances[resolvedName] = inst
 	s.mu.Unlock()
 
 	if old != nil {
-		old.draining = true
-		old.state = StateStopping
 		if old.mgr != nil {
+			if !old.inflightIsDrained() {
+				drainTimeout := s.cfg.VLLM.DrainTimeout.Duration
+				if drainTimeout <= 0 {
+					drainTimeout = 60 * time.Second
+				}
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
+				_ = old.inflight.WaitForDrain(drainCtx)
+				drainCancel()
+			}
+
 			stopTimeout := s.cfg.VLLM.ShutdownTimeout.Duration
 			if stopTimeout <= 0 {
 				stopTimeout = 30 * time.Second
@@ -345,25 +360,17 @@ func (s *Scheduler) StopAll(ctx context.Context) error {
 }
 
 func (s *Scheduler) tryRouteReady(ctx context.Context, resolvedModelName, upstreamModel string) (Route, bool) {
-	s.mu.RLock()
-	inst := s.instances[resolvedModelName]
-	s.mu.RUnlock()
-	if inst == nil {
-		return Route{}, false
-	}
-	if inst.state != StateReady || inst.draining || inst.mgr == nil || inst.mgr.CurrentPID() == 0 {
-		return Route{}, false
-	}
-
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if inst2 := s.instances[resolvedModelName]; inst2 != nil && inst2 == inst &&
-		inst.state == StateReady && !inst.draining && inst.mgr != nil && inst.mgr.CurrentPID() != 0 {
-		inst.lastUsedAt = now
-		return s.routeForInstance(ctx, inst, upstreamModel), true
+
+	inst := s.instances[resolvedModelName]
+	if inst == nil || inst.state != StateReady || inst.draining || inst.mgr == nil || inst.mgr.CurrentPID() == 0 {
+		return Route{}, false
 	}
-	return Route{}, false
+
+	inst.lastUsedAt = now
+	return s.routeForInstance(ctx, inst, upstreamModel), true
 }
 
 func (s *Scheduler) routeForInstance(ctx context.Context, inst *schedInstance, upstreamModel string) Route {

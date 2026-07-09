@@ -498,6 +498,30 @@ func (c *Coordinator) doSwap(model, requestID string) error {
 	return nil
 }
 
+func (c *Coordinator) StopCurrent(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+
+	c.mu.RLock()
+	currentModel := c.currentModel
+	c.mu.RUnlock()
+
+	if c.mgr != nil {
+		if err := c.mgr.Stop(ctx); err != nil {
+			return err
+		}
+	}
+
+	if c.powerMgr != nil && currentModel != "" && c.cfg != nil {
+		if _, modelCfg, err := c.cfg.ResolveModel(currentModel); err == nil && len(modelCfg.GPUs) > 0 {
+			_ = c.powerMgr.RevertModelLimits(context.Background(), modelCfg.GPUs)
+		}
+	}
+
+	return nil
+}
+
 func backoffDelay(failureCount int) time.Duration {
 	switch {
 	case failureCount <= 1:
