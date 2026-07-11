@@ -24,9 +24,11 @@ models:
     runtime: llama_cpp
     # Hugging Face repo coordinate; llama-server downloads on first start.
     # Pick a quant tag that fits your VRAM budget. Unsloth ships "UD-" dynamic
-    # quants; see https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF for the
-    # full list of files.
-    path: "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"
+    # quants; the "-MTP-GGUF" repo variant preserves the NextN/MTP layers so
+    # --spec-type draft-mtp below can actually use them. The non-MTP repo
+    # strips those layers to save space and fails at load time when MTP is
+    # requested.
+    path: "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_M"
     max_model_len: 65536
     extra_args:
       - "--jinja"
@@ -46,3 +48,29 @@ models:
       - "2048"
       - "--ubatch-size"
       - "512"
+      # Multi-Token Prediction (MTP) — uncomment to enable.
+      #
+      # llama.cpp implements MTP as a speculative-decoding mode using the
+      # model's own NextN layers (no separate draft model). Qwen 3.5/3.6
+      # ship those layers in "-MTP-GGUF" repo variants only; the plain
+      # "-GGUF" repos strip them and llama-server will exit at load with
+      # "context type MTP requested but model doesn't contain MTP layers".
+      #
+      # Performance caveat: on this exact config (35B-A3B MoE, UD-Q4_K_M,
+      # 8x RTX 3090 layer-split, long-form max_tokens=4000) MTP cannot
+      # speed this model up — measured curve relative to baseline:
+      #
+      #   n_max=1: -0.5%  (77.5% acceptance)  <- least-bad operating point
+      #   n_max=2: -1.3%  (60.9% acceptance)
+      #   n_max=3: -10.1% (47.5% acceptance)  <- llama-server default
+      #
+      # The dense MTP draft pass on the A3B MoE main model costs ~50-80%
+      # of a main pass, so acceptance savings get eaten. The jump from
+      # n_max=2 to n_max=3 is a kernel-batching nonlinearity (3 tokens
+      # triggers a different draft path than 1-2). If you want to enable
+      # MTP anyway (e.g. for latency-profile reasons), start with n_max=1.
+      #
+      # - "--spec-type"
+      # - "draft-mtp"
+      # - "--spec-draft-n-max"
+      # - "1"

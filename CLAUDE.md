@@ -155,6 +155,57 @@ exists on disk, is an absolute or `./`/`../` path, or ends in `.gguf`.
 Scheduler mode does not yet support `runtime: llama_cpp`; the config
 validator rejects that combination.
 
+### Multi-Token Prediction (MTP) for Qwen 3.5 / 3.6
+
+llama.cpp implements MTP as a speculative-decoding mode that runs against
+the model's own NextN layers — no separate draft model is needed. Enable it
+by adding to a model's `extra_args`:
+
+```yaml
+extra_args:
+  - "--spec-type"
+  - "draft-mtp"
+```
+
+Two gotchas to know before you turn it on:
+
+- The GGUF must include the NextN/MTP layers. Many community quants
+  (including the default `unsloth/Qwen3.6-35B-A3B-GGUF`) strip them to save
+  space and llama-server will exit at load with
+  `context type MTP requested but model doesn't contain MTP layers`. Use
+  an `-MTP-GGUF` variant such as `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` (the
+  shipped `configs/qwen36-35b-a3b-llamacpp.yaml` example points at this
+  even though MTP is commented out by default; see below).
+- MTP being functional does not mean it makes the model faster. We
+  measured the full `--spec-draft-n-max` curve on Qwen 3.6 35B-A3B
+  (UD-Q4_K_M, 8× RTX 3090 layer-split, `temperature=0`, long-form
+  `max_tokens=4000`):
+
+  | Config | tok/s | acceptance | vs baseline |
+  |---|---|---|---|
+  | baseline (no `--spec-type`) | 128.16 | — | — |
+  | `n_max=1` | 127.56 | 77.5% | **−0.5%** |
+  | `n_max=2` | 126.48 | 60.9% | −1.3% |
+  | `n_max=3` (llama-server default) | 115.22 | 47.5% | −10.1% |
+
+  Best operating point is `n_max=1` and it's still slightly below
+  baseline. We also verified this is not GPU-count dependent: on 2× RTX
+  3090, baseline = 129.18 tok/s and MTP at default `n_max=3` = 113.23
+  tok/s (−12.3%) — actually *worse* than the 8-GPU regression. Identical
+  draft/accept counts between 2-GPU and 8-GPU runs prove the deterministic
+  prompt produces the same speculation behavior; the wall-clock difference
+  is purely execution cost.
+
+  The bottleneck is structural: the MTP draft layer is dense, while the
+  main model is an A3B MoE (~3B active). A draft pass costs ~50–80% of a
+  main pass, so the acceptance savings don't pay it back. The big jump
+  between `n_max=2` (−1.3%) and `n_max=3` (−10.1%) is a kernel-batching
+  nonlinearity (3 tokens triggers a different draft path than 1–2).
+
+  The example config ships with `--spec-type draft-mtp` commented out
+  because of this. If you want to enable it (e.g. for latency-profile
+  reasons rather than throughput), start with `--spec-draft-n-max 1`.
+
 ## GPU Power Limits
 
 Power limits can be configured at startup and overridden per-model:
